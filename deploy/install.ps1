@@ -15,7 +15,7 @@ $Dst = 'D:\epsilon'
 $Ctl = '@CONTROLLER@'                                   # @...@ are filled in by deploy/release.sh from dist/deploy/secrets.env
 $Base = "http://${Ctl}:8090/dl"
 $BootSha = '@BOOT_SHA256@'
-$SeedSha = '@SEED_SHA256@'                               # epsilon-probe.exe used once by -seed to put the first version into a slot
+$SeedSha = '@SEED_SHA256@'                               # epsilon-probe.exe of the signed release that goes into the rescue slot R
 $Heads = '@POOL_HEADS@' -split ','                      # pooling v1: these download the 27B model
 $Pool = '@POOL_RANGE@'                                  # pooling v1: rpc-server only talks to the pool machines
 
@@ -65,11 +65,16 @@ $got = (Get-FileHash "$Dst\epsilon-boot.exe.new" -Algorithm SHA256).Hash.ToLower
 if ($got -ne $BootSha) { Remove-Item "$Dst\epsilon-boot.exe.new"; throw "boot loader hash mismatch: $got" }
 Move-Item "$Dst\epsilon-boot.exe.new" "$Dst\epsilon-boot.exe" -Force
 Write-Host "boot loader OK"
-New-Item -ItemType Directory -Force "$Dst\seed" | Out-Null
-Fetch 'upgrade/epsilon-probe-seed.exe' "$Dst\seed\epsilon-probe.exe"
-$got = (Get-FileHash "$Dst\seed\epsilon-probe.exe" -Algorithm SHA256).Hash.ToLower()
-if ($got -ne $SeedSha) { Remove-Item "$Dst\seed\epsilon-probe.exe"; throw "seed probe hash mismatch: $got" }
-Write-Host "seed probe OK"
+# Rescue slot R (docs/boot.md): the signed release, written only by this installer. The boot loader verifies it
+# and runs it with -seed when slots A and B cannot run; we also use it below for the first seed.
+$R = "$Dst\R"
+Remove-Item -Recurse -Force $R -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $R | Out-Null
+foreach ($f in 'release.json', 'epsilon-probe.exe', 'workloads.json') { Fetch "release/$f" "$R\$f" }
+$got = (Get-FileHash "$R\epsilon-probe.exe" -Algorithm SHA256).Hash.ToLower()
+if ($got -ne $SeedSha) { Remove-Item -Recurse -Force $R; throw "rescue probe hash mismatch: $got" }
+Remove-Item -Recurse -Force "$Dst\seed" -ErrorAction SilentlyContinue   # older installers kept the seed probe here
+Write-Host "rescue slot R OK"
 New-Item -ItemType Directory -Force "$Dst\models" | Out-Null
 $model = 'models\Qwen3.5-4B-Q4_K_M.gguf'
 if ((Test-Path "$Dst\$model") -and (Get-Item "$Dst\$model").Length -eq (RemoteSize "pkg/models/Qwen3.5-4B-Q4_K_M.gguf")) { Write-Host 'model already there' }
@@ -104,7 +109,7 @@ if ($ok) { Write-Host 'reachable' } else { Write-Host 'NOT reachable' }
 
 Step '5/7 seed: put the current signed release into a free slot (boot loader picks it up and trial-starts it)'
 $ErrorActionPreference = 'Continue'
-& "$Dst\seed\epsilon-probe.exe" -seed -config "$Dst\probe.json" -root $Dst 2>&1 | ForEach-Object { Write-Host $_ }
+& "$R\epsilon-probe.exe" -seed -config "$Dst\probe.json" -root $Dst 2>&1 | ForEach-Object { Write-Host $_ }
 $seedExit = $LASTEXITCODE
 $ErrorActionPreference = 'Stop'
 if ($seedExit -eq 0) { Write-Host 'seed OK' } else { Write-Host "seed failed (exit $seedExit): boot loader will have nothing to start until the probe gets a slot" }

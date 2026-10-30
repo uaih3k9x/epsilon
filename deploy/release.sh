@@ -46,7 +46,7 @@ dist/build/epsilon-release -key dist/keys/release-main.key -version "$V" -out di
   dist/build/epsilon-probe.exe dist/build/workloads.json
 mkdir -p dist/deploy/upgrade
 cp dist/build/epsilon-boot.exe dist/deploy/upgrade/
-cp dist/build/epsilon-probe.exe dist/deploy/upgrade/epsilon-probe-seed.exe   # 装机时跑一次 -seed，放进第一个版本
+rm -f dist/deploy/upgrade/epsilon-probe-seed.exe   # 旧版装机脚本用的；现在救援槽 R 直接取 /dl/release/ 里签了名的发布
 SHA=$(shasum -a 256 dist/build/epsilon-boot.exe | cut -d' ' -f1)
 SEED=$(shasum -a 256 dist/build/epsilon-probe.exe | cut -d' ' -f1)
 sed -e "s/@BOOT_SHA256@/$SHA/" -e "s/@SEED_SHA256@/$SEED/" -e "s/@CONTROLLER@/$EPS_CONTROLLER/" \
