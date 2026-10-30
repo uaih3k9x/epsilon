@@ -16,10 +16,12 @@ import (
 type fakeProc struct {
 	exited chan struct{}
 	once   sync.Once
+	code   int // 退出码：在 Kill 之前设
 }
 
 func (p *fakeProc) Exited() <-chan struct{} { return p.exited }
 func (p *fakeProc) Kill()                   { p.once.Do(func() { close(p.exited) }) }
+func (p *fakeProc) ExitCode() int           { return p.code }
 
 func (p *fakeProc) dead() bool {
 	select {
@@ -30,7 +32,7 @@ func (p *fakeProc) dead() bool {
 	}
 }
 
-// fakeRunner 记录启动了哪个槽、启动那一刻 state 里的 tries；behave 决定本体起来后干什么。
+// fakeRunner 记录启动了哪个槽（救援记为 R）、启动那一刻 state 里的 tries；behave 决定本体起来后干什么。
 type fakeRunner struct {
 	mu     sync.Mutex
 	starts []string
@@ -82,7 +84,9 @@ func newBoot(t *testing.T) (*Boot, ed25519.PrivateKey, *fakeRunner) {
 	pub, priv := keys(t)
 	r := &fakeRunner{}
 	b := &Boot{Root: t.TempDir(), Keys: []ed25519.PublicKey{pub}, Start: r.start,
-		ConfirmWithin: 300 * time.Millisecond, Backoff: 20 * time.Millisecond, Poll: 5 * time.Millisecond}
+		Rescue:        func(dir string) (Proc, error) { return r.start(dir, "") },
+		ConfirmWithin: 300 * time.Millisecond, Backoff: 20 * time.Millisecond, Poll: 5 * time.Millisecond,
+		RescueWithin: time.Second, RescueGap: time.Hour}
 	return b, priv, r
 }
 
@@ -125,7 +129,10 @@ func write(t *testing.T, path, body string) {
 func stage(t *testing.T, b *Boot, slot, version string) {
 	t.Helper()
 	raw, _ := json.Marshal(Staged{Slot: slot, Version: version})
-	write(t, filepath.Join(b.Root, StagedFile), string(raw))
+	// 和 loader 一样原子写：boot 看护时会并发读，os.WriteFile 可能让它读到半个文件
+	if err := writeAtomic(filepath.Join(b.Root, StagedFile), raw); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func stagedExists(b *Boot) bool {
