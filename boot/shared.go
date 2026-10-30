@@ -16,6 +16,7 @@ const (
 	StagedFile  = "staged.json"
 	EventsFile  = "boot-events.jsonl"
 	ReleaseFile = "release.json"
+	RescueSlot  = "R" // 救援槽：只有安装脚本写，boot 和 loader 都只读
 )
 
 // Staged 是 loader 交给 boot 的"槽已备好"。版本只作参考，boot 以槽里验过的清单为准。

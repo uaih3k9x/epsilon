@@ -48,6 +48,14 @@ type Boot struct {
 	ConfirmWithin time.Duration // 新版本多久内要确认
 	Backoff       time.Duration // 本体退出、启动失败、没槽可跑时等多久再来
 	Poll          time.Duration // 看护时多久看一次确认文件和 staged.json
+
+	// Rescue 运行救援槽 R 里的本体（-seed：跑一轮 loader 就退出，docs/boot.md "救援槽 R"）。
+	// 返回的 Proc 有 ExitCode() int 方法时，事件里记退出码。
+	Rescue       func(slotDir string) (Proc, error)
+	RescueWithin time.Duration // 救援最多跑多久，到了杀掉
+	RescueGap    time.Duration // 两次救援至少隔多久
+
+	lastRescue time.Time // 上次救援的时间，只记在内存里：boot 重启后可以立刻再救一次
 }
 
 func (b *Boot) path(name string) string { return filepath.Join(b.Root, name) }
@@ -289,6 +297,61 @@ func (b *Boot) promote(slot string) bool {
 	return true
 }
 
+// rescueWhy 判断该不该跑救援槽，返回原因；空表示不该（docs/boot.md "救援槽 R" 的两种情况）。
+// 只读不写，state 读不出时不救（拿不准就不动）。
+func (b *Boot) rescueWhy() string {
+	st, err := b.state()
+	switch {
+	case err != nil || b.hasFallback(st):
+		return ""
+	case st.Pending == "" || b.check(st, st.Pending) != nil:
+		return fmt.Sprintf("没有能跑的槽（current %q，good %q，pending %q）", st.Current, st.Good, st.Pending)
+	case st.Current == "" && st.Tries >= MaxTries:
+		return fmt.Sprintf("首次安装的版本 %s（槽 %s）试了 %d 次没确认", st.Versions[st.Pending], st.Pending, st.Tries)
+	}
+	return ""
+}
+
+// rescue 验 R、运行它、等它退出（最多 RescueWithin，超时杀掉）。返回 false 表示收到 stop。
+//
+// 断电/崩溃安全：救援这边只追加事件，不写 state、不写确认文件、不碰 R，所以
+//   - 救援中断电、boot 被杀：boot 的磁盘状态和救援前一模一样，重启后重新判断（限频在内存里，会立刻再救一次）；
+//     Windows 上救援进程在作业对象里，随 boot 一起走，不会和新起的 boot 同时跑；
+//   - 超时或 stop 时杀掉救援进程：loader 写到一半的槽还没有 staged.json，boot 不会用它（loader 的写法保证
+//     staged.json 最后原子写）；它写的目标槽永远不是 current，正在用的退路不会被它写坏。
+func (b *Boot) rescue(stop <-chan struct{}, why string) bool {
+	b.lastRescue = time.Now() // R 验不过也算一次，免得每轮都记 boot_rescue_bad
+	dir := b.path(RescueSlot)
+	m, err := VerifySlot(dir, b.Keys)
+	if err != nil {
+		b.event("boot_rescue_bad", "%s；救援槽验不过: %v", why, err)
+		return true
+	}
+	b.event("boot_rescue", "%s；运行救援版本 %s", why, m.Version)
+	p, err := b.Rescue(dir)
+	if err != nil {
+		b.event("boot_rescue_done", "起不来: %v", err)
+		return true
+	}
+	timeout := time.NewTimer(b.RescueWithin)
+	defer timeout.Stop()
+	select {
+	case <-stop:
+		kill(p)
+		return false
+	case <-timeout.C:
+		kill(p)
+		b.event("boot_rescue_done", "超时（%s），杀掉", b.RescueWithin)
+	case <-p.Exited():
+		code := -1
+		if c, ok := p.(interface{ ExitCode() int }); ok {
+			code = c.ExitCode()
+		}
+		b.event("boot_rescue_done", "退出码 %d", code)
+	}
+	return true
+}
+
 func (b *Boot) sleep(stop <-chan struct{}, d time.Duration) bool {
 	select {
 	case <-stop:
@@ -319,8 +382,13 @@ func (b *Boot) Run(stop <-chan struct{}) {
 	}
 }
 
-// runOnce 选一个槽跑一次直到它该换掉；返回 false 表示收到 stop。
+// runOnce 选一个槽跑一次直到它该换掉（没槽可跑时先看要不要救援）；返回 false 表示收到 stop。
 func (b *Boot) runOnce(stop <-chan struct{}) bool {
+	if time.Since(b.lastRescue) >= b.RescueGap { // 先看限频，省得每轮都给槽算哈希
+		if why := b.rescueWhy(); why != "" {
+			return b.rescue(stop, why) // 跑完回 Run 的循环：先消费它留下的 staged.json 再选槽
+		}
+	}
 	slot, trial := b.Pick()
 	if slot == "" {
 		return b.sleep(stop, b.Backoff)

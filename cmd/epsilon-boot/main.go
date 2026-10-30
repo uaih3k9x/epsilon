@@ -27,6 +27,22 @@ type proc struct {
 
 func (p *proc) Exited() <-chan struct{} { return p.done }
 func (p *proc) Kill()                   { p.cmd.Process.Kill() }
+func (p *proc) ExitCode() int           { return p.cmd.ProcessState.ExitCode() } // Exited 之后才调
+
+// spawn 在 root 下不弹窗地启动 exe，并绑进作业对象：引导器被杀，它（连同它的工作负载）一起走。
+func spawn(root, exe string, args ...string) (boot.Proc, error) {
+	cmd := exec.Command(exe, args...)
+	cmd.Dir = root
+	winproc.Hide(cmd)
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	winproc.Bind(cmd.Process.Pid)
+	p := &proc{cmd: cmd, done: make(chan struct{})}
+	go func() { cmd.Wait(); close(p.done) }()
+	log.Printf("启动 %s pid %d", exe, cmd.Process.Pid)
+	return p, nil
+}
 
 func main() {
 	exe, _ := os.Executable()
@@ -60,23 +76,19 @@ func main() {
 
 	b := &boot.Boot{Root: *root, Keys: keys,
 		ConfirmWithin: 3 * time.Minute, Backoff: 30 * time.Second, Poll: 2 * time.Second,
+		RescueWithin: 30 * time.Minute, RescueGap: 10 * time.Minute,
 		Start: func(slotDir, confirm string) (boot.Proc, error) {
-			slot := filepath.Base(slotDir)
 			// 命令行是冻结契约（docs/boot.md），本体以后的版本都得认这些参数
-			cmd := exec.Command(filepath.Join(slotDir, "epsilon-probe.exe"),
+			return spawn(*root, filepath.Join(slotDir, "epsilon-probe.exe"),
 				"-config", filepath.Join(*root, "probe.json"), "-log", filepath.Join(*root, "probe.log"),
 				"-workloads", filepath.Join(slotDir, "workloads.json"), "-confirm", confirm,
-				"-boot", fmt.Sprintf("%d/%s", boot.Version, slot), "-root", *root)
-			cmd.Dir = *root
-			winproc.Hide(cmd)
-			if err := cmd.Start(); err != nil {
-				return nil, err
-			}
-			winproc.Bind(cmd.Process.Pid) // 引导器被杀，本体连同它的工作负载一起走
-			p := &proc{cmd: cmd, done: make(chan struct{})}
-			go func() { cmd.Wait(); close(p.done) }()
-			log.Printf("启动槽 %s pid %d", slot, cmd.Process.Pid)
-			return p, nil
+				"-boot", fmt.Sprintf("%d/%s", boot.Version, filepath.Base(slotDir)), "-root", *root)
+		},
+		Rescue: func(slotDir string) (boot.Proc, error) {
+			// 同样是冻结契约（docs/boot.md "救援槽 R"）：跑一轮 loader 就退出
+			return spawn(*root, filepath.Join(slotDir, "epsilon-probe.exe"),
+				"-seed", "-config", filepath.Join(*root, "probe.json"), "-root", *root,
+				"-boot", fmt.Sprintf("%d/%s", boot.Version, boot.RescueSlot))
 		}}
 	b.Run(make(chan struct{}))
 }
