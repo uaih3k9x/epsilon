@@ -32,6 +32,7 @@ type Loader struct {
 	Token       string
 	Keys        []ed25519.PublicKey
 	BootVersion int          // 本机 boot 的版本，发布的 min_boot 不能比它大
+	Seed        bool         // -seed（安装、救援）：pending 非空、current 空时也放，目标是 pending 以外的槽
 	Client      *http.Client // 空 = 默认（不走代理）
 }
 
@@ -80,8 +81,9 @@ func (l *Loader) Stage(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("读 %s: %w", boot.StateFile, err)
 	}
-	if st.Pending != "" {
-		return false, nil // boot 正在试新版本
+	target, ok := l.target(st)
+	if !ok {
+		return false, nil // boot 正在试新版本（seed：两个槽都占着）
 	}
 	// 上一次备好的还没被 boot 拿走（同版本就是已经做完了；别的版本也等 boot 先消费，staged.json 只有 boot 删）
 	if _, err := os.Stat(filepath.Join(l.Root, boot.StagedFile)); err == nil {
@@ -92,12 +94,8 @@ func (l *Loader) Stage(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if m.Version == st.Bad || m.Version == st.Versions[st.Current] {
-		return false, nil
-	}
-	target := "A"
-	if st.Current != "" {
-		target = other(st.Current)
+	if m.Version == st.Bad || m.Version == st.Versions[st.Current] || st.Pending != "" && m.Version == st.Versions[st.Pending] {
+		return false, nil // pending 就是这个版本：换个槽再试也一样
 	}
 	dir := filepath.Join(l.Root, target)
 	if err := l.fill(ctx, dir, rel, m); err != nil {
@@ -105,8 +103,8 @@ func (l *Loader) Stage(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("槽 %s: %w", target, err)
 	}
 	// 下载要好一会儿：期间 boot 可能因为 current 坏了改跑 good，目标槽就成了 current。
-	// 再读一次 state，对不上就不交接（槽里的东西不删：它现在是 current，boot 会按版本核对发现不对）。
-	if st2, err := boot.ReadState(l.Root); err != nil || st2.Pending != "" || st2.Current == target {
+	// 再读一次 state，按同样的规则算出的目标槽变了就不交接（槽里的东西不删：它可能已是 current，boot 会按版本核对发现不对）。
+	if st2, err := boot.ReadState(l.Root); err != nil || !l.sameTarget(st2, target) {
 		return false, fmt.Errorf("下载期间 boot 换了槽（current=%q pending=%q），这次不交接", st2.Current, st2.Pending)
 	}
 	raw, _ := json.Marshal(boot.Staged{Slot: target, Version: m.Version})
@@ -116,6 +114,24 @@ func (l *Loader) Stage(ctx context.Context) (bool, error) {
 	}
 	log.Printf("版本 %s 放进槽 %s，等引导器切换", m.Version, target)
 	return true, nil
+}
+
+// target 按 docs/boot.md 选目标槽：绝不是 current，也不是正在试的 pending。ok=false 就什么都不做。
+func (l *Loader) target(st boot.State) (string, bool) {
+	switch {
+	case st.Pending == "" && st.Current == "":
+		return "A", true
+	case st.Pending == "":
+		return other(st.Current), true
+	case l.Seed && st.Current == "": // 首次安装的版本坏了：换另一个槽，boot 在两次试启动之间接受
+		return other(st.Pending), true
+	}
+	return "", false
+}
+
+func (l *Loader) sameTarget(st boot.State, target string) bool {
+	t, ok := l.target(st)
+	return ok && t == target
 }
 
 // release 取主控的签名发布并验过：签名、min_boot。

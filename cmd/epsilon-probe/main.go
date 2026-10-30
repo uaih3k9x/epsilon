@@ -33,7 +33,7 @@ func main() {
 	confirm := flag.String("confirm", "", "第一次心跳成功后创建这个文件，告诉引导器这个版本能用")
 	bootArg := flag.String("boot", "", "引导器版本/槽位，原样上报；有它才在后台跑 loader")
 	root := flag.String("root", "", "引导器根目录（A/B 槽、boot-state.json）；默认 probe.json 所在目录")
-	seedOnly := flag.Bool("seed", false, "安装用：跑一轮 loader 把第一个版本放进槽就退出")
+	seedOnly := flag.Bool("seed", false, "安装、救援用：跑一轮 loader 把版本放进槽就退出")
 	flag.Parse()
 	if st, err := os.Stat(*logPath); err == nil && st.Size() > 10<<20 {
 		os.Remove(*logPath) // 超过 10 MB 就从头记
@@ -54,7 +54,7 @@ func main() {
 		log.Fatal(err)
 	}
 	if *seedOnly {
-		os.Exit(seed(context.Background(), l, log.Writer())) // 原因同时进日志
+		os.Exit(seed(context.Background(), l, *bootArg, log.Writer())) // 原因同时进日志
 	}
 	log.Printf("epsilon-probe %s 节点 %s 主控 %s 引导 %q", version, cfg.Node, cfg.Controller, *bootArg)
 
@@ -118,9 +118,22 @@ func bootVersion(s string) (int, error) {
 	return n, nil
 }
 
-// seed 是安装时的 -seed：跑一轮 Stage。装的 boot 和本体同一版，所以引导器版本用编进来的 boot.Version。
-func seed(ctx context.Context, l *loader.Loader, w io.Writer) int {
-	l.BootVersion = boot.Version
+// seedBootVersion：救援时 boot 传 -boot <版本>/R，按它；安装脚本不传，装的 boot 和本体同一版，用编进来的 boot.Version。
+func seedBootVersion(bootArg string) (int, error) {
+	if bootArg == "" {
+		return boot.Version, nil
+	}
+	return bootVersion(bootArg)
+}
+
+// seed 是 -seed（安装、救援）：按 seed 的选槽规则跑一轮 Stage。
+func seed(ctx context.Context, l *loader.Loader, bootArg string, w io.Writer) int {
+	v, err := seedBootVersion(bootArg)
+	if err != nil {
+		fmt.Fprintf(w, "seed 失败: %v\n", err)
+		return 1
+	}
+	l.BootVersion, l.Seed = v, true
 	staged, err := l.Stage(ctx)
 	if err != nil {
 		fmt.Fprintf(w, "seed 失败: %v\n", err)
@@ -129,7 +142,7 @@ func seed(ctx context.Context, l *loader.Loader, w io.Writer) int {
 	if staged {
 		fmt.Fprintln(w, "seed: 已放进槽，等引导器启动")
 	} else {
-		fmt.Fprintln(w, "seed: 没有要放的（已备好，或已是当前版本）")
+		fmt.Fprintln(w, "seed: 没有要放的（已备好、已是当前版本，或两个槽都占着）")
 	}
 	return 0
 }

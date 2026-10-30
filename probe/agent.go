@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -49,8 +52,14 @@ type Agent struct {
 
 	maxOfflineUnit time.Duration // MaxOfflineMins 的单位，测试里缩短
 
+	// 离线确认（docs/boot.md）：跑起来后持续 offlineAfter，联系主控的失败全是网络层的，也算这个版本能用
+	offlineAfter time.Duration
+	startedAt    time.Time
+	netFailed    bool // 登记/心跳出现过网络层失败
+	httpFailed   bool // 主控明确回过错误：这次启动只认心跳成功
+
 	Boot     string // 引导器版本/槽位，原样上报
-	OnOnline func() // 第一次心跳成功时调一次：告诉引导器"这个版本能用"
+	OnOnline func() // 第一次心跳成功（或离线确认）时调一次：告诉引导器"这个版本能用"
 	LogPath  string // 探针自己的日志；主控要日志时一起传
 
 	logDone atomic.Int64 // 已经传过的日志请求号
@@ -94,7 +103,7 @@ type Agent struct {
 func NewAgent(cfg Config, sys System, version string) *Agent {
 	a := &Agent{cfg: cfg, sys: sys, sup: NewSupervisor(), version: version,
 		client: &http.Client{Timeout: 10 * time.Second}, desired: proto.DesiredState{}.Defaults(),
-		lastOK: time.Now(), maxOfflineUnit: time.Minute, gpuEvery: 5 * time.Second,
+		lastOK: time.Now(), maxOfflineUnit: time.Minute, offlineAfter: time.Minute, gpuEvery: 5 * time.Second,
 		vram: vramBook{grace: 30 * time.Second}, upload: newLimiter(), p2pClient: &http.Client{},
 		fetchParallel: 4, sourceTimeout: 30 * time.Second, retryUnit: time.Second, fetchRetry: time.Minute,
 		ready: map[string]bool{}, jobs: map[string]*fetchJob{}, failedAt: map[string]time.Time{}, lastErr: map[string]string{},
@@ -118,6 +127,9 @@ func (a *Agent) Run(stop <-chan struct{}, step time.Duration) {
 }
 
 func (a *Agent) Step(now time.Time) {
+	if a.startedAt.IsZero() {
+		a.startedAt = now
+	}
 	if !a.registered.Load() {
 		a.register()
 	}
@@ -165,6 +177,50 @@ func (a *Agent) Step(now time.Time) {
 			a.sendEvent(e)
 		}
 	}
+	// 走到这里说明主循环在正常跑
+	if a.OnOnline != nil && a.netFailed && !a.httpFailed && now.Sub(a.startedAt) >= a.offlineAfter {
+		log.Printf("主控连不上，按网络故障离线确认")
+		a.online()
+	}
+}
+
+// online 告诉引导器这个版本能用，只调一次。
+func (a *Agent) online() {
+	if a.OnOnline != nil {
+		a.OnOnline()
+		a.OnOnline = nil
+	}
+}
+
+// contactFailed 给登记/心跳的失败归类，供离线确认用。409 不算失败。
+func (a *Agent) contactFailed(err error) {
+	switch {
+	case err == errUnknownNode:
+	case isNetErr(err):
+		a.netFailed = true
+	case !a.httpFailed:
+		a.httpFailed = true
+		if a.OnOnline != nil {
+			log.Printf("主控回了错误，这次启动只认心跳成功、不走离线确认: %v", err)
+		}
+	}
+}
+
+// isNetErr：没拿到主控的 HTTP 回答——连不上、拒绝连接、DNS 失败、超时、连上就断。
+// 主控回了状态码（401/404/5xx 等）、回包解析不了都不算。
+func isNetErr(err error) bool {
+	var op *net.OpError
+	var dns *net.DNSError
+	var ne net.Error
+	switch {
+	case err == nil:
+		return false
+	case errors.As(err, &op), errors.As(err, &dns):
+		return true
+	case errors.As(err, &ne) && ne.Timeout(): // *url.Error 也是 net.Error，只认超时
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 var yieldReason = map[string]bool{"user_active": true, "foreign_gpu": true, "foreign_vram": true,
@@ -257,6 +313,7 @@ func (a *Agent) register() {
 	}
 	if err := a.post("/v1/register", req, nil); err != nil {
 		log.Printf("登记失败: %v", err)
+		a.contactFailed(err)
 		return
 	}
 	a.registered.Store(true)
@@ -273,6 +330,7 @@ func (a *Agent) heartbeat(obs Observed) bool {
 	var d proto.DesiredState
 	if err := a.post("/v1/heartbeat", hb, &d); err != nil {
 		log.Printf("心跳失败: %v", err)
+		a.contactFailed(err)
 		if err == errUnknownNode {
 			a.registered.Store(false)
 		}
@@ -284,10 +342,7 @@ func (a *Agent) heartbeat(obs Observed) bool {
 		go a.uploadLogs(d.LogRequest)
 	}
 	a.lastOK = time.Now()
-	if a.OnOnline != nil {
-		a.OnOnline()
-		a.OnOnline = nil
-	}
+	a.online()
 	return true
 }
 
@@ -319,7 +374,9 @@ func (a *Agent) post(path string, body, out any) error {
 		return fmt.Errorf("%s: HTTP %d", path, r.StatusCode)
 	}
 	if out != nil {
-		return json.NewDecoder(r.Body).Decode(out)
+		if err := json.NewDecoder(r.Body).Decode(out); err != nil {
+			return fmt.Errorf("%s: 回包解析: %v", path, err) // %v：不让 io.EOF 被当成网络错误
+		}
 	}
 	return nil
 }
