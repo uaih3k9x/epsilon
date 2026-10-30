@@ -100,9 +100,9 @@ loader 住在本体里，本体跑不起来就没人下载修复版。所以加�
 - **只有安装脚本写 R**；boot 和 loader 都不写、不删。R 不进 `boot-state.json` 的 `versions`，不当 current / good / pending。
 - **什么时候用**：boot 选槽时"没有能跑的"——
   1. current 和 good 都验不过（或版本对不上），且没有能试的 pending；或者
-  2. current 为空（首次安装、没有退路），pending 已经连续试了 ≥ `MaxTries` 次都没确认。
+  2. **没有退路**（current 为空即首次安装，或 current/good 都验不过），pending 已经连续试了 ≥ `MaxTries` 次都没确认。
 - **怎么用**：先 `VerifySlot(R)`，验不过记事件、不跑。验过就运行
-  `R\epsilon-probe.exe -seed -config <root>\probe.json -root <root> -boot <boot版本>/R`，
+  `R\epsilon-probe.exe -seed -config <root>\probe.json -root <root> -log <root>\rescue.log -boot <boot版本>/R`（`-log` 必须给，否则日志默认写进 R），
   等它退出（最多 30 分钟，超时杀掉）。它是一次性的：跑一轮 loader 就退出，不是常驻本体，不写确认文件。
   之后 boot 照常回到选槽循环（有了 staged.json 就按正常流程消费）。
 - **限频**：两次救援之间至少隔 10 分钟（记在内存里即可；boot 重启后可以立刻再救一次）。
@@ -114,7 +114,8 @@ loader 住在本体里，本体跑不起来就没人下载修复版。所以加�
 
 - `pending == ""`：照旧，目标 = current 以外的那个（current 空则 A）。
 - `pending != ""` 且 `current == ""`（首次安装那个版本坏了）：目标 = **pending 以外的那个槽**。boot 在两次试启动之间看到 staged.json（slot ≠ current）会接受它，改试新槽，`tries` 从 0 开始。
-- `pending != "" 且 current != ""`：两个槽都占着，什么都不做（boot 自己会回退到 current）。
+- `pending != ""`、`current != ""` 且 `tries ≥ MaxTries`：救援只在没有退路时才跑，说明 current 也跑不起来 → 目标 = **pending 槽**（覆盖那个试满的坏版本；不碰 current，它若只是暂时坏，仍是唯一可能的退路）。
+- `pending != ""`、`current != ""` 且没试满：什么都不做（安装脚本重跑时也不打断正在进行的试启动）。
 - 常驻模式（被 boot 拉起的本体里的 loader）不变：`pending != ""` 时不动。
 - `-seed` 带 `-boot` 参数时，按它的版本判断 `min_boot`；没带（安装脚本）时用编进本体的 `boot.Version`。
 - 主控发的版本**就是 pending 槽里那个**（首次安装的坏版本还在发）：不放进另一个槽，等主控发新版本。否则同一个坏版本会每 10 分钟换个槽再试 3 次，来回空转。
@@ -134,4 +135,8 @@ loader 住在本体里，本体跑不起来就没人下载修复版。所以加�
 - 偏移 > 0 时，先检查文件里偏移前一个字节是不是换行；不是，说明文件已经轮转并重新长过了旧偏移，从 0 开始读。
 - 读到不能解析的行（半行、NUL）跳过（已经是这样）。
 - 读完立刻关文件（boot 改名轮转时不要被占着）。
+
+### R 里的 loader 也近似冻结
+
+R 只在重装时更新，所以"救援时选哪个槽"的规则以**装进 R 的那个本体**为准，这台机器重装前都改不了。改这些规则时要想到：已经装出去的 R 还是旧规则。
 
