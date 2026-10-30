@@ -270,12 +270,6 @@ func TestNoRescueWhenRunnable(t *testing.T) {
 			putSlot(t, b, priv, "B", "0.2.0")
 			setState(t, b, State{Current: "A", Pending: "B", Tries: MaxTries, Versions: map[string]string{"A": "0.1.0", "B": "0.2.0"}})
 		}, "A"},
-		{"current 坏、pending 试满（current 不空，loader 不会动）", func(t *testing.T, b *Boot, priv ed25519.PrivateKey) {
-			putSlot(t, b, priv, "A", "0.1.0")
-			tamper(t, b, "A")
-			putSlot(t, b, priv, "B", "0.2.0")
-			setState(t, b, State{Current: "A", Pending: "B", Tries: MaxTries, Versions: map[string]string{"A": "0.1.0", "B": "0.2.0"}})
-		}, "B"},
 		{"staged.json 待消费", func(t *testing.T, b *Boot, priv ed25519.PrivateKey) {
 			putSlot(t, b, priv, "A", "0.1.0")
 			stage(t, b, "A", "0.1.0")
@@ -306,5 +300,54 @@ func TestNoRescueWhenStateUnreadable(t *testing.T) {
 	stop()
 	if len(r.list()) != 0 || hasEvent(t, b, "boot_rescue") || hasEvent(t, b, "boot_rescue_bad") {
 		t.Fatalf("starts %v 事件 %+v", r.list(), events(t, b))
+	}
+}
+
+// current 坏了（比如被杀毒软件隔离）、pending 又是坏版本试满了：没有退路，要救援，不能一直试坏版本。
+func TestRescueWhenCurrentBrokenAndPendingExhausted(t *testing.T) {
+	b, priv, r := newBoot(t)
+	r.behave = crash
+	putSlot(t, b, priv, "A", "0.1.0")
+	tamper(t, b, "A")
+	putSlot(t, b, priv, "B", "0.2.0")
+	putSlot(t, b, priv, RescueSlot, "0.0.1")
+	setState(t, b, State{Current: "A", Pending: "B", Tries: MaxTries, Versions: map[string]string{"A": "0.1.0", "B": "0.2.0"}})
+	stop := run(t, b)
+	waitFor(t, "救援", func() bool { return r.count(RescueSlot) > 0 })
+	stop()
+	if got := r.list(); got[0] != RescueSlot {
+		t.Fatalf("没有退路时应先救援: %v", got)
+	}
+}
+
+// 接上一个场景：救援把修复版覆盖写进试满的槽 B（loader -seed 规则），boot 按新版本从 0 次重试并转正。
+func TestRescueOverwritesExhaustedPending(t *testing.T) {
+	b, priv, r := newBoot(t)
+	r.behave = func(slot, confirm string, p *fakeProc) {
+		switch slot {
+		case RescueSlot:
+			putSlot(t, b, priv, "B", "0.2.1")
+			stage(t, b, "B", "0.2.1")
+			p.Kill()
+		case "B":
+			if getState(t, b).Versions["B"] == "0.2.1" {
+				confirmAfterStart(slot, confirm, p)
+			} else {
+				p.Kill()
+			}
+		default:
+			p.Kill()
+		}
+	}
+	putSlot(t, b, priv, "A", "0.1.0")
+	tamper(t, b, "A")
+	putSlot(t, b, priv, "B", "0.2.0")
+	putSlot(t, b, priv, RescueSlot, "0.0.1")
+	setState(t, b, State{Current: "A", Pending: "B", Tries: MaxTries, Versions: map[string]string{"A": "0.1.0", "B": "0.2.0"}})
+	stop := run(t, b)
+	waitFor(t, "B(0.2.1) 转正", func() bool { st := getState(t, b); return st.Current == "B" && st.Versions["B"] == "0.2.1" })
+	stop()
+	if got := r.list(); strings.Join(got, ",") != "R,B" {
+		t.Fatalf("starts %v，应为 R,B", got)
 	}
 }

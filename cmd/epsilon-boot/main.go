@@ -88,6 +88,7 @@ func main() {
 			// 同样是冻结契约（docs/boot.md "救援槽 R"）：跑一轮 loader 就退出
 			return spawn(*root, filepath.Join(slotDir, "epsilon-probe.exe"),
 				"-seed", "-config", filepath.Join(*root, "probe.json"), "-root", *root,
+				"-log", filepath.Join(*root, "rescue.log"), // 不然日志默认写进 R（只有安装脚本写 R）
 				"-boot", fmt.Sprintf("%d/%s", boot.Version, boot.RescueSlot))
 		}}
 	b.Run(make(chan struct{}))

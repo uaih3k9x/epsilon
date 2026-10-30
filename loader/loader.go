@@ -125,6 +125,10 @@ func (l *Loader) target(st boot.State) (string, bool) {
 		return other(st.Current), true
 	case l.Seed && st.Current == "": // 首次安装的版本坏了：换另一个槽，boot 在两次试启动之间接受
 		return other(st.Pending), true
+	case l.Seed && st.Tries >= boot.MaxTries:
+		// 两个槽都占着还要救援 = current 也跑不起来（boot 只在没有退路时救援）：覆盖那个试满的 pending。
+		// 不碰 current：万一它只是暂时坏（比如被杀毒软件锁住），它还是唯一可能的退路。
+		return st.Pending, true
 	}
 	return "", false
 }

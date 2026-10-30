@@ -405,7 +405,7 @@ func TestStageSeedPicksSlot(t *testing.T) {
 		"pending 空、current=A": {boot.State{Current: "A", Versions: map[string]string{"A": "0.3.1"}}, "B"},
 		"首装坏了 pending=A":      {boot.State{Pending: "A", Tries: 3, Versions: map[string]string{"A": "0.3.9"}}, "B"},
 		"首装坏了 pending=B":      {boot.State{Pending: "B", Tries: 3, Versions: map[string]string{"B": "0.3.9"}}, "A"},
-		"两个槽都占着":              {boot.State{Current: "A", Pending: "B", Versions: map[string]string{"A": "0.3.1", "B": "0.3.9"}}, ""},
+		"两个槽都占着（救援=没有退路）":     {boot.State{Current: "A", Pending: "B", Tries: 3, Versions: map[string]string{"A": "0.3.1", "B": "0.3.9"}}, "B"},
 		"pending 就是这个版本（不重试）": {boot.State{Pending: "A", Tries: 3, Versions: map[string]string{"A": "0.4.0"}}, ""},
 	}
 	for name, c := range cases {
@@ -433,7 +433,7 @@ func TestStageSeedPicksSlot(t *testing.T) {
 				t.Fatalf("Stage = %v, staged = %+v，要槽 %s", ok, s, c.want)
 			}
 			for _, keep := range []string{c.st.Current, c.st.Pending} {
-				if keep != "" && e.marker(keep) != "old-"+strings.ToLower(keep) {
+				if keep != "" && keep != c.want && e.marker(keep) != "old-"+strings.ToLower(keep) {
 					t.Fatalf("槽 %s 被动了", keep)
 				}
 			}

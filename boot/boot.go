@@ -306,8 +306,8 @@ func (b *Boot) rescueWhy() string {
 		return ""
 	case st.Pending == "" || b.check(st, st.Pending) != nil:
 		return fmt.Sprintf("没有能跑的槽（current %q，good %q，pending %q）", st.Current, st.Good, st.Pending)
-	case st.Current == "" && st.Tries >= MaxTries:
-		return fmt.Sprintf("首次安装的版本 %s（槽 %s）试了 %d 次没确认", st.Versions[st.Pending], st.Pending, st.Tries)
+	case st.Tries >= MaxTries: // 没有退路（首次安装，或 current/good 都坏了）还一直试同一个坏版本
+		return fmt.Sprintf("没有退路，版本 %s（槽 %s）试了 %d 次没确认", st.Versions[st.Pending], st.Pending, st.Tries)
 	}
 	return ""
 }
