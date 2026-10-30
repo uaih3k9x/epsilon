@@ -394,3 +394,91 @@ func TestStageIdleUnderOldBoot(t *testing.T) {
 		t.Fatalf("旧引导器下不该下载: %d", e.ctl.fetches)
 	}
 }
+
+// -seed（安装、救援）：选槽规则放宽，见 docs/boot.md "救援时 loader 选哪个槽"。
+func TestStageSeedPicksSlot(t *testing.T) {
+	cases := map[string]struct {
+		st   boot.State
+		want string // "" = 什么都不做
+	}{
+		"全空":                  {boot.State{}, "A"},
+		"pending 空、current=A": {boot.State{Current: "A", Versions: map[string]string{"A": "0.3.1"}}, "B"},
+		"首装坏了 pending=A":      {boot.State{Pending: "A", Tries: 3, Versions: map[string]string{"A": "0.3.9"}}, "B"},
+		"首装坏了 pending=B":      {boot.State{Pending: "B", Tries: 3, Versions: map[string]string{"B": "0.3.9"}}, "A"},
+		"两个槽都占着":              {boot.State{Current: "A", Pending: "B", Versions: map[string]string{"A": "0.3.1", "B": "0.3.9"}}, ""},
+		"pending 就是这个版本（不重试）": {boot.State{Pending: "A", Tries: 3, Versions: map[string]string{"A": "0.4.0"}}, ""},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.l.Seed = true
+			e.state(c.st)
+			e.slot("A", "old-a")
+			e.slot("B", "old-b")
+			ok, err := e.stage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.want == "" {
+				if ok {
+					t.Fatal("不该交接")
+				}
+				e.noStaged()
+				if e.marker("A") != "old-a" || e.marker("B") != "old-b" || e.ctl.fetches != 0 {
+					t.Fatal("槽被动了")
+				}
+				return
+			}
+			if s, _ := e.staged(); !ok || s.Slot != c.want || s.Version != "0.4.0" {
+				t.Fatalf("Stage = %v, staged = %+v，要槽 %s", ok, s, c.want)
+			}
+			for _, keep := range []string{c.st.Current, c.st.Pending} {
+				if keep != "" && e.marker(keep) != "old-"+strings.ToLower(keep) {
+					t.Fatalf("槽 %s 被动了", keep)
+				}
+			}
+		})
+	}
+}
+
+// 常驻模式：pending 非空就不动，哪怕 current 是空的。
+func TestStageResidentIdleWhilePending(t *testing.T) {
+	e := newEnv(t)
+	e.state(boot.State{Pending: "A", Tries: 3, Versions: map[string]string{"A": "0.3.9"}})
+	e.slot("A", "old-a")
+	if ok, err := e.stage(); ok || err != nil {
+		t.Fatalf("Stage = %v %v", ok, err)
+	}
+	e.noStaged()
+	if e.ctl.fetches != 0 {
+		t.Fatalf("下载了 %d 个文件", e.ctl.fetches)
+	}
+}
+
+// seed 下载期间 boot 改了 state：目标槽成了 current 或 pending 都不交接；pending 没变（还在试另一个槽）照常交接。
+func TestStageSeedRechecksState(t *testing.T) {
+	cases := map[string]struct {
+		after boot.State
+		ok    bool
+	}{
+		"没变":           {boot.State{Pending: "A", Tries: 3, Versions: map[string]string{"A": "0.3.9"}}, true},
+		"目标成了 current": {boot.State{Current: "B", Versions: map[string]string{"B": "0.3.0"}}, false},
+		"目标成了 pending": {boot.State{Pending: "B", Versions: map[string]string{"B": "0.3.0"}}, false},
+		"A 转正了":        {boot.State{Current: "A", Versions: map[string]string{"A": "0.3.9"}}, true},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.l.Seed = true
+			e.state(boot.State{Pending: "A", Tries: 3, Versions: map[string]string{"A": "0.3.9"}})
+			e.ctl.onFetch = func() { e.state(c.after) }
+			ok, err := e.stage()
+			if ok != c.ok || (err == nil) != c.ok {
+				t.Fatalf("Stage = %v %v，要 %v", ok, err, c.ok)
+			}
+			if s, found := e.staged(); found != c.ok || found && s.Slot != "B" {
+				t.Fatalf("staged = %+v %v", s, found)
+			}
+		})
+	}
+}
