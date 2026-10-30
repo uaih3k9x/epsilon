@@ -1,0 +1,271 @@
+package probe
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"time"
+
+	"epsilon/proto"
+)
+
+// System 是对本机的观测，测试里换成假的。
+type System interface {
+	IdleSeconds() int    // 键鼠空闲秒数；-1 = 拿不到
+	GPUs() []proto.GPU   // nvidia-smi
+	ComputeApps() string // nvidia-smi --query-compute-apps 原始输出
+	MemFreeMB() int
+}
+
+type Agent struct {
+	cfg     Config
+	sys     System
+	sup     *Supervisor
+	client  *http.Client
+	version string
+
+	desired    proto.DesiredState
+	registered bool
+	lastOK     time.Time // 最近一次心跳成功
+	reason     string    // 上一轮不跑的原因，变化时记事件
+
+	gpus    []proto.GPU
+	foreign []string
+	mode    Mode
+
+	// 显存账：模型起来前后各记一次，算出"模型占多少"和"别人多占了多少"
+	vram      vramBook
+	gpuAt     time.Time
+	gpuEvery  time.Duration // 显卡多久查一次（nvidia-smi 不便宜）
+	lastBeat  time.Time
+	beatEvery time.Duration // 0 = 按期望状态里的 HeartbeatSeconds
+
+	maxOfflineUnit time.Duration // MaxOfflineMins 的单位，测试里缩短
+
+	Boot     string // 引导器版本/槽位，原样上报
+	OnOnline func() // 第一次心跳成功时调一次：告诉引导器"这个版本能用"
+}
+
+func NewAgent(cfg Config, sys System, version string) *Agent {
+	return &Agent{cfg: cfg, sys: sys, sup: NewSupervisor(), version: version,
+		client: &http.Client{Timeout: 10 * time.Second}, desired: proto.DesiredState{}.Defaults(),
+		lastOK: time.Now(), maxOfflineUnit: time.Minute, gpuEvery: 5 * time.Second,
+		vram: vramBook{grace: 30 * time.Second}}
+}
+
+// Run 每 step 看一次要不要让位（便宜：只读键鼠空闲），显卡每 5 秒查一次，心跳按间隔发。
+func (a *Agent) Run(stop <-chan struct{}, step time.Duration) {
+	t := time.NewTicker(step)
+	defer t.Stop()
+	for {
+		a.Step(time.Now())
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func (a *Agent) Step(now time.Time) {
+	if !a.registered {
+		a.register()
+	}
+	if now.Sub(a.gpuAt) >= a.gpuEvery {
+		a.gpus = a.sys.GPUs()
+		a.foreign = ForeignApps(a.sys.ComputeApps(), a.sup.Status().PID)
+		a.gpuAt = now
+	}
+	st := a.sup.Status()
+	if st.Healthy && a.vram.loaded == 0 { // 刚健康：手上的显卡读数可能是加载前的，马上重读
+		a.gpus, a.gpuAt = a.sys.GPUs(), now
+	}
+	a.vram.observe(st, a.gpus, now)
+	obs := Observed{Now: now, IdleSeconds: a.sys.IdleSeconds(), ForeignGPU: a.foreign,
+		ForeignVRAMMB: a.vram.foreign(st, a.gpus, now), VRAMShort: a.vram.short(a.gpus, a.desired.ForeignVRAMMB),
+		ControllerOK: now.Sub(a.lastOK) < time.Duration(a.desired.MaxOfflineMins)*a.maxOfflineUnit}
+	mode, why := Decide(a.desired, obs)
+	w, known := a.cfg.Workloads[a.desired.Workload]
+	if mode != Stop && !known {
+		mode, why = Stop, "unknown_workload"
+	}
+	if why == "foreign_vram" {
+		a.vram.waiting = true // 卸载之后要等显存空出来才装回去
+	}
+	if why != a.reason {
+		a.transition(a.reason, why)
+		a.reason = why
+	}
+	a.mode = mode
+	a.sup.Ensure(a.desired.Workload, w, mode != Stop)
+
+	every := a.beatEvery
+	if every == 0 {
+		every = time.Duration(a.desired.HeartbeatSeconds) * time.Second
+	}
+	if now.Sub(a.lastBeat) >= every {
+		a.lastBeat = now
+		if !a.heartbeat(obs) && every > 2*time.Second {
+			a.lastBeat = now.Add(2*time.Second - every) // 失败了 2 秒后再试，不用等满一个间隔
+		}
+		for _, e := range a.sup.DrainEvents() {
+			a.sendEvent(e)
+		}
+	}
+}
+
+var yieldReason = map[string]bool{"user_active": true, "foreign_gpu": true, "foreign_vram": true,
+	"vram_short": true, "controller_lost": true}
+
+// vramBook 记显存账。都按第一张卡算（学生机只有一张）。
+type vramBook struct {
+	pid     int // 记账时的工作负载进程
+	before  int // 起模型之前已用显存（桌面等）
+	base    int // 上一次装模型时的桌面基线，卸载后用它判断"别人还占着没"
+	loaded  int // 模型健康后的已用显存（稳定期内取最大值）
+	model   int // 模型自己占多少 = loaded - before
+	waiting bool
+
+	healthyAt time.Time
+	grace     time.Duration // 健康后这段时间显存还在涨（KV 缓存等），只记账不判"别人占"
+}
+
+func usedMB(g []proto.GPU) (used, total int) {
+	if len(g) == 0 {
+		return 0, 0
+	}
+	return g[0].MemUsed, g[0].MemTotal
+}
+
+func (v *vramBook) observe(st WorkloadStatus, g []proto.GPU, now time.Time) {
+	used, _ := usedMB(g)
+	switch {
+	case st.PID == 0: // 没在跑：持续刷新"起模型之前"的读数（等显存时不刷，免得把游戏算进基线）
+		v.pid, v.loaded = 0, 0
+		if !v.waiting {
+			v.before = used
+		}
+	case st.PID != v.pid: // 新进程
+		v.pid, v.loaded = st.PID, 0
+	case st.Healthy && v.loaded == 0 && used > 0: // 刚健康，记下模型占用
+		v.loaded, v.base, v.healthyAt = used, v.before, now
+	case v.loaded > 0 && now.Sub(v.healthyAt) < v.grace && used > v.loaded: // 稳定期：只涨不跌
+		v.loaded = used
+	}
+	if v.loaded > v.before {
+		v.model = v.loaded - v.before
+	}
+}
+
+// foreign: 别人比模型刚加载好时多占的显存；没在跑或还没记账 = -1。
+func (v *vramBook) foreign(st WorkloadStatus, g []proto.GPU, now time.Time) int {
+	used, _ := usedMB(g)
+	if st.PID == 0 || v.loaded == 0 || used == 0 || now.Sub(v.healthyAt) < v.grace {
+		return -1
+	}
+	return used - v.loaded
+}
+
+// short: 因显存被占卸载过，要等别人放掉（比装模型时的桌面基线多占的降到阈值以下）、
+// 且空闲显存装得下模型（留 512 MB 余量）才解除；不然卸了马上又装回来，白卸还来回抖。
+func (v *vramBook) short(g []proto.GPU, threshold int) bool {
+	if !v.waiting {
+		return false
+	}
+	used, total := usedMB(g)
+	if total > 0 && used-v.base < threshold && total-used >= v.model+512 {
+		v.waiting = false
+	}
+	return v.waiting
+}
+
+// transition 记让位 / 恢复事件；"没有工作负载"之类的平常状态不记。
+func (a *Agent) transition(from, to string) {
+	switch {
+	case yieldReason[to]:
+		a.sendEvent(proto.Event{Kind: "yield", Detail: to})
+	case to == "" && yieldReason[from]:
+		a.sendEvent(proto.Event{Kind: "resume", Detail: "from " + from})
+	case to == "":
+		a.sendEvent(proto.Event{Kind: "start", Detail: a.desired.Workload})
+	}
+}
+
+func (a *Agent) register() {
+	host, _ := os.Hostname()
+	names := make([]string, 0, len(a.cfg.Workloads))
+	for n := range a.cfg.Workloads {
+		names = append(names, n)
+	}
+	req := proto.Register{Node: a.cfg.Node, Version: a.version, Boot: a.Boot, Hostname: host,
+		GPUs: a.sys.GPUs(), MemoryMB: a.sys.MemFreeMB(), Workload: names}
+	if err := a.post("/v1/register", req, nil); err != nil {
+		log.Printf("登记失败: %v", err)
+		return
+	}
+	a.registered = true
+}
+
+func (a *Agent) heartbeat(obs Observed) bool {
+	st := a.sup.Status()
+	hb := proto.Heartbeat{Node: a.cfg.Node, Version: a.version, Boot: a.Boot, IdleSeconds: obs.IdleSeconds,
+		ForeignGPU: obs.ForeignGPU, GPUs: a.gpus, MemFreeMB: a.sys.MemFreeMB(),
+		Running: st.Name, Reason: a.reason}
+	if st.Healthy && a.mode == Run { // 保温档：模型在显存里，但不接新请求
+		hb.Serving = &proto.Serving{Model: st.Model, Port: st.Port}
+	}
+	var d proto.DesiredState
+	if err := a.post("/v1/heartbeat", hb, &d); err != nil {
+		log.Printf("心跳失败: %v", err)
+		if err == errUnknownNode {
+			a.registered = false
+		}
+		return false
+	}
+	a.desired = d.Defaults()
+	a.lastOK = time.Now()
+	if a.OnOnline != nil {
+		a.OnOnline()
+		a.OnOnline = nil
+	}
+	return true
+}
+
+func (a *Agent) sendEvent(e proto.Event) {
+	e.Node = a.cfg.Node
+	if err := a.post("/v1/events", e, nil); err != nil {
+		log.Printf("事件没发出去 %s %s: %v", e.Kind, e.Detail, err)
+	}
+}
+
+var errUnknownNode = fmt.Errorf("主控不认识这台机器（重启过？）")
+
+func (a *Agent) post(path string, body, out any) error {
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest(http.MethodPost, a.cfg.Controller+path, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	if a.cfg.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+a.cfg.Token)
+	}
+	r, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer r.Body.Close()
+	if r.StatusCode == http.StatusConflict {
+		return errUnknownNode
+	}
+	if r.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s: HTTP %d", path, r.StatusCode)
+	}
+	if out != nil {
+		return json.NewDecoder(r.Body).Decode(out)
+	}
+	return nil
+}
+
+// Shutdown 退出前停掉工作负载。
+func (a *Agent) Shutdown() { a.sup.Stop() }

@@ -1,0 +1,14 @@
+{
+  "controller": "http://主控IP:8090",
+  "token": "和主控的 probe_token 一样",
+  "workloads": {
+    "qwen3.5-4b": {
+      "exe": "D:\\epsilon\\llama\\llama-server.exe",
+      "args": ["-m", "D:\\epsilon\\models\\Qwen3.5-4B-Q4_K_M.gguf", "--alias", "qwen3.5-4b", "--host", "0.0.0.0", "--port", "8080",
+               "-ngl", "99", "-c", "8192", "--parallel", "2"],
+      "dir": "D:\\epsilon\\llama",
+      "port": 8080,
+      "model": "qwen3.5-4b"
+    }
+  }
+}

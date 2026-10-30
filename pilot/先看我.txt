@@ -1,0 +1,54 @@
+﻿Epsilon 试点 U 盘 · 先看我
+================================
+
+主控已经在 221 上跑着：http://@CONTROLLER@:8090
+每台学生机照下面做一遍（建议挑 4 台挨着的、接同一台交换机的）。
+
+1. 插 U 盘，双击 U 盘里的「0-copy-to-D.bat」
+   → 整个文件夹拷到 D:\epsilon（数据盘，哦易不还原），约 3 GB，一两分钟。
+
+2. 打开 D:\epsilon，右键「1-setup-admin.bat」→ 以管理员身份运行，一次做完三件事：
+   - 装 VC++ 运行库，并把 DLL 复制到 llama 目录（学生机自带的运行库太老，llama-server 会直接崩）；
+   - 防火墙放行 llama-server（本网段 + 221）；
+   - 测一下能不能连上 221 主控，窗口里会写 OK 或 NOT reachable。
+   看到 "llama-server OK" 和 "controller ... OK" 就对了。
+
+3. 双击 D:\epsilon 里的「2-start-probe.bat」
+   → 探针在后台跑（没有窗口），日志在 D:\epsilon\probe.log
+   → 模型先加载进显存（约半分钟）；键鼠 60 秒内动过就只保温、不接请求，
+     手离开一分钟后开始接活。
+
+4. 双击「test.bat」
+   → 能看到节点列表、一段回答，响应头里 X-Epsilon-Node 是哪台在干活。
+   → 动一下那台的鼠标，几秒内它停接新请求（模型留在显存里）；再测，请求会转到别的机器。
+
+5. （可选）双击「3-autostart.bat」，开机后自动启动探针。
+   系统盘被还原后快捷方式会没，再双击一次即可。
+
+停掉：双击「stop.bat」。
+看 llama-server 为什么起不来：双击「run-llama-by-hand.bat」，窗口里会打印原因。
+
+出问题先看 D:\epsilon\probe.log，然后把内容发给 Claude。
+- llama-server 的输出在 D:\epsilon\qwen3.5-4b.log，崩了先看这个。
+- 0xc0000005 崩溃：运行库没装上，重新右键管理员运行 1-setup-admin.bat。
+- 心跳失败 / connection refused：学生机连不上 221，用兜底方案。
+
+兜底方案（学生机连不上 221 时）
+--------------------------------
+挑其中一台当主控：
+  a. 在这台上双击「controller-start.bat」，窗口别关；
+  b. 记下这台的 IP（ipconfig），写进每台 D:\epsilon\controller-ip.txt（覆盖原来的 @CONTROLLER@）；
+  c. 每台再双击「stop.bat」「2-start-probe.bat」。
+
+文件说明
+--------
+epsilon-probe.exe       探针（后台，无窗口）
+epsilon-controller.exe  主控（兜底时用）
+probe.json              本机配置：允许跑哪些程序（主控只能挑名字）
+controller.json         兜底主控的配置
+controller-ip.txt / api_key.txt  启动和测试脚本读的
+llama\                  llama.cpp CUDA 12.4 版
+llama-vulkan\           llama.cpp Vulkan 版（驱动太老时的保底）
+models\                 Qwen3.5-4B Q4_K_M
+vc_redist.x64.exe       VC++ 运行库 14.44（1-setup-admin.bat 会装）
+以后探针更新不用 U 盘：从 221 下载 http://@CONTROLLER@:8090/dl/epsilon-probe.exe（要 api_key）

@@ -1,0 +1,18 @@
+{
+  "listen": ":8090",
+  "probe_token": "换成一串随机字符",
+  "api_keys": ["sk-换成随机字符"],
+  "stale_seconds": 30,
+  "default": {
+    "workload": "qwen3.5-4b",
+    "windows": [],
+    "yield_on_input": true,
+    "input_idle_seconds": 300,
+    "yield_on_foreign_gpu": true,
+    "heartbeat_seconds": 10,
+    "max_offline_minutes": 30
+  },
+  "nodes": {
+    "pc-28": {}
+  }
+}
