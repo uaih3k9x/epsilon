@@ -28,6 +28,7 @@ type fakeCtl struct {
 	evFailKind string // 这一类事件返回 500
 	fetches    int    // 文件下载次数
 	token      string
+	onFetch    func() // 每次发文件前调（模拟下载期间 boot 改了 state）
 }
 
 func (f *fakeCtl) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -51,6 +52,9 @@ func (f *fakeCtl) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.fetches++
+		if f.onFetch != nil {
+			f.onFetch()
+		}
 		w.Write(b)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/events":
 		var e proto.Event
@@ -79,7 +83,7 @@ func newEnv(t *testing.T) *env {
 	srv := httptest.NewServer(ctl)
 	t.Cleanup(srv.Close)
 	e := &env{t: t, ctl: ctl, priv: priv, l: &Loader{Root: t.TempDir(), Node: "pc-test", Controller: srv.URL,
-		Token: "tok", Keys: []ed25519.PublicKey{pub}, BootVersion: 1}}
+		Token: "tok", Keys: []ed25519.PublicKey{pub}, BootVersion: boot.Version}}
 	e.publish("0.4.0", 1, map[string]string{"epsilon-probe.exe": "probe 0.4.0", "workloads.json": "{}"})
 	return e
 }
@@ -305,7 +309,7 @@ func TestStageRejectsRelease(t *testing.T) {
 			e.ctl.rel.Manifest = strings.Replace(e.ctl.rel.Manifest, "0.4.0", "0.4.1", 1)
 			e.ctl.mu.Unlock()
 		},
-		"min_boot 太大": func(e *env) { e.publish("0.4.0", 2, map[string]string{"epsilon-probe.exe": "x"}) },
+		"min_boot 太大": func(e *env) { e.publish("0.4.0", e.l.BootVersion+1, map[string]string{"epsilon-probe.exe": "x"}) },
 	}
 	for name, bad := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -355,4 +359,38 @@ func TestStageCanceled(t *testing.T) {
 		t.Fatal("取消了还成功")
 	}
 	e.noStaged()
+}
+
+// 本机 boot 比编进本体的 boot 包新：按本机的版本判断 min_boot（-boot 参数传进来的），不然会拒掉能装的发布。
+func TestStageUsesRunningBootVersion(t *testing.T) {
+	e := newEnv(t)
+	e.l.BootVersion = boot.Version + 1
+	e.publish("0.5.0", boot.Version+1, map[string]string{"epsilon-probe.exe": "probe 0.5.0"})
+	if ok, err := e.stage(); !ok || err != nil {
+		t.Fatalf("本机 boot 够新就该装上: %v %v", ok, err)
+	}
+}
+
+// 下载期间 boot 换了 current（比如 current 坏了改跑 good），目标槽变成了 current：不交接。
+func TestStageRechecksStateBeforeStaging(t *testing.T) {
+	e := newEnv(t)
+	e.state(boot.State{Current: "A", Good: "B", Versions: map[string]string{"A": "0.3.0", "B": "0.2.0"}})
+	e.ctl.onFetch = func() { e.state(boot.State{Current: "B", Versions: map[string]string{"B": "0.2.0"}}) }
+	if ok, err := e.stage(); ok || err == nil {
+		t.Fatalf("目标槽成了 current 还交接: %v %v", ok, err)
+	}
+	e.noStaged()
+}
+
+// 旧引导器（版本 1）自己会下载：新本体在它下面跑时 loader 不插手，免得抢同一个空闲槽。
+func TestStageIdleUnderOldBoot(t *testing.T) {
+	e := newEnv(t)
+	e.l.BootVersion = 1
+	if ok, err := e.stage(); ok || err != nil {
+		t.Fatalf("旧引导器下不该动: %v %v", ok, err)
+	}
+	e.noStaged()
+	if e.ctl.fetches != 0 {
+		t.Fatalf("旧引导器下不该下载: %d", e.ctl.fetches)
+	}
 }

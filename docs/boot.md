@@ -82,3 +82,13 @@ boot 不下载，所以安装脚本负责放进第一个版本：
 ## 无盘模式
 
 不支持（设计书 11.11）。前提：真机验证数据盘重启后不还原。
+
+## 补充约定（2026-10-30，boot 改造评审后定）
+
+- **boot 版本 2 = 不联网的 boot**。loader 只在 `-boot` 传来的版本 ≥ 2 时工作（`loader.OfflineBoot`）；在旧引导器（1）下面不插手，避免和它抢同一个空闲槽。
+- loader 判断 `min_boot` 用**机器上实际在跑的 boot 版本**（`-boot` 参数），验槽用 `boot.VerifySlotFor`；不是编进本体的 boot 包版本。
+- 发布的 `min_boot` 由发版时显式给（`epsilon-release -min-boot`，默认 2），只在本体真的依赖新引导器时调高。
+- loader 下载完、写 staged.json 前**再读一次 state**：期间 boot 换了 current（目标槽成了 current）或开始试启动，就不交接。
+- **本体命令行是冻结约定**：本体以后每个版本都必须接受 boot 传的这一整套参数（`-config -log -workloads -confirm -boot -root`），只能加不能删；Go 的 flag 遇到不认识的参数会直接退出。
+- 已知、待定（见设计书 11.11 后的评审记录）：A/B 都跑不起来时没有自愈；首次装的版本是坏的没法远程修；试启动期间主控不在线会把好版本判坏；事件轮转判断不够稳。
+

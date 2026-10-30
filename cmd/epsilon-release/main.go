@@ -22,6 +22,7 @@ import (
 func main() {
 	keyPath := flag.String("key", "dist/keys/release-main.key", "私钥（base64 种子）")
 	version := flag.String("version", "", "版本号；试坏过的版本号引导器不会再下，修好要换新号")
+	minBoot := flag.Int("min-boot", 2, "这版本体至少要哪个版本的引导器（只在本体真的依赖新引导器时调高：调高后旧引导器的机器装不了）")
 	out := flag.String("out", "dist/release", "输出目录")
 	flag.Parse()
 	if *version == "" || flag.NArg() == 0 {
@@ -41,7 +42,7 @@ func main() {
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		log.Fatal(err)
 	}
-	m := boot.Manifest{Version: *version, MinBoot: boot.Version}
+	m := boot.Manifest{Version: *version, MinBoot: *minBoot}
 	for _, src := range flag.Args() {
 		name := filepath.Base(src)
 		in, err := os.Open(src)

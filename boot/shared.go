@@ -48,6 +48,12 @@ func ReadState(root string) (State, error) {
 
 // VerifySlot 验一个槽：release.json 签名、min_boot 不超过本引导器、每个文件大小和 sha256。
 func VerifySlot(dir string, keys []ed25519.PublicKey) (Manifest, error) {
+	return VerifySlotFor(dir, keys, Version)
+}
+
+// VerifySlotFor 同 VerifySlot，但按给定的引导器版本判断 min_boot。
+// loader 用它：要比的是机器上实际在跑的 boot（-boot 参数），不是编进本体的这份 boot 包。
+func VerifySlotFor(dir string, keys []ed25519.PublicKey, bootVersion int) (Manifest, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, ReleaseFile))
 	if err != nil {
 		return Manifest{}, err
@@ -60,8 +66,8 @@ func VerifySlot(dir string, keys []ed25519.PublicKey) (Manifest, error) {
 	if err != nil {
 		return m, err
 	}
-	if m.MinBoot > Version {
-		return m, fmt.Errorf("版本 %s 要引导器 %d，本机是 %d", m.Version, m.MinBoot, Version)
+	if m.MinBoot > bootVersion {
+		return m, fmt.Errorf("版本 %s 要引导器 %d，本机是 %d", m.Version, m.MinBoot, bootVersion)
 	}
 	for _, f := range m.Files {
 		n, sum, err := sumFile(filepath.Join(dir, f.Path))

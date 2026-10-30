@@ -22,6 +22,9 @@ import (
 	"epsilon/boot"
 )
 
+// OfflineBoot 是不联网的引导器从哪个版本起（docs/boot.md）。更旧的引导器自己下载，loader 不插手。
+const OfflineBoot = 2
+
 type Loader struct {
 	Root        string // boot 的根目录：A\ B\ boot-state.json staged.json …
 	Node        string
@@ -70,6 +73,9 @@ func other(slot string) string {
 // Stage 按 docs/boot.md "loader 的步骤"走一轮：有新版本就下到 current 以外的槽、验过、写 staged.json。
 // 返回这一轮是否写了 staged.json。没新东西、或者 boot 正在试 / 还没消费上一次的，什么都不做。
 func (l *Loader) Stage(ctx context.Context) (bool, error) {
+	if l.BootVersion < OfflineBoot {
+		return false, nil // 旧引导器自己会下载，插手就会和它抢同一个空闲槽
+	}
 	st, err := boot.ReadState(l.Root)
 	if err != nil {
 		return false, fmt.Errorf("读 %s: %w", boot.StateFile, err)
@@ -97,6 +103,11 @@ func (l *Loader) Stage(ctx context.Context) (bool, error) {
 	if err := l.fill(ctx, dir, rel, m); err != nil {
 		os.RemoveAll(dir)
 		return false, fmt.Errorf("槽 %s: %w", target, err)
+	}
+	// 下载要好一会儿：期间 boot 可能因为 current 坏了改跑 good，目标槽就成了 current。
+	// 再读一次 state，对不上就不交接（槽里的东西不删：它现在是 current，boot 会按版本核对发现不对）。
+	if st2, err := boot.ReadState(l.Root); err != nil || st2.Pending != "" || st2.Current == target {
+		return false, fmt.Errorf("下载期间 boot 换了槽（current=%q pending=%q），这次不交接", st2.Current, st2.Pending)
 	}
 	raw, _ := json.Marshal(boot.Staged{Slot: target, Version: m.Version})
 	if err := writeAtomic(filepath.Join(l.Root, boot.StagedFile), raw); err != nil {
@@ -146,7 +157,7 @@ func (l *Loader) fill(ctx context.Context, dir string, rel boot.Signed, m boot.M
 	if err := writeAtomic(filepath.Join(dir, boot.ReleaseFile), raw); err != nil {
 		return err
 	}
-	got, err := boot.VerifySlot(dir, l.Keys)
+	got, err := boot.VerifySlotFor(dir, l.Keys, l.BootVersion)
 	if err == nil && got.Version != m.Version {
 		err = fmt.Errorf("槽里是 %s，要的是 %s", got.Version, m.Version)
 	}
