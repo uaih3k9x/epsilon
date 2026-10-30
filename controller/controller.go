@@ -48,14 +48,18 @@ type node struct {
 	inflight int
 	downTill time.Time // 转发失败后暂停派活到这个时间
 	chunks   map[string]bool
+	logReq   int64    // 要它传日志（DesiredState.LogRequest）；0 = 不要
+	logs     *logsRec // 最近一次传上来的日志
 }
 
 type Controller struct {
-	cfg   Config
-	mu    sync.Mutex
-	nodes map[string]*node
-	now   func() time.Time
-	proxy *http.Client
+	cfg    Config
+	mu     sync.Mutex
+	nodes  map[string]*node
+	events map[string][]eventRec // 每台最近的事件，新的在后
+	evSeq  int64
+	now    func() time.Time
+	proxy  *http.Client
 
 	// 预热规则单独一把锁：peers 持着 mu 时会经 desiredFor 读规则。加锁顺序只能 mu → pmu。
 	pmu     sync.RWMutex
@@ -69,7 +73,7 @@ func New(cfg Config) *Controller {
 	if cfg.SeedsPerRoom <= 0 {
 		cfg.SeedsPerRoom = 2
 	}
-	c := &Controller{cfg: cfg, nodes: map[string]*node{}, now: time.Now, preload: map[string]preloadRule{},
+	c := &Controller{cfg: cfg, nodes: map[string]*node{}, events: map[string][]eventRec{}, now: time.Now, preload: map[string]preloadRule{},
 		proxy: &http.Client{Transport: &http.Transport{
 			DialContext:           (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
 			ResponseHeaderTimeout: 10 * time.Minute, // 长回答首字也可能慢
@@ -90,6 +94,10 @@ func (c *Controller) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/completions", c.apiAuth(c.route))
 	mux.HandleFunc("POST /v1/embeddings", c.apiAuth(c.route))
 	mux.HandleFunc("GET /v1/nodes", c.apiAuth(c.listNodes))
+	mux.HandleFunc("GET /v1/events", c.apiAuth(c.listEvents))
+	mux.HandleFunc("POST /v1/nodes/{node}/logs", c.apiAuth(c.requestLogs))
+	mux.HandleFunc("GET /v1/nodes/{node}/logs", c.apiAuth(c.nodeLogs))
+	mux.HandleFunc("POST /v1/logs", c.probeAuth(c.uploadLogs))
 	if c.cfg.FilesDir != "" { // 学生机上不了外网，要什么从主控拉
 		mux.Handle("GET /dl/", c.apiAuth(http.StripPrefix("/dl/", http.FileServer(http.Dir(c.cfg.FilesDir))).ServeHTTP))
 		mux.HandleFunc("GET /v1/boot/release", c.probeAuth(c.bootFile))
@@ -193,15 +201,19 @@ func (c *Controller) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	c.mu.Lock()
 	n, ok := c.nodes[hb.Node]
+	var logReq int64
 	if ok {
 		n.hb, n.addr, n.seen = hb, remoteIP(r), c.now()
+		logReq = n.logReq
 	}
 	c.mu.Unlock()
 	if !ok { // 主控重启过：让探针重新登记
 		http.Error(w, "unknown node", http.StatusConflict)
 		return
 	}
-	json.NewEncoder(w).Encode(c.desiredFor(hb.Node))
+	d := c.desiredFor(hb.Node)
+	d.LogRequest = logReq
+	json.NewEncoder(w).Encode(d)
 }
 
 // desiredFor 是配置里的期望状态，再并上匹配本节点的预热规则。
@@ -212,13 +224,6 @@ func (c *Controller) desiredFor(name string) proto.DesiredState {
 	}
 	d.Preload = mergePreload(d, c.preloadFor(name))
 	return d.Defaults()
-}
-
-func (c *Controller) event(w http.ResponseWriter, r *http.Request) {
-	var ev proto.Event
-	json.NewDecoder(r.Body).Decode(&ev)
-	log.Printf("事件 %s %s %s", ev.Node, ev.Kind, ev.Detail)
-	w.Write([]byte("{}"))
 }
 
 // alive: 心跳没过期、工作负载健康、最近没转发失败。调用方持锁。

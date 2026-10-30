@@ -146,7 +146,7 @@ func (s *Supervisor) health(cmd *exec.Cmd, w Workload) {
 
 		if !ok && !was && time.Since(start) > time.Duration(w.StartTimeoutSec)*time.Second {
 			s.mu.Lock()
-			s.event("health_failed", fmt.Sprintf("%s %d 秒内没通过健康检查", w.Model, w.StartTimeoutSec))
+			s.event("health_failed", fmt.Sprintf("%s %d 秒内没通过健康检查\n%s", w.Model, w.StartTimeoutSec, tailFile(w.Log, 1500)))
 			s.crashed = time.Now()
 			s.mu.Unlock()
 			s.Stop()

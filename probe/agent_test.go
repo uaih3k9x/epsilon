@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -60,6 +63,8 @@ type fakeController struct {
 	peerAt    []time.Time             // 每次问 peers 的时间
 	haves     []proto.Have
 	haveCode  int // 不为 0：/v1/have 回这个状态码
+
+	logs []proto.Logs
 }
 
 func (c *fakeController) handler() http.Handler {
@@ -140,6 +145,13 @@ func (c *fakeController) handler() http.Handler {
 		d := c.desired
 		c.mu.Unlock()
 		json.NewEncoder(w).Encode(d)
+	})
+	mux.HandleFunc("POST /v1/logs", func(w http.ResponseWriter, r *http.Request) {
+		var l proto.Logs
+		json.NewDecoder(r.Body).Decode(&l)
+		c.mu.Lock()
+		c.logs = append(c.logs, l)
+		c.mu.Unlock()
 	})
 	mux.HandleFunc("POST /v1/events", func(w http.ResponseWriter, r *http.Request) {
 		var ev proto.Event
@@ -229,9 +241,17 @@ func TestAgentStopsWhenControllerLost(t *testing.T) {
 }
 
 func startAgent(t *testing.T, d proto.DesiredState, sys *fakeSys) (*fakeController, *Agent) {
+	return startAgentWith(t, d, sys, nil)
+}
+
+// startAgentWith: setup 在 Agent 跑起来之前改它（测试专用的字段）。
+func startAgentWith(t *testing.T, d proto.DesiredState, sys *fakeSys, setup func(*Agent)) (*fakeController, *Agent) {
 	fc := &fakeController{desired: d}
 	srv := httptest.NewServer(fc.handler())
 	a := NewAgent(Config{Node: "n", Controller: srv.URL, Workloads: map[string]Workload{"fake": fakeWorkload(t, false)}}, sys, "test")
+	if setup != nil {
+		setup(a)
+	}
 	a.beatEvery, a.gpuEvery = 100*time.Millisecond, 20*time.Millisecond
 	a.vram.grace = 500 * time.Millisecond
 	stop := make(chan struct{})
@@ -323,5 +343,42 @@ func TestAgentConfirmsBootOnceOnline(t *testing.T) {
 	defer mu.Unlock()
 	if n != 1 || fc.last().Boot != "1/B" {
 		t.Fatalf("OnOnline called %d times, boot %q", n, fc.last().Boot)
+	}
+}
+
+// 主控点名要日志：传一次探针日志和工作负载日志的末尾；同一个请求号不重复传。
+func TestAgentUploadsLogsOnRequest(t *testing.T) {
+	dir := t.TempDir()
+	probeLog, wlLog := filepath.Join(dir, "probe.log"), filepath.Join(dir, "fake.log")
+	os.WriteFile(probeLog, []byte(strings.Repeat("x", 100<<10)+"\nprobe tail line\n"), 0o644)
+	fc, a := startAgentWith(t, proto.DesiredState{Workload: "fake", HeartbeatSeconds: 1}, &fakeSys{idle: 9999},
+		func(a *Agent) {
+			a.LogPath = probeLog
+			w := a.cfg.Workloads["fake"]
+			w.Log = wlLog
+			a.cfg.Workloads["fake"] = w
+		})
+	waitFor(t, "serving", func() bool { return fc.last().Serving != nil })
+	fc.mu.Lock()
+	fc.desired.LogRequest = 42 // 起来以后才点名要日志，这时工作负载日志里已经有东西
+	fc.mu.Unlock()
+	_ = a
+	waitFor(t, "logs uploaded", func() bool { fc.mu.Lock(); defer fc.mu.Unlock(); return len(fc.logs) > 0 })
+	time.Sleep(400 * time.Millisecond) // 又过了几次心跳，请求号没变
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if len(fc.logs) != 1 {
+		t.Fatalf("同一个请求号只传一次，传了 %d 次", len(fc.logs))
+	}
+	l := fc.logs[0]
+	if l.Node != "n" || l.Request != 42 {
+		t.Fatalf("logs: %+v", l)
+	}
+	pl := l.Files["probe.log"]
+	if !strings.HasSuffix(pl, "probe tail line\n") || len(pl) > 64<<10 {
+		t.Fatalf("探针日志要末尾、最多 64 KB: 长 %d", len(pl))
+	}
+	if !strings.Contains(l.Files["fake.log"], "启动") {
+		t.Fatalf("工作负载日志: %q", l.Files["fake.log"])
 	}
 }

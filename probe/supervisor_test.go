@@ -19,6 +19,10 @@ func TestMain(m *testing.M) {
 			fmt.Fprintln(os.Stderr, "fake crashing")
 			os.Exit(3)
 		}
+		if os.Getenv("EPSILON_FAKE_HANG") == "1" { // 模型加载卡住：有输出，但永远不健康
+			fmt.Fprintln(os.Stderr, "loading model: cudaMalloc failed: out of memory")
+			time.Sleep(time.Hour) // 不能用 select{}：没有别的 goroutine 时运行时会判死锁直接退出
+		}
 		http.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `{"status":"ok"}`) })
 		http.ListenAndServe("127.0.0.1:"+port, nil)
 		os.Exit(0)
@@ -120,4 +124,28 @@ func TestSupervisorCrashBacksOff(t *testing.T) {
 	time.Sleep(350 * time.Millisecond)
 	s.Ensure("bad", w, true)
 	waitFor(t, "second crash", func() bool { s.mu.Lock(); defer s.mu.Unlock(); return s.crashes >= 2 })
+}
+
+// 加载卡住超时：事件要带上工作负载日志末尾，不然只知道"没起来"，得跑去机器上看。
+func TestSupervisorHealthFailedCarriesLogTail(t *testing.T) {
+	s := NewSupervisor()
+	s.backoff = time.Hour
+	defer s.Stop()
+	w := fakeWorkload(t, false)
+	w.env = append(w.env, "EPSILON_FAKE_HANG=1")
+	w.StartTimeoutSec = 1
+	w.Log = filepath.Join(t.TempDir(), "w.log")
+	s.Ensure("hang", w, true)
+	var ev string
+	waitFor(t, "health_failed", func() bool {
+		for _, e := range s.DrainEvents() {
+			if e.Kind == "health_failed" {
+				ev = e.Detail
+			}
+		}
+		return ev != ""
+	})
+	if !strings.Contains(ev, "out of memory") {
+		t.Fatalf("health_failed 要带日志末尾: %q", ev)
+	}
 }

@@ -114,3 +114,17 @@ curl -H "$K" -X DELETE 'http://<controller>:8090/v1/cache/preload?manifest=qwen3
 - 一台机器一次只跑一个工作负载；
 - 主控把节点表放内存，重启后探针会被要求重新登记（自动）；
 - 路由在已经开始回数据后不换节点：学生机中途让位，那个请求会断。
+
+## 远程排障（不用跑到学生机跟前）
+
+- 工作负载崩溃（`crash`）、加载超时（`health_failed`）的事件都带工作负载日志最后 1.5 KB；主控每台留最近 50 条：`GET /v1/events?node=&kind=&limit=`。
+- 点名要日志：`POST /v1/nodes/{node}/logs` → 探针下次心跳把探针日志和各工作负载日志的末尾（各 64 KB）经 `POST /v1/logs` 传上来 → `GET /v1/nodes/{node}/logs` 取。探针 0.3.1 起支持。
+- 命令行：
+
+```sh
+export EPS=http://<controller>:8090 EPS_KEY=<api key>
+pilot/eps-logs.sh events                 # 全部机器最近 30 条
+pilot/eps-logs.sh events pc-01 crash     # 某台的某类事件
+pilot/eps-logs.sh logs pc-01             # 要日志并打印
+```
+

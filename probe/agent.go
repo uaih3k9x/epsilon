@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,6 +51,10 @@ type Agent struct {
 
 	Boot     string // 引导器版本/槽位，原样上报
 	OnOnline func() // 第一次心跳成功时调一次：告诉引导器"这个版本能用"
+	LogPath  string // 探针自己的日志；主控要日志时一起传
+
+	logDone atomic.Int64 // 已经传过的日志请求号
+	logBusy atomic.Bool  // 正在传，别重复开
 
 	// P2P 分发（docs/p2p.md）。块缓存和拼装在 chunk 包里，由 main 注入；Chunks 为 nil 时期望状态里的 artifacts 永远备不齐。
 	Chunks   ChunkStore
@@ -275,6 +280,9 @@ func (a *Agent) heartbeat(obs Observed) bool {
 	}
 	a.desired = d.Defaults()
 	a.upload.setMbps(d.P2PUploadMbps)
+	if d.LogRequest != 0 && d.LogRequest != a.logDone.Load() && a.logBusy.CompareAndSwap(false, true) {
+		go a.uploadLogs(d.LogRequest)
+	}
 	a.lastOK = time.Now()
 	if a.OnOnline != nil {
 		a.OnOnline()
@@ -323,4 +331,24 @@ func (a *Agent) Shutdown() {
 		a.p2pSrv.Close()
 	}
 	a.sup.Stop()
+}
+
+// uploadLogs 把探针日志和各工作负载日志的末尾（每个最多 64 KB）传给主控。传成功才算处理过，失败了下次心跳再传。
+func (a *Agent) uploadLogs(req int64) {
+	defer a.logBusy.Store(false)
+	files := map[string]string{}
+	add := func(path string) {
+		if t := tailFile(path, 64<<10); t != "" {
+			files[filepath.Base(path)] = t
+		}
+	}
+	add(a.LogPath)
+	for _, w := range a.cfg.Workloads {
+		add(w.Log)
+	}
+	if err := a.post("/v1/logs", proto.Logs{Node: a.cfg.Node, Request: req, Files: files}, nil); err != nil {
+		log.Printf("日志没传上去（下次心跳再传）: %v", err)
+		return
+	}
+	a.logDone.Store(req)
 }

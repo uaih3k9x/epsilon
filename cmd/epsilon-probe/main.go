@@ -16,7 +16,7 @@ import (
 	"epsilon/proto"
 )
 
-var version = "0.3.0"
+var version = "0.3.1"
 
 func main() {
 	exe, _ := os.Executable()
@@ -46,6 +46,7 @@ func main() {
 
 	a := probe.NewAgent(cfg, probe.RealSystem{}, version)
 	a.Boot = *boot
+	a.LogPath = *logPath
 	if *confirm != "" {
 		a.OnOnline = func() {
 			if err := os.WriteFile(*confirm, []byte(version), 0o644); err != nil {

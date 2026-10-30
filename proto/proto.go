@@ -58,6 +58,7 @@ type DesiredState struct {
 	MaxOfflineMins   int      `json:"max_offline_minutes"`       // 主控失联多久后停掉工作负载
 	Artifacts        []string `json:"artifacts,omitempty"`       // 当前工作负载要用的制品（manifest ID）；没备齐前不起工作负载
 	Preload          []string `json:"preload,omitempty"`         // 预热：后台拉进本地缓存但不拼文件、不影响工作负载；排在 Artifacts 之后拉
+	LogRequest       int64    `json:"log_request,omitempty"`     // 非 0 且和上次处理过的不同：把日志末尾经 POST /v1/logs 传上来
 	P2PUploadMbps    int      `json:"p2p_upload_mbps,omitempty"` // 分块服务上传限速；0 = 不限
 }
 
@@ -111,4 +112,11 @@ type Have struct {
 type Peers struct {
 	Sources           map[string][]string `json:"sources"`
 	RetryAfterSeconds int                 `json:"retry_after_seconds,omitempty"`
+}
+
+// Logs 是探针应主控要求（DesiredState.LogRequest）传上来的日志末尾：文件名 → 末尾若干字节。
+type Logs struct {
+	Node    string            `json:"node"`
+	Request int64             `json:"request"`
+	Files   map[string]string `json:"files"`
 }
