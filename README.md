@@ -11,7 +11,7 @@ ProjectEpsilon 的探针和主控，v0.1。设计书在内部仓库（未公开�
 
 主控只能说"跑哪个**名字**的工作负载"；名字对应哪个 exe、什么参数，写死在每台机器自己的 `probe.json` 里。主控被冒充也只能在本机允许的几个程序里挑，不能执行任意命令。
 
-本体发布由 `epsilon-boot.exe`（引导器）按 A/B 槽管理：ed25519 验签、试启动失败自动回退、`canary_nodes` 灰度（设计书 11.9）。还没有 HTTPS：探针和主控之间靠 `probe_token`，路由靠 `api_keys`，只在机房内网用。
+本体发布按 A/B 槽管理（设计书 11.9，契约见 `docs/boot.md`）：`epsilon-boot.exe`（引导器）冻结进镜像、**不联网**，只做挑槽、ed25519 验签、试启动、失败回退；问主控要新版本、下载到空闲槽、写 `staged.json` 交给引导器的是本体里的 loader（`loader/`，随本体发布，`canary_nodes` 灰度照旧）。引导器的事件先记在本地 `boot-events.jsonl`，由 loader 转发到主控。还没有 HTTPS：探针和主控之间靠 `probe_token`，路由靠 `api_keys`，只在机房内网用。
 
 ## 部署配置（不进仓库）
 
@@ -43,6 +43,16 @@ D:\epsilon\
 开机自启：在 `shell:startup`（启动文件夹）里放一个指向 `D:\epsilon\epsilon-probe.exe` 的快捷方式。探针要和学生在同一个登录会话里才能读到键鼠空闲时间，所以 v0.1 用启动文件夹，不用 Windows 服务。启动文件夹在 C 盘、会被还原的话，就得把这个快捷方式做进镜像，或者每次手动双击。
 
 日志在 `D:\epsilon\probe.log`。
+
+### 引导器与升级（契约见 `docs/boot.md`）
+
+装了引导器的机器上，`D:\epsilon` 是引导器根目录：`A\`、`B\` 两个槽放本体，`boot-state.json`、`boot-events.jsonl` 只有引导器写，`staged.json`、`boot-events.sent` 由 loader 写。
+
+- 首次安装：引导器不下载，先用本体放进第一个版本，再启动引导器：
+  `epsilon-probe.exe -seed -config D:\epsilon\probe.json -root D:\epsilon`（从主控 `/dl/` 下到临时目录运行即可）。跑一轮就退出，成功退出码 0，失败非 0 并在输出和日志里写原因。
+- 平时：引导器启动本体时带 `-boot <引导器版本>/<槽> -root <根目录>`，本体就在后台每 10 分钟跑一次 loader：主控有新版本就下到当前槽以外的那个槽、验签验哈希、写 `staged.json`，引导器看到后切过去试启动；同时把引导器的事件转发到主控（`GET /v1/events` 能查到，detail 末尾带引导器记的时间）。
+- 不带 `-boot` 直接运行本体（手动排障）时不跑 loader。
+- 发布签名公钥在 `cmd/epsilon-boot/keys.go` 和 `loader/keys.go` 各一份，必须一致（有测试比对）；换公钥要重做引导器镜像。
 
 ### 模型分发（第 2 阶段，契约见 `docs/p2p.md`）
 
