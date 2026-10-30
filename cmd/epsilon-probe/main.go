@@ -11,10 +11,12 @@ import (
 	"strings"
 	"time"
 
+	"epsilon/chunk"
 	"epsilon/probe"
+	"epsilon/proto"
 )
 
-var version = "0.2.0"
+var version = "0.3.0"
 
 func main() {
 	exe, _ := os.Executable()
@@ -50,6 +52,16 @@ func main() {
 				log.Printf("写确认文件: %v", err)
 			}
 		}
+	}
+	store, err := chunk.NewStore(cfg.ChunkDir, cfg.ChunkQuotaGB<<30)
+	if err != nil {
+		log.Fatal(err)
+	}
+	a.Chunks = store
+	a.Ready = chunk.Ready
+	a.Assemble = func(m proto.Manifest, root string) error { return chunk.Assemble(m, store, root) }
+	if err := a.ListenP2P(); err != nil { // 要在 Run 之前：登记时要报端口
+		log.Printf("分块服务没起来（只拉不供）: %v", err)
 	}
 	stop := make(chan struct{})
 	sig := make(chan os.Signal, 1)

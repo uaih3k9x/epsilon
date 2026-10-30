@@ -3,6 +3,7 @@ package probe
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
 
@@ -87,5 +88,48 @@ func TestLoadConfigMergesSlotWorkloads(t *testing.T) {
 	}
 	if c.Token != "t" || c.Workloads["rpc"].StartTimeoutSec != 300 {
 		t.Fatalf("defaults: %+v", c)
+	}
+}
+
+func TestLoadConfigP2PDefaults(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "probe.json")
+	os.WriteFile(p, []byte(`{"controller":"http://10.0.0.1:8090","workloads":{}}`), 0o600)
+	c, err := LoadConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ArtifactRoot != dir || c.ChunkDir != filepath.Join(dir, "chunks") {
+		t.Errorf("artifact_root=%q chunk_dir=%q", c.ArtifactRoot, c.ChunkDir)
+	}
+	if c.ChunkQuotaGB != 100 || c.P2PPort != 47100 {
+		t.Errorf("quota=%d port=%d", c.ChunkQuotaGB, c.P2PPort)
+	}
+}
+
+func TestLoadConfigP2PExplicit(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "probe.json")
+	root := filepath.Join(dir, "data")
+	os.WriteFile(p, []byte(`{"controller":"http://x","p2p_port":0,"chunk_quota_gb":20,
+	  "artifact_root":`+strconv.Quote(root)+`}`), 0o600)
+	c, err := LoadConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.P2PPort != 0 {
+		t.Errorf("p2p_port 写了 0 就是不开，got %d", c.P2PPort)
+	}
+	if c.ArtifactRoot != root || c.ChunkDir != filepath.Join(root, "chunks") || c.ChunkQuotaGB != 20 {
+		t.Errorf("%+v", c)
+	}
+
+	// 相对路径按 probe.json 所在目录算：开机自启时工作目录不可靠
+	os.WriteFile(p, []byte(`{"controller":"http://x","p2p_port":47200,"artifact_root":"models","chunk_dir":"cache"}`), 0o600)
+	if c, err = LoadConfig(p); err != nil {
+		t.Fatal(err)
+	}
+	if c.P2PPort != 47200 || c.ArtifactRoot != filepath.Join(dir, "models") || c.ChunkDir != filepath.Join(dir, "models", "cache") {
+		t.Errorf("%+v", c)
 	}
 }

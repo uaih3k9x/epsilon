@@ -11,7 +11,9 @@ type Register struct {
 	Hostname string   `json:"hostname"`
 	GPUs     []GPU    `json:"gpus,omitempty"`
 	MemoryMB int      `json:"memory_mb,omitempty"`
-	Workload []string `json:"workloads"` // 本机配置里允许跑的工作负载名
+	Workload []string `json:"workloads"`          // 本机配置里允许跑的工作负载名
+	P2PPort  int      `json:"p2p_port,omitempty"` // 本机分块服务端口；0 = 不提供
+	Chunks   []string `json:"chunks,omitempty"`   // 登记时本地已有的全部块（之后用 /v1/have 增量报）
 }
 
 // Heartbeat 是周期上报；主控的回复是 DesiredState。
@@ -53,7 +55,10 @@ type DesiredState struct {
 	KeepWarm         bool     `json:"keep_warm"`            // 有人用电脑时模型留在显存里，只停接新请求
 	ForeignVRAMMB    int      `json:"foreign_vram_mb"`      // 别人比模型刚加载好时多占这么多显存就卸载；0 = 不看
 	HeartbeatSeconds int      `json:"heartbeat_seconds"`
-	MaxOfflineMins   int      `json:"max_offline_minutes"` // 主控失联多久后停掉工作负载
+	MaxOfflineMins   int      `json:"max_offline_minutes"`       // 主控失联多久后停掉工作负载
+	Artifacts        []string `json:"artifacts,omitempty"`       // 当前工作负载要用的制品（manifest ID）；没备齐前不起工作负载
+	Preload          []string `json:"preload,omitempty"`         // 预热：后台拉进本地缓存但不拼文件、不影响工作负载；排在 Artifacts 之后拉
+	P2PUploadMbps    int      `json:"p2p_upload_mbps,omitempty"` // 分块服务上传限速；0 = 不限
 }
 
 // Event 是让位、崩溃这类值得记一笔的事。
@@ -75,4 +80,35 @@ func (d DesiredState) Defaults() DesiredState {
 		d.MaxOfflineMins = 30
 	}
 	return d
+}
+
+// ---- 第 2 阶段：教室内 P2P 分块分发（契约见 docs/p2p.md）----
+
+// Manifest 描述一个制品（比如一个模型）：由哪些文件组成、每个文件切成哪些块。块 ID = 块内容的 sha256（小写十六进制）。
+type Manifest struct {
+	ID        string         `json:"id"`         // 如 "qwen3.5-4b-q4km"
+	ChunkSize int64          `json:"chunk_size"` // 字节；最后一块可以更小
+	Files     []ManifestFile `json:"files"`
+}
+
+type ManifestFile struct {
+	Path   string   `json:"path"` // 相对路径，正斜杠，不许 .. 和绝对路径；落到探针的 artifact_root 下
+	Size   int64    `json:"size"`
+	SHA256 string   `json:"sha256"` // 整个文件
+	Chunks []string `json:"chunks"` // 按顺序
+}
+
+// Have 是探针增量报告本地块缓存的变化（每存好一块就报，淘汰了也报）。
+type Have struct {
+	Node string   `json:"node"`
+	Add  []string `json:"add,omitempty"`
+	Del  []string `json:"del,omitempty"`
+}
+
+// Peers 是 GET /v1/peers?manifest=&node= 的回复：每个块去哪拿，按优先级排好（同交换机 > 同教室 > 其他 > 主控）。
+// 来源是 "http://ip:port" 形式的邻居地址；空字符串 "" 表示主控自己（走 GET /v1/chunks/{hash}）。
+// 某块的列表为空 = 现在没人能给你，过 RetryAfterSeconds 再问（种子还在拉）。
+type Peers struct {
+	Sources           map[string][]string `json:"sources"`
+	RetryAfterSeconds int                 `json:"retry_after_seconds,omitempty"`
 }

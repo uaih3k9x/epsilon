@@ -26,9 +26,18 @@ type Config struct {
 	APIKeys      []string                      `json:"api_keys"`      // 空 = 路由不验 key
 	StaleSeconds int                           `json:"stale_seconds"` // 多久没心跳算掉线
 	Default      proto.DesiredState            `json:"default"`
-	Nodes        map[string]proto.DesiredState `json:"nodes"`        // 按节点整个覆盖默认值
-	FilesDir     string                        `json:"files_dir"`    // 给学生机下载的文件（运行库、新版探针）；空 = 不开
-	CanaryNodes  []string                      `json:"canary_nodes"` // 这些节点的引导器取 release-canary/ 里的本体，其余取 release/
+	Nodes        map[string]proto.DesiredState `json:"nodes"`          // 按节点整个覆盖默认值
+	FilesDir     string                        `json:"files_dir"`      // 给学生机下载的文件（运行库、新版探针）；空 = 不开
+	CanaryNodes  []string                      `json:"canary_nodes"`   // 这些节点的引导器取 release-canary/ 里的本体，其余取 release/
+	ChunksDir    string                        `json:"chunks_dir"`     // 制品清单和块（docs/p2p.md）；空 = 不开 P2P 接口
+	Topology     map[string]Place              `json:"topology"`       // 节点在哪间教室、哪台交换机，peers 排序用
+	SeedsPerRoom int                           `json:"seeds_per_room"` // 每间教室几台种子可以直接从主控拉块（默认 2）
+}
+
+// Place 是节点的物理位置；不在 Topology 里的节点两项都是空串。
+type Place struct {
+	Room   string `json:"room"`
+	Switch string `json:"switch"`
 }
 
 type node struct {
@@ -38,6 +47,7 @@ type node struct {
 	seen     time.Time
 	inflight int
 	downTill time.Time // 转发失败后暂停派活到这个时间
+	chunks   map[string]bool
 }
 
 type Controller struct {
@@ -46,17 +56,28 @@ type Controller struct {
 	nodes map[string]*node
 	now   func() time.Time
 	proxy *http.Client
+
+	// 预热规则单独一把锁：peers 持着 mu 时会经 desiredFor 读规则。加锁顺序只能 mu → pmu。
+	pmu     sync.RWMutex
+	preload map[string]preloadRule // manifest → 规则
 }
 
 func New(cfg Config) *Controller {
 	if cfg.StaleSeconds <= 0 {
 		cfg.StaleSeconds = 30
 	}
-	return &Controller{cfg: cfg, nodes: map[string]*node{}, now: time.Now,
+	if cfg.SeedsPerRoom <= 0 {
+		cfg.SeedsPerRoom = 2
+	}
+	c := &Controller{cfg: cfg, nodes: map[string]*node{}, now: time.Now, preload: map[string]preloadRule{},
 		proxy: &http.Client{Transport: &http.Transport{
 			DialContext:           (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
 			ResponseHeaderTimeout: 10 * time.Minute, // 长回答首字也可能慢
 		}}}
+	if cfg.ChunksDir != "" {
+		c.loadPreload()
+	}
+	return c
 }
 
 func (c *Controller) Handler() http.Handler {
@@ -73,6 +94,15 @@ func (c *Controller) Handler() http.Handler {
 		mux.Handle("GET /dl/", c.apiAuth(http.StripPrefix("/dl/", http.FileServer(http.Dir(c.cfg.FilesDir))).ServeHTTP))
 		mux.HandleFunc("GET /v1/boot/release", c.probeAuth(c.bootFile))
 		mux.HandleFunc("GET /v1/boot/files/{name}", c.probeAuth(c.bootFile))
+	}
+	if c.cfg.ChunksDir != "" {
+		mux.HandleFunc("GET /v1/manifests/{id}", c.probeAuth(c.manifest))
+		mux.HandleFunc("GET /v1/chunks/{hash}", c.probeAuth(c.chunk))
+		mux.HandleFunc("GET /v1/peers", c.probeAuth(c.peers))
+		mux.HandleFunc("POST /v1/have", c.probeAuth(c.have))
+		mux.HandleFunc("GET /v1/cache", c.apiAuth(c.cacheStats))
+		mux.HandleFunc("POST /v1/cache/preload", c.apiAuth(c.setPreload))
+		mux.HandleFunc("DELETE /v1/cache/preload", c.apiAuth(c.delPreload))
 	}
 	return mux
 }
@@ -143,7 +173,13 @@ func (c *Controller) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c.mu.Lock()
-	c.nodes[reg.Node] = &node{reg: reg, addr: remoteIP(r), seen: c.now()}
+	chunks := make(map[string]bool, len(reg.Chunks))
+	for _, h := range reg.Chunks {
+		if chunkHash.MatchString(h) {
+			chunks[h] = true
+		}
+	}
+	c.nodes[reg.Node] = &node{reg: reg, addr: remoteIP(r), seen: c.now(), chunks: chunks}
 	c.mu.Unlock()
 	log.Printf("登记 %s (%s) 探针 %s 工作负载 %v", reg.Node, remoteIP(r), reg.Version, reg.Workload)
 	w.Write([]byte("{}"))
@@ -168,11 +204,14 @@ func (c *Controller) heartbeat(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(c.desiredFor(hb.Node))
 }
 
+// desiredFor 是配置里的期望状态，再并上匹配本节点的预热规则。
 func (c *Controller) desiredFor(name string) proto.DesiredState {
-	if d, ok := c.cfg.Nodes[name]; ok {
-		return d.Defaults()
+	d, ok := c.cfg.Nodes[name]
+	if !ok {
+		d = c.cfg.Default
 	}
-	return c.cfg.Default.Defaults()
+	d.Preload = mergePreload(d, c.preloadFor(name))
+	return d.Defaults()
 }
 
 func (c *Controller) event(w http.ResponseWriter, r *http.Request) {
@@ -329,6 +368,7 @@ func (c *Controller) listNodes(w http.ResponseWriter, _ *http.Request) {
 		Foreign  []string    `json:"foreign_gpu"`
 		Inflight int         `json:"inflight"`
 		GPUs     []proto.GPU `json:"gpus"`
+		Chunks   int         `json:"chunks"` // 持有的块数
 	}
 	c.mu.Lock()
 	now := c.now()
@@ -340,7 +380,7 @@ func (c *Controller) listNodes(w http.ResponseWriter, _ *http.Request) {
 		}
 		rows = append(rows, row{Node: name, Addr: n.addr, Version: v, Boot: n.hb.Boot, AgoSec: int(now.Sub(n.seen).Seconds()),
 			Running: n.hb.Running, Serving: c.alive(n, now), Reason: n.hb.Reason, Idle: n.hb.IdleSeconds, Foreign: n.hb.ForeignGPU,
-			Inflight: n.inflight, GPUs: n.hb.GPUs})
+			Inflight: n.inflight, GPUs: n.hb.GPUs, Chunks: len(n.chunks)})
 	}
 	c.mu.Unlock()
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Node < rows[j].Node })

@@ -14,5 +14,11 @@
   },
   "nodes": {
     "pc-28": {}
+  },
+  "chunks_dir": "/opt/epsilon/chunks",
+  "seeds_per_room": 2,
+  "topology": {
+    "pc-01": {"room": "R1", "switch": "R1U12"},
+    "pc-02": {"room": "R1", "switch": "R1U12"}
   }
 }

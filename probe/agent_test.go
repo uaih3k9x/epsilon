@@ -46,19 +46,91 @@ type fakeController struct {
 	mu       sync.Mutex
 	desired  proto.DesiredState
 	register int
+	regs     []proto.Register
 	beats    []proto.Heartbeat
 	events   []proto.Event
 	auth     string
+
+	// P2P（p2p_fetch_test.go 用）
+	manifests map[string]proto.Manifest
+	chunks    map[string][]byte       // 主控自己能给的块
+	chunkHits int                     // 主控 /v1/chunks 被要了几次
+	gate      chan struct{}           // 不为 nil：主控发块前等它关上
+	peers     func(n int) proto.Peers // n = 第几次问（从 1 开始）；nil = 每块都只有主控
+	peerAt    []time.Time             // 每次问 peers 的时间
+	haves     []proto.Have
+	haveCode  int // 不为 0：/v1/have 回这个状态码
 }
 
 func (c *fakeController) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/register", func(w http.ResponseWriter, r *http.Request) {
+		var reg proto.Register
+		json.NewDecoder(r.Body).Decode(&reg)
 		c.mu.Lock()
 		c.register++
+		c.regs = append(c.regs, reg)
 		c.auth = r.Header.Get("Authorization")
 		c.mu.Unlock()
 		w.Write([]byte("{}"))
+	})
+	mux.HandleFunc("GET /v1/manifests/{id}", func(w http.ResponseWriter, r *http.Request) {
+		c.mu.Lock()
+		m, ok := c.manifests[r.PathValue("id")]
+		c.mu.Unlock()
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		json.NewEncoder(w).Encode(m)
+	})
+	mux.HandleFunc("GET /v1/peers", func(w http.ResponseWriter, r *http.Request) {
+		c.mu.Lock()
+		c.peerAt = append(c.peerAt, time.Now())
+		n, fn, m := len(c.peerAt), c.peers, c.manifests[r.URL.Query().Get("manifest")]
+		c.mu.Unlock()
+		if r.URL.Query().Get("node") == "" {
+			http.Error(w, "no node", http.StatusBadRequest)
+			return
+		}
+		var p proto.Peers
+		if fn != nil {
+			p = fn(n)
+		} else {
+			p.Sources = map[string][]string{}
+			for _, f := range m.Files {
+				for _, h := range f.Chunks {
+					p.Sources[h] = []string{""}
+				}
+			}
+		}
+		json.NewEncoder(w).Encode(p)
+	})
+	mux.HandleFunc("GET /v1/chunks/{hash}", func(w http.ResponseWriter, r *http.Request) {
+		c.mu.Lock()
+		c.chunkHits++
+		b, ok := c.chunks[r.PathValue("hash")]
+		gate := c.gate
+		c.mu.Unlock()
+		if gate != nil {
+			<-gate
+		}
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write(b)
+	})
+	mux.HandleFunc("POST /v1/have", func(w http.ResponseWriter, r *http.Request) {
+		var h proto.Have
+		json.NewDecoder(r.Body).Decode(&h)
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.haveCode != 0 {
+			w.WriteHeader(c.haveCode)
+			return
+		}
+		c.haves = append(c.haves, h)
 	})
 	mux.HandleFunc("POST /v1/heartbeat", func(w http.ResponseWriter, r *http.Request) {
 		var hb proto.Heartbeat

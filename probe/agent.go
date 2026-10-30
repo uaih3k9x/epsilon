@@ -2,11 +2,14 @@ package probe
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"epsilon/proto"
@@ -28,9 +31,9 @@ type Agent struct {
 	version string
 
 	desired    proto.DesiredState
-	registered bool
-	lastOK     time.Time // 最近一次心跳成功
-	reason     string    // 上一轮不跑的原因，变化时记事件
+	registered atomic.Bool // 拉取的 goroutine 收到 have 409 也会置 false
+	lastOK     time.Time   // 最近一次心跳成功
+	reason     string      // 上一轮不跑的原因，变化时记事件
 
 	gpus    []proto.GPU
 	foreign []string
@@ -47,13 +50,52 @@ type Agent struct {
 
 	Boot     string // 引导器版本/槽位，原样上报
 	OnOnline func() // 第一次心跳成功时调一次：告诉引导器"这个版本能用"
+
+	// P2P 分发（docs/p2p.md）。块缓存和拼装在 chunk 包里，由 main 注入；Chunks 为 nil 时期望状态里的 artifacts 永远备不齐。
+	Chunks   ChunkStore
+	Assemble func(m proto.Manifest, root string) error // 块齐了按清单拼成文件落到 root 下
+	Ready    func(m proto.Manifest, root string) bool  // 拼好的文件还在、和清单一致（只看 stat 和校验戳）
+
+	upload    *limiter // 分块服务上传限速，跟着期望状态走
+	p2pSrv    *http.Server
+	p2pPort   int          // 分块服务实际端口；0 = 没开
+	p2pClient *http.Client // 取块用：块有 64 MiB，不能套 10 秒总超时，靠 sourceTimeout
+
+	fetchParallel int           // 并发取块数
+	sourceTimeout time.Duration // 单个来源多久没给完一块就换下一个
+	retryUnit     time.Duration // retry_after_seconds 的单位，测试里缩短
+	fetchRetry    time.Duration // 一次拉取失败后多久再来
+
+	// 以下只在 Step 里碰
+	wantArts []string             // 上次看到的期望 artifacts，变了才重新核对
+	wantPre  []string             // 上次看到的期望预热
+	ready    map[string]bool      // 已备齐的制品（缓存：只在期望变化、拉取结束时更新）
+	jobs     map[string]*fetchJob // 正在后台拉的
+	failedAt map[string]time.Time // 上次拉失败的时间，过 fetchRetry 再来
+	lastErr  map[string]string    // 上次失败的原因，一样就不再发事件
+
+	fetchCtx  context.Context // Shutdown 时取消全部后台拉取
+	stopFetch context.CancelFunc
+
+	fmu       sync.Mutex // 以下和后台拉取共享
+	wanted    []string
+	manifests map[string]proto.Manifest
+	results   []fetchResult
+
+	hmu              sync.Mutex // /v1/have 一次一个，没报出去的攒着
+	haveAdd, haveDel []string
 }
 
 func NewAgent(cfg Config, sys System, version string) *Agent {
-	return &Agent{cfg: cfg, sys: sys, sup: NewSupervisor(), version: version,
+	a := &Agent{cfg: cfg, sys: sys, sup: NewSupervisor(), version: version,
 		client: &http.Client{Timeout: 10 * time.Second}, desired: proto.DesiredState{}.Defaults(),
 		lastOK: time.Now(), maxOfflineUnit: time.Minute, gpuEvery: 5 * time.Second,
-		vram: vramBook{grace: 30 * time.Second}}
+		vram: vramBook{grace: 30 * time.Second}, upload: newLimiter(), p2pClient: &http.Client{},
+		fetchParallel: 4, sourceTimeout: 30 * time.Second, retryUnit: time.Second, fetchRetry: time.Minute,
+		ready: map[string]bool{}, jobs: map[string]*fetchJob{}, failedAt: map[string]time.Time{}, lastErr: map[string]string{},
+		manifests: map[string]proto.Manifest{}}
+	a.fetchCtx, a.stopFetch = context.WithCancel(context.Background())
+	return a
 }
 
 // Run 每 step 看一次要不要让位（便宜：只读键鼠空闲），显卡每 5 秒查一次，心跳按间隔发。
@@ -71,12 +113,12 @@ func (a *Agent) Run(stop <-chan struct{}, step time.Duration) {
 }
 
 func (a *Agent) Step(now time.Time) {
-	if !a.registered {
+	if !a.registered.Load() {
 		a.register()
 	}
 	if now.Sub(a.gpuAt) >= a.gpuEvery {
 		a.gpus = a.sys.GPUs()
-		a.foreign = ForeignApps(a.sys.ComputeApps(), a.sup.Status().PID)
+		a.foreign = ForeignApps(a.sys.ComputeApps(), a.sup.Status().PID, a.cfg.GPUIgnore...)
 		a.gpuAt = now
 	}
 	st := a.sup.Status()
@@ -91,6 +133,9 @@ func (a *Agent) Step(now time.Time) {
 	w, known := a.cfg.Workloads[a.desired.Workload]
 	if mode != Stop && !known {
 		mode, why = Stop, "unknown_workload"
+	}
+	if !a.artifactsReady(now) && mode != Stop { // 不跑的时候也要拉：趁没人用、在时段外先备好
+		mode, why = Stop, "fetching"
 	}
 	if why == "foreign_vram" {
 		a.vram.waiting = true // 卸载之后要等显存空出来才装回去
@@ -201,12 +246,15 @@ func (a *Agent) register() {
 		names = append(names, n)
 	}
 	req := proto.Register{Node: a.cfg.Node, Version: a.version, Boot: a.Boot, Hostname: host,
-		GPUs: a.sys.GPUs(), MemoryMB: a.sys.MemFreeMB(), Workload: names}
+		GPUs: a.sys.GPUs(), MemoryMB: a.sys.MemFreeMB(), Workload: names, P2PPort: a.p2pPort}
+	if a.Chunks != nil {
+		req.Chunks = a.Chunks.List() // 主控以此重置这台的块表，之后靠 /v1/have 增量
+	}
 	if err := a.post("/v1/register", req, nil); err != nil {
 		log.Printf("登记失败: %v", err)
 		return
 	}
-	a.registered = true
+	a.registered.Store(true)
 }
 
 func (a *Agent) heartbeat(obs Observed) bool {
@@ -221,11 +269,12 @@ func (a *Agent) heartbeat(obs Observed) bool {
 	if err := a.post("/v1/heartbeat", hb, &d); err != nil {
 		log.Printf("心跳失败: %v", err)
 		if err == errUnknownNode {
-			a.registered = false
+			a.registered.Store(false)
 		}
 		return false
 	}
 	a.desired = d.Defaults()
+	a.upload.setMbps(d.P2PUploadMbps)
 	a.lastOK = time.Now()
 	if a.OnOnline != nil {
 		a.OnOnline()
@@ -267,5 +316,11 @@ func (a *Agent) post(path string, body, out any) error {
 	return nil
 }
 
-// Shutdown 退出前停掉工作负载。
-func (a *Agent) Shutdown() { a.sup.Stop() }
+// Shutdown 退出前停掉工作负载、后台拉取和分块服务。
+func (a *Agent) Shutdown() {
+	a.stopFetch()
+	if a.p2pSrv != nil {
+		a.p2pSrv.Close()
+	}
+	a.sup.Stop()
+}
