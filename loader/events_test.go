@@ -202,3 +202,24 @@ func TestRun(t *testing.T) {
 		t.Fatal("取消后 Run 没返回")
 	}
 }
+
+// 轮转后新文件在 loader 回来之前就长过了旧偏移：偏移前一个字节不是换行，说明不是同一个文件，从 0 读。
+func TestForwardRotatedAndRegrown(t *testing.T) {
+	e := newEnv(t)
+	e.appendEvents(line("old", "x"))
+	if err := e.forward(); err != nil {
+		t.Fatal(err)
+	}
+	old := e.sent()
+	os.Rename(filepath.Join(e.l.Root, boot.EventsFile), filepath.Join(e.l.Root, boot.EventsFile+".1"))
+	e.appendEvents(line("new1", strings.Repeat("长", 20)) + line("new2", "y")) // 比旧偏移长，且旧偏移落在行中间
+	if b, _ := os.ReadFile(filepath.Join(e.l.Root, boot.EventsFile)); b[old-1] == '\n' {
+		t.Fatal("测试数据没造好：旧偏移前一个字节恰好是换行")
+	}
+	if err := e.forward(); err != nil {
+		t.Fatal(err)
+	}
+	if k := e.kinds(); len(k) != 3 || k[1] != "new1" || k[2] != "new2" {
+		t.Fatalf("应从头发 new1 new2，发了 %v", k)
+	}
+}
