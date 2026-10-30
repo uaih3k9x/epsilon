@@ -1,5 +1,10 @@
 package boot
 
+// 断电安全的总原则（每个写盘点的注释都按这三条论证）：
+//  1. 每次写盘是单个原子动作：state 用"临时文件 → 刷盘 → 改名"，删文件、改名本身原子；
+//  2. 多步操作排成"任意一步之后断电，重启后从磁盘状态重来，结果一样"；
+//  3. 拿不准就不动：state 读不出或写不进去时不改东西、不启动本体，等下一轮。
+
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -10,18 +15,13 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 )
 
-// MaxTries 是新版本最多试启动几次，到了就回退。
+// MaxTries 是新版本最多试启动几次，到了就回退（有退路时）。
 const MaxTries = 3
 
-// Source 是主控：给当前该跑的发布，以及发布里的文件。
-type Source interface {
-	Release() (Signed, error)
-	Fetch(name string, w io.Writer) error
-}
+const eventsMax = 1 << 20 // boot-events.jsonl 超过它就轮转成 .1
 
 // Proc 是跑起来的本体。
 type Proc interface {
@@ -29,88 +29,105 @@ type Proc interface {
 	Kill()
 }
 
-// State 存在 <Root>\boot-state.json，原子写。
+// State 存在 <Root>\boot-state.json，只有 boot 写（docs/boot.md）。
 type State struct {
 	Current  string            `json:"current"`  // 已确认能用的槽
 	Pending  string            `json:"pending"`  // 待试的槽
 	Tries    int               `json:"tries"`    // 待试槽已经试了几次（先记再启动，防断电）
 	Good     string            `json:"good"`     // 上一个好槽
-	Bad      string            `json:"bad"`      // 试过不行的版本，不再下载
-	Versions map[string]string `json:"versions"` // 槽 -> 版本
+	Bad      string            `json:"bad"`      // 试过不行的版本
+	Versions map[string]string `json:"versions"` // 槽 -> boot 认定的版本
 }
 
+// Boot 只做本地事：消费 staged.json、选槽、验签、试启动、看护、转正、回退。不联网。
 type Boot struct {
-	Root   string
-	Keys   []ed25519.PublicKey
-	Src    Source
-	Start  func(slotDir, confirmFile string) (Proc, error)
-	Report func(kind, detail string)
+	Root  string
+	Keys  []ed25519.PublicKey
+	Start func(slotDir, confirmFile string) (Proc, error)
 
 	ConfirmWithin time.Duration // 新版本多久内要确认
-	CheckEvery    time.Duration // 多久问一次主控有没有新版本
-	Backoff       time.Duration // 本体崩溃后等多久再起
-	Poll          time.Duration
-
-	mu sync.Mutex // 保护状态文件，测试里会并发读
+	Backoff       time.Duration // 本体退出、启动失败、没槽可跑时等多久再来
+	Poll          time.Duration // 看护时多久看一次确认文件和 staged.json
 }
 
-const releaseFile = "release.json" // 槽里存一份签名清单，启动前对着它验文件
+func (b *Boot) path(name string) string { return filepath.Join(b.Root, name) }
 
-func other(slot string) string {
-	if slot == "A" {
-		return "B"
+func (b *Boot) state() (State, error) {
+	st, err := ReadState(b.Root)
+	if err != nil {
+		log.Printf("读 %s: %v", StateFile, err)
 	}
-	return "A"
+	return st, err
 }
 
-func (b *Boot) statePath() string { return filepath.Join(b.Root, "boot-state.json") }
-
-func (b *Boot) state() State {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	var s State
-	if raw, err := os.ReadFile(b.statePath()); err == nil {
-		json.Unmarshal(raw, &s)
+func (b *Boot) save(st State) error {
+	raw, _ := json.MarshalIndent(st, "", "  ")
+	err := writeAtomic(b.path(StateFile), raw)
+	if err != nil {
+		log.Printf("写 %s: %v", StateFile, err)
 	}
-	if s.Versions == nil {
-		s.Versions = map[string]string{}
-	}
-	return s
+	return err
 }
 
-func (b *Boot) save(s State) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	raw, _ := json.MarshalIndent(s, "", "  ")
-	if err := writeAtomic(b.statePath(), raw); err != nil {
-		log.Printf("写 boot-state 失败: %v", err)
-	}
-}
-
+// writeAtomic: 临时文件 → 刷盘 → 改名。断电后看到的要么是旧文件、要么是新文件。
+// Windows 上 loader 正开着目标文件读时改名会失败，所以改名重试一会儿。
 func writeAtomic(path string, data []byte) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
+	for i := 0; ; i++ {
+		if err = os.Rename(tmp, path); err == nil || i == 9 {
+			return err
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	f.Close()
-	return os.Rename(tmp, path)
 }
 
-func (b *Boot) report(kind, format string, a ...any) {
-	msg := fmt.Sprintf(format, a...)
-	log.Printf("%s: %s", kind, msg)
-	if b.Report != nil {
-		b.Report(kind, msg)
+// event 记 boot.log，并往 boot-events.jsonl 追加一行留给 loader 转发。写不进去只记日志，不影响引导。
+func (b *Boot) event(kind, format string, a ...any) {
+	detail := fmt.Sprintf(format, a...)
+	log.Printf("%s: %s", kind, detail)
+	line, _ := json.Marshal(Event{Time: time.Now().UTC().Format(time.RFC3339), Kind: kind, Detail: detail})
+	if err := appendLine(b.path(EventsFile), line); err != nil {
+		log.Printf("写 %s: %v", EventsFile, err)
 	}
+}
+
+// appendLine 往文件末尾追加一行（一次 Write），超过 eventsMax 先改名为 .1（覆盖旧的）。
+// 断电可能留下半行：追加前发现末尾不是换行就先补一个，坏的只有那半行。
+func appendLine(path string, line []byte) error {
+	if fi, err := os.Stat(path); err == nil && fi.Size() > eventsMax {
+		if err := os.Rename(path, path+".1"); err != nil {
+			log.Printf("轮转 %s: %v", path, err) // loader 正开着就下次再轮转，这次照常追加
+		}
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err == nil && fi.Size() > 0 {
+		last := []byte{0}
+		if _, err := f.ReadAt(last, fi.Size()-1); err == nil && last[0] != '\n' {
+			line = append([]byte{'\n'}, line...)
+		}
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 func sumFile(path string) (int64, string, error) {
@@ -124,159 +141,152 @@ func sumFile(path string) (int64, string, error) {
 	return n, hex.EncodeToString(h.Sum(nil)), err
 }
 
-// verifySlot 验槽里的清单签名和每个文件的哈希。
-func (b *Boot) verifySlot(slot string) (Manifest, error) {
-	dir := filepath.Join(b.Root, slot)
-	raw, err := os.ReadFile(filepath.Join(dir, releaseFile))
+// check 验槽（签名、min_boot、文件哈希），并核对清单版本 == state 记的版本。
+// 版本对不上说明 loader 往里写过新东西，不能当已确认的版本跑（docs/boot.md "回退时核对版本"）。
+func (b *Boot) check(st State, slot string) error {
+	m, err := VerifySlot(b.path(slot), b.Keys)
+	if err == nil && m.Version != st.Versions[slot] {
+		err = fmt.Errorf("槽里是 %s，记的是 %q", m.Version, st.Versions[slot])
+	}
+	return err
+}
+
+// consumeStaged 按 docs/boot.md 第 1–4 步处理 loader 留下的 staged.json。
+// 返回 true 表示 pending 现在指向它，调用方要（停掉本体）重新选槽。
+//
+// 断电安全：先写 state，再删 staged.json。
+//   - 写 state 前断电：staged.json 还在、state 是旧的，重启后整个重来；
+//   - 写完 state、删 staged.json 前断电：重启后看到 pending==slot 且版本一致，只删 staged.json，
+//     不重置 tries（否则每次试启动都断电就能无限试下去）；
+//   - 拒绝只有"删 staged.json"一步，删前断电就重判一遍，结论一样（事件可能多一条）。
+func (b *Boot) consumeStaged() bool {
+	path := b.path(StagedFile)
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return false
+	}
 	if err != nil {
-		return Manifest{}, err
+		log.Printf("读 %s: %v", StagedFile, err) // 可能 loader 正在改名，下个周期再看
+		return false
 	}
-	var s Signed
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return Manifest{}, err
-	}
-	m, err := s.Verify(b.Keys)
+	st, err := b.state()
 	if err != nil {
-		return m, err
+		return false
 	}
-	for _, f := range m.Files {
-		n, sum, err := sumFile(filepath.Join(dir, f.Path))
-		if err != nil || n != f.Size || sum != f.SHA256 {
-			return m, fmt.Errorf("%s 对不上清单", f.Path)
+	var sg Staged
+	var m Manifest
+	err = json.Unmarshal(raw, &sg)
+	switch {
+	case err != nil:
+	case sg.Slot != "A" && sg.Slot != "B":
+		err = fmt.Errorf("槽 %q 不是 A/B", sg.Slot)
+	case sg.Slot == st.Current:
+		err = fmt.Errorf("槽 %s 是当前槽", sg.Slot)
+	default:
+		// 版本以槽里验过的清单为准，不信 staged.json
+		if m, err = VerifySlot(b.path(sg.Slot), b.Keys); err == nil && m.Version == st.Bad {
+			err = fmt.Errorf("版本 %s 试过不行", m.Version)
 		}
 	}
-	return m, nil
-}
-
-// Stage 问主控要发布；是新版本就下到非当前槽、验过，记为待试。返回是否有新东西待试。
-func (b *Boot) Stage() (bool, error) {
-	s, err := b.Src.Release()
 	if err != nil {
-		return false, err
+		b.event("boot_staged_rejected", "%.200s: %v", raw, err)
+		os.Remove(path)
+		return false
 	}
-	m, err := s.Verify(b.Keys)
-	if err != nil {
-		b.report("boot_verify_failed", "主控给的发布: %v", err)
-		return false, err
-	}
-	if m.MinBoot > Version {
-		return false, fmt.Errorf("版本 %s 要引导器 %d，本机是 %d", m.Version, m.MinBoot, Version)
-	}
-	st := b.state()
-	if m.Version == st.Bad || m.Version == st.Versions[st.Current] && st.Pending == "" ||
-		st.Pending != "" && m.Version == st.Versions[st.Pending] {
-		return false, nil
-	}
-	target := "A"
-	if st.Current != "" {
-		target = other(st.Current)
-	}
-	if st.Good == target { // 要覆盖它了，它不再是能退回去的好槽
-		st.Good = ""
-		b.save(st)
-	}
-	dir := filepath.Join(b.Root, target)
-	os.RemoveAll(dir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return false, err
-	}
-	for _, f := range m.Files {
-		if err := fetchFile(b.Src, f, filepath.Join(dir, f.Path)); err != nil {
-			os.RemoveAll(dir)
-			return false, fmt.Errorf("下载 %s: %w", f.Path, err)
+	if st.Pending != sg.Slot || st.Versions[sg.Slot] != m.Version {
+		st.Pending, st.Tries = sg.Slot, 0
+		st.Versions[sg.Slot] = m.Version
+		if st.Good == sg.Slot {
+			st.Good = "" // 被覆盖了，不能再当退路
 		}
+		if b.save(st) != nil {
+			return false // staged.json 留着，下个周期再来
+		}
+		b.event("boot_staged", "版本 %s（槽 %s）待试", m.Version, sg.Slot)
 	}
-	raw, _ := json.Marshal(s)
-	if err := os.WriteFile(filepath.Join(dir, releaseFile), raw, 0o644); err != nil {
-		return false, err
+	if err := os.Remove(path); err != nil {
+		log.Printf("删 %s: %v", StagedFile, err) // 下次走上面的幂等分支再删
 	}
-	st = b.state()
-	st.Pending, st.Tries = target, 0
-	st.Versions[target] = m.Version
-	b.save(st)
-	b.report("boot_staged", "版本 %s 放进槽 %s，待试", m.Version, target)
-	return true, nil
+	return true
 }
 
-func fetchFile(src Source, f File, path string) error {
-	tmp := path + ".part"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755) // 本体要能执行（Unix 上测试用）
-	if err != nil {
-		return err
-	}
-	h := sha256.New()
-	cw := &countWriter{}
-	err = src.Fetch(f.Path, io.MultiWriter(out, h, cw))
-	out.Close()
-	if err == nil && (cw.n != f.Size || hex.EncodeToString(h.Sum(nil)) != f.SHA256) {
-		err = fmt.Errorf("大小或哈希不对（%d 字节）", cw.n)
-	}
-	if err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-type countWriter struct{ n int64 }
-
-func (c *countWriter) Write(p []byte) (int, error) { c.n += int64(len(p)); return len(p), nil }
-
-// Pick 决定这次启动哪个槽；trial 表示是在试新版本。没有能用的槽返回空。
+// Pick 决定这次启动哪个槽；trial 表示在试新版本。返回空表示现在没东西能跑，等 Backoff 再来。
+//
+// 断电安全：每条路径最多写一次 state，写成功才启动。试启动先把 tries+1 写盘再启动：
+// 断电也算一次，宁可早回退，也不会无限试一个起不来的版本。
 func (b *Boot) Pick() (slot string, trial bool) {
-	st := b.state()
-	if st.Pending != "" {
-		if _, err := b.verifySlot(st.Pending); err != nil {
-			// 文件坏了多半是本机的事（断电、被还原），不算版本坏；丢掉待试槽，下一轮重下
-			b.report("boot_slot_bad", "待试槽 %s: %v", st.Pending, err)
+	st, err := b.state()
+	if err != nil {
+		return "", false
+	}
+	if p := st.Pending; p != "" {
+		if err := b.check(st, p); err != nil {
+			// 文件坏了多半是本机的事（断电、杀毒），不算版本坏；丢掉待试槽，loader 会重下
+			b.event("boot_slot_bad", "待试槽 %s: %v", p, err)
 			st.Pending, st.Tries = "", 0
-			b.save(st)
-		} else if st.Tries >= MaxTries && st.Current != "" {
-			b.giveUp(st, fmt.Sprintf("试了 %d 次没确认", st.Tries))
+		} else if st.Tries >= MaxTries && b.hasFallback(st) {
+			b.event("boot_rollback", "版本 %s（槽 %s）试了 %d 次没确认，回到 %q", st.Versions[p], p, st.Tries, st.Current)
+			st.Bad, st.Pending, st.Tries = st.Versions[p], "", 0
 		} else {
-			// 没有好版本可退（刚装好）时一直试：多半是主控暂时连不上，不是版本坏
 			if st.Tries >= MaxTries {
-				st.Tries = 0
+				st.Tries = 0 // 没有退路（首次安装、current 也坏了）：判 bad 也没别的可跑，一直试
 			}
 			st.Tries++
-			b.save(st)
-			return st.Pending, true
+			if b.save(st) != nil {
+				return "", false
+			}
+			return p, true
 		}
-		st = b.state()
+		if b.save(st) != nil {
+			return "", false
+		}
 	}
 	for _, s := range []string{st.Current, st.Good} {
 		if s == "" {
 			continue
 		}
-		if _, err := b.verifySlot(s); err != nil {
-			b.report("boot_slot_bad", "槽 %s: %v", s, err)
+		if err := b.check(st, s); err != nil {
+			b.event("boot_slot_bad", "槽 %s: %v", s, err)
 			continue
 		}
 		if s != st.Current {
+			b.event("boot_fallback", "槽 %s 用不了，改跑上一个好版本 %s（槽 %s）", st.Current, st.Versions[s], s)
 			st.Current, st.Good = s, ""
-			b.save(st)
+			if b.save(st) != nil {
+				return "", false
+			}
 		}
 		return s, false
 	}
 	return "", false
 }
 
-func (b *Boot) giveUp(st State, why string) {
-	v := st.Versions[st.Pending]
-	b.report("boot_rollback", "版本 %s（槽 %s）%s，回到 %q", v, st.Pending, why, st.Current)
-	st.Bad, st.Pending, st.Tries = v, "", 0
-	b.save(st)
+func (b *Boot) hasFallback(st State) bool {
+	for _, s := range []string{st.Current, st.Good} {
+		if s != "" && b.check(st, s) == nil {
+			return true
+		}
+	}
+	return false
 }
 
-func (b *Boot) promote() {
-	st := b.state()
-	if st.Pending == "" {
-		return
+// promote: 试启动的槽确认了，转正，原来的 current 留作 good。返回 false 表示没写成，下个周期再试。
+// 断电安全：一次写 state；写之前断电，重启后再试启动一次（多记一次 tries）。
+func (b *Boot) promote(slot string) bool {
+	st, err := b.state()
+	if err != nil {
+		return false
 	}
-	st.Good, st.Current = st.Current, st.Pending
+	if st.Pending != slot {
+		return true // 不该发生；不是待试槽了就按普通运行看护
+	}
+	st.Good, st.Current = st.Current, slot
 	st.Pending, st.Tries = "", 0
-	b.save(st)
-	b.report("boot_promoted", "版本 %s（槽 %s）转正", st.Versions[st.Current], st.Current)
+	if b.save(st) != nil {
+		return false
+	}
+	b.event("boot_promoted", "版本 %s（槽 %s）转正", st.Versions[slot], slot)
+	return true
 }
 
 func (b *Boot) sleep(stop <-chan struct{}, d time.Duration) bool {
@@ -288,84 +298,73 @@ func (b *Boot) sleep(stop <-chan struct{}, d time.Duration) bool {
 	}
 }
 
-// Run 一直跑到 stop：取发布、选槽、启动本体、看护，有新版本就切。
+// kill 杀掉本体并等它真的退出，免得新旧两个本体同时跑。
+func kill(p Proc) {
+	p.Kill()
+	<-p.Exited()
+}
+
+// Run 一直跑到 stop：消费 staged.json、选槽、启动本体、看护。
 func (b *Boot) Run(stop <-chan struct{}) {
-	lastCheck := time.Time{}
 	for {
 		select {
 		case <-stop:
 			return
 		default:
 		}
-		if time.Since(lastCheck) >= b.CheckEvery {
-			lastCheck = time.Now()
-			if _, err := b.Stage(); err != nil {
-				log.Printf("取发布: %v", err)
-			}
-		}
-		slot, trial := b.Pick()
-		if slot == "" {
-			if !b.sleep(stop, b.Backoff) {
-				return
-			}
-			continue
-		}
-		confirm := filepath.Join(b.Root, "confirm-"+slot)
-		os.Remove(confirm)
-		p, err := b.Start(filepath.Join(b.Root, slot), confirm)
-		if err != nil {
-			b.report("boot_start_failed", "槽 %s: %v", slot, err)
-			if !b.sleep(stop, b.Backoff) {
-				return
-			}
-			continue
-		}
-		if !b.watch(stop, p, trial, confirm, &lastCheck) {
-			p.Kill()
+		b.consumeStaged()
+		if !b.runOnce(stop) {
 			return
 		}
 	}
 }
 
-// watch 看护一次运行；返回 false 表示要整个退出。
-func (b *Boot) watch(stop <-chan struct{}, p Proc, trial bool, confirm string, lastCheck *time.Time) bool {
+// runOnce 选一个槽跑一次直到它该换掉；返回 false 表示收到 stop。
+func (b *Boot) runOnce(stop <-chan struct{}) bool {
+	slot, trial := b.Pick()
+	if slot == "" {
+		return b.sleep(stop, b.Backoff)
+	}
+	// 先删旧确认文件再启动：上次留下的文件不能让这次没确认的版本转正。删不掉就不启动。
+	confirm := b.path("confirm-" + slot)
+	if err := os.Remove(confirm); err != nil && !os.IsNotExist(err) {
+		log.Printf("删 %s: %v", confirm, err)
+		return b.sleep(stop, b.Backoff)
+	}
+	p, err := b.Start(b.path(slot), confirm)
+	if err != nil {
+		b.event("boot_start_failed", "槽 %s: %v", slot, err)
+		return b.sleep(stop, b.Backoff)
+	}
 	started := time.Now()
 	tick := time.NewTicker(b.Poll)
 	defer tick.Stop()
 	for {
 		select {
 		case <-stop:
+			kill(p)
 			return false
 		case <-p.Exited():
-			if trial {
-				return true // 次数在 Pick 里已经记过
-			}
-			b.report("boot_probe_exited", "本体退出，%s 后重启", b.Backoff)
+			// 试启动的次数在 Pick 里已经记过；歇一下再来，免得起不来的版本把 CPU 和磁盘打满
+			b.event("boot_probe_exited", "槽 %s 的本体退出，%s 后再起", slot, b.Backoff)
 			return b.sleep(stop, b.Backoff)
 		case <-tick.C:
 		}
 		if trial {
+			// 试启动期间不看 staged.json（loader 在 pending 时不该写；就算写了也等这次试完再说）
 			if _, err := os.Stat(confirm); err == nil {
-				b.promote()
-				trial = false
+				trial = !b.promote(slot)
 			} else if time.Since(started) > b.ConfirmWithin {
-				b.report("boot_unconfirmed", "%s 内没确认，停掉重试", b.ConfirmWithin)
-				p.Kill()
+				b.event("boot_unconfirmed", "槽 %s %s 内没确认，停掉重试", slot, b.ConfirmWithin)
+				kill(p)
 				return true
 			}
 			continue
 		}
-		if time.Since(*lastCheck) >= b.CheckEvery {
-			*lastCheck = time.Now()
-			staged, err := b.Stage()
-			if err != nil {
-				log.Printf("取发布: %v", err)
-			}
-			if staged {
-				p.Kill()
-				<-p.Exited()
-				return true
-			}
+		if b.consumeStaged() {
+			log.Printf("有新版本待试，停掉槽 %s 的本体", slot)
+			kill(p)
+			return true
 		}
 	}
 }

@@ -1,4 +1,5 @@
-// Package boot 是引导器（设计书 11.9）：从主控取签名的本体发布，装进 A/B 槽，试启动，确认后转正，失败回退。
+// Package boot 是引导器（设计书 11.9，docs/boot.md）：从 A/B 槽里挑验过签的本体，试启动，确认后转正，失败回退。
+// 不联网：新版本由本体里的 loader 下载到空闲槽，写 staged.json 交给 boot。
 // 它要冻结进镜像，所以只做这几件事，别往里加功能。
 package boot
 
@@ -12,7 +13,8 @@ import (
 )
 
 // Version 是引导器版本；发布清单里的 MinBoot 比它大就拒绝。
-const Version = 1
+// 2：不联网、消费 staged.json、给本体传 -root 不传 -controller（docs/boot.md）。
+const Version = 2
 
 type File struct {
 	Path   string `json:"path"` // 槽目录下的文件名，不许带目录
