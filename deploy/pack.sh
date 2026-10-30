@@ -1,17 +1,17 @@
 #!/bin/sh
-# 组装试点 U 盘包到 dist/pilot/epsilon/：程序 + 脚本 + llama.cpp(CUDA 12.4 / Vulkan) + 模型 + 配置
-# 用法: pilot/pack.sh   （先下好 dist/pilot/dl/ 里的 zip 和 gguf，密钥在 dist/pilot/secrets.env）
+# 组装试点 U 盘包到 dist/deploy/epsilon/：程序 + 脚本 + llama.cpp(CUDA 12.4 / Vulkan) + 模型 + 配置
+# 用法: deploy/pack.sh   （先下好 dist/deploy/dl/ 里的 zip 和 gguf，密钥在 dist/deploy/secrets.env）
 set -e
 cd "$(dirname "$0")/.."
-DL=dist/pilot/dl
-OUT=dist/pilot/epsilon
+DL=dist/deploy/dl
+OUT=dist/deploy/epsilon
 B=b11849
-. dist/pilot/secrets.env   # 密钥和部署地址，不进仓库
+. dist/deploy/secrets.env   # 密钥和部署地址，不进仓库
 : "${EPS_CONTROLLER:?}"
 rm -rf "$OUT" && mkdir -p "$OUT/llama" "$OUT/llama-vulkan" "$OUT/models"
 cp dist/epsilon-probe.exe dist/epsilon-controller.exe "$OUT/"
-for f in pilot/*.bat; do sed "s/@CONTROLLER@/$EPS_CONTROLLER/g" "$f" > "$OUT/$(basename "$f")"; done
-cp dist/pilot/files/vc_redist.x64.exe "$OUT/"
+for f in deploy/*.bat; do sed "s/@CONTROLLER@/$EPS_CONTROLLER/g" "$f" > "$OUT/$(basename "$f")"; done
+cp dist/deploy/files/vc_redist.x64.exe "$OUT/"
 unzip -q -o "$DL/llama-$B-bin-win-cuda-12.4-x64.zip" -d "$OUT/llama"
 unzip -q -o "$DL/cudart-llama-bin-win-cuda-12.4-x64.zip" -d "$OUT/llama"
 unzip -q -o "$DL/llama-$B-bin-win-vulkan-x64.zip" -d "$OUT/llama-vulkan"
@@ -42,5 +42,5 @@ ctl = {"listen": ":8090", "probe_token": token, "api_keys": [key], "stale_second
                    "heartbeat_seconds": 10, "max_offline_minutes": 30}, "nodes": {}}
 json.dump(ctl, open(f"{out}/controller.json", "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 PY
-sed "s/@CONTROLLER@/$EPS_CONTROLLER/g" pilot/先看我.txt > "$OUT/先看我.txt"
+sed "s/@CONTROLLER@/$EPS_CONTROLLER/g" deploy/先看我.txt > "$OUT/先看我.txt"
 du -sh "$OUT"; ls "$OUT"

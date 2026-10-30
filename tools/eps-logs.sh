@@ -1,8 +1,8 @@
 #!/bin/sh
 # 远程看学生机：最近事件，或者点名要日志（不用跑到机器跟前）。
 # 用法:
-#   EPS=http://<controller>:8090 EPS_KEY=<api key> pilot/eps-logs.sh events [节点] [类型]   # 最近事件，新的在前
-#   EPS=... EPS_KEY=... pilot/eps-logs.sh logs <节点>                                     # 要日志，等它下次心跳传上来再打印
+#   EPS=http://<controller>:8090 EPS_KEY=<api key> tools/eps-logs.sh events [节点] [类型]   # 最近事件，新的在前
+#   EPS=... EPS_KEY=... tools/eps-logs.sh logs <节点>                                     # 要日志，等它下次心跳传上来再打印
 set -eu
 : "${EPS:?设 EPS=http://<controller>:8090}" "${EPS_KEY:?设 EPS_KEY=<api key>}"
 api() { curl -sS --noproxy '*' -H "Authorization: Bearer $EPS_KEY" "$@"; }

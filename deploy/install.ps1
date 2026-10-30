@@ -12,7 +12,7 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $Dst = 'D:\epsilon'
-$Ctl = '@CONTROLLER@'                                   # @...@ are filled in by pilot/release.sh from dist/pilot/secrets.env
+$Ctl = '@CONTROLLER@'                                   # @...@ are filled in by deploy/release.sh from dist/deploy/secrets.env
 $Base = "http://${Ctl}:8090/dl"
 $BootSha = '@BOOT_SHA256@'
 $Heads = '@POOL_HEADS@' -split ','                      # pooling v1: these download the 27B model

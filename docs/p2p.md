@@ -25,7 +25,7 @@
 
 ## 主控的来源排序（peers）
 
-- 拓扑：主控配置 `topology: {"<节点名>": {"room": "R1", "switch": "R1U12"}}`，由 `pilot/ports2topology.py` 从座位 → 交换机端口表 `ports.json` 生成。不在表里的节点 room/switch 当空串（彼此不算同交换机、同教室）。
+- 拓扑：主控配置 `topology: {"<节点名>": {"room": "R1", "switch": "R1U12"}}`，由 `tools/ports2topology.py` 从座位 → 交换机端口表 `ports.json` 生成。不在表里的节点 room/switch 当空串（彼此不算同交换机、同教室）。
 - 每个块的来源 = 心跳没过期、`p2p_port>0`、持有这个块的其他节点，地址 `http://<心跳来源 IP>:<p2p_port>`；顺序：同交换机 > 同教室 > 其他；同一层内随机打乱（分散压力）。
 - **种子**：每间教室里，期望状态含该 manifest 的在线节点按名字排序取前 `seeds_per_room`（默认 2）台为种子。主控 `""` 只出现在：请求者是种子；或者请求者所在教室没有在线种子（不在拓扑里的节点也算这种）。非种子拿到空列表就等种子和邻居先拉到。
 - `retry_after_seconds`：有块来源为空时给 3。

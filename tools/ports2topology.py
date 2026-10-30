@@ -2,14 +2,14 @@
 """把座位 → 交换机端口表 ports.json 转成主控配置里的 topology。
 
 用法：
-    python3 pilot/ports2topology.py ports.json > topology.json
+    python3 tools/ports2topology.py ports.json > topology.json
 然后把输出贴进 controller.json 的 "topology"。
 
 输入：{"<节点名>": ["<交换机名>", "<端口>", "<来源标签>"], ...}
 输出：{"<节点名>": {"room": "<教室>", "switch": "<交换机名>"}, ...}
 教室取交换机名里 U 之前的部分（R1U12 → R1），没有 U 就用交换机名本身。
 
-自测：python3 -m doctest -v pilot/ports2topology.py
+自测：python3 -m doctest -v tools/ports2topology.py
 
 >>> room_of("R1U12")
 'R1'

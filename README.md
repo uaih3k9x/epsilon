@@ -15,7 +15,7 @@ ProjectEpsilon 的探针和主控，v0.1。设计书在内部仓库（未公开�
 
 ## 部署配置（不进仓库）
 
-密钥和部署地址都放在 `dist/pilot/secrets.env`（`dist/` 已被忽略），`pilot/release.sh`、`pilot/pack.sh` 从这里读，并把 `pilot/` 里的 `@CONTROLLER@` 这类占位符填上：
+密钥和部署地址都放在 `dist/deploy/secrets.env`（`dist/` 已被忽略），`deploy/release.sh`、`deploy/pack.sh` 从这里读，并把 `deploy/` 里的 `@CONTROLLER@` 这类占位符填上：
 
 ```sh
 PROBE_TOKEN=...          # 探针 ↔ 主控
@@ -73,7 +73,7 @@ P2P 分块分发（第 2 阶段，契约见 `docs/p2p.md`）在 `controller.json
 
 - `chunks_dir`：`epsilon-chunk build` 产出的目录（`<id>.json` 清单 + `<hash[:2]>/<hash>` 块）；不写就不开 P2P 接口。
 - `topology`：节点在哪间教室、哪台交换机，决定邻居来源的先后（同交换机 > 同教室 > 其他）。从座位 → 交换机端口表生成：
-  `python3 pilot/ports2topology.py ports.json > topology.json`，再贴进 `topology`。不在表里的节点直接从主控拉。
+  `python3 tools/ports2topology.py ports.json > topology.json`，再贴进 `topology`。不在表里的节点直接从主控拉。
 - `seeds_per_room`：每间教室几台种子（期望状态 `artifacts` 含该制品的在线节点按名字排序取前几台）可以从主控拉块，其余等邻居；默认 2。
 
 `/v1/nodes` 的 `chunks` 是每台节点持有的块数。
@@ -123,8 +123,8 @@ curl -H "$K" -X DELETE 'http://<controller>:8090/v1/cache/preload?manifest=qwen3
 
 ```sh
 export EPS=http://<controller>:8090 EPS_KEY=<api key>
-pilot/eps-logs.sh events                 # 全部机器最近 30 条
-pilot/eps-logs.sh events pc-01 crash     # 某台的某类事件
-pilot/eps-logs.sh logs pc-01             # 要日志并打印
+tools/eps-logs.sh events                 # 全部机器最近 30 条
+tools/eps-logs.sh events pc-01 crash     # 某台的某类事件
+tools/eps-logs.sh logs pc-01             # 要日志并打印
 ```
 
