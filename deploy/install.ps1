@@ -4,9 +4,9 @@
 # OSEasy remote command (runs as SYSTEM), one line:
 #   powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:EPS_KEY='<api key>'; iex (iwr http://<controller>:8090/dl/upgrade/install.ps1 -Headers @{Authorization='Bearer '+$env:EPS_KEY} -UseBasicParsing).Content"
 #
-# Steps: files -> VC++ runtime (+ app-local DLLs) -> firewall -> check controller -> scheduled task running the boot loader
-#        -> pool heads fetch the big model in the background.
-# The boot loader then pulls the signed probe from the controller by itself.
+# Steps: files -> VC++ runtime (+ app-local DLLs) -> firewall -> check controller -> seed the first signed probe into a slot
+#        -> scheduled task running the boot loader -> pool heads fetch the big model in the background.
+# The boot loader never talks to the network (docs/boot.md): the probe's loader fetches later versions.
 # Log: D:\epsilon\install.log. ASCII only (PowerShell 5.1 reads scripts as ANSI).
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +15,7 @@ $Dst = 'D:\epsilon'
 $Ctl = '@CONTROLLER@'                                   # @...@ are filled in by deploy/release.sh from dist/deploy/secrets.env
 $Base = "http://${Ctl}:8090/dl"
 $BootSha = '@BOOT_SHA256@'
+$SeedSha = '@SEED_SHA256@'                               # epsilon-probe.exe used once by -seed to put the first version into a slot
 $Heads = '@POOL_HEADS@' -split ','                      # pooling v1: these download the 27B model
 $Pool = '@POOL_RANGE@'                                  # pooling v1: rpc-server only talks to the pool machines
 
@@ -53,7 +54,7 @@ function EnsureZip($name) {
     Set-Content $marker "$size"
 }
 
-Step "1/6 files -> $Dst"
+Step "1/7 files -> $Dst"
 Stop-ScheduledTask -TaskName epsilon-probe -ErrorAction SilentlyContinue
 Get-Process epsilon-boot, epsilon-probe, llama-server, ggml-rpc-server -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep 2
@@ -64,6 +65,11 @@ $got = (Get-FileHash "$Dst\epsilon-boot.exe.new" -Algorithm SHA256).Hash.ToLower
 if ($got -ne $BootSha) { Remove-Item "$Dst\epsilon-boot.exe.new"; throw "boot loader hash mismatch: $got" }
 Move-Item "$Dst\epsilon-boot.exe.new" "$Dst\epsilon-boot.exe" -Force
 Write-Host "boot loader OK"
+New-Item -ItemType Directory -Force "$Dst\seed" | Out-Null
+Fetch 'upgrade/epsilon-probe-seed.exe' "$Dst\seed\epsilon-probe.exe"
+$got = (Get-FileHash "$Dst\seed\epsilon-probe.exe" -Algorithm SHA256).Hash.ToLower()
+if ($got -ne $SeedSha) { Remove-Item "$Dst\seed\epsilon-probe.exe"; throw "seed probe hash mismatch: $got" }
+Write-Host "seed probe OK"
 New-Item -ItemType Directory -Force "$Dst\models" | Out-Null
 $model = 'models\Qwen3.5-4B-Q4_K_M.gguf'
 if ((Test-Path "$Dst\$model") -and (Get-Item "$Dst\$model").Length -eq (RemoteSize "pkg/models/Qwen3.5-4B-Q4_K_M.gguf")) { Write-Host 'model already there' }
@@ -71,7 +77,7 @@ else { Write-Host 'downloading model (2.6 GB)'; Fetch 'pkg/models/Qwen3.5-4B-Q4_
 EnsureZip 'llama'
 EnsureZip 'llama-vulkan'
 
-Step '2/6 VC++ runtime (the stock MSVCP140 14.31 makes llama-server crash with 0xc0000005)'
+Step '2/7 VC++ runtime (the stock MSVCP140 14.31 makes llama-server crash with 0xc0000005)'
 Start-Process "$Dst\vc_redist.x64.exe" -ArgumentList '/install','/quiet','/norestart' -Wait
 foreach ($d in 'llama','llama-vulkan') {   # keep a copy next to the exe: survives the C: restore
     Copy-Item C:\Windows\System32\msvcp140*.dll, C:\Windows\System32\vcruntime140*.dll, C:\Windows\System32\concrt140.dll "$Dst\$d" -Force
@@ -81,7 +87,7 @@ $v = & "$Dst\llama\llama-server.exe" --version 2>&1 | Select-String version
 $ErrorActionPreference = 'Stop'
 if ($LASTEXITCODE -eq 0 -and $v) { Write-Host "llama-server OK: $v" } else { Write-Host "llama-server does not start (exit $LASTEXITCODE)" }
 
-Step '3/6 firewall'
+Step '3/7 firewall'
 foreach ($d in 'llama','llama-vulkan') {
     Remove-NetFirewallRule -DisplayName "epsilon-$d" -ErrorAction SilentlyContinue
     New-NetFirewallRule -DisplayName "epsilon-$d" -Direction Inbound -Action Allow -Program "$Dst\$d\llama-server.exe" -RemoteAddress LocalSubnet,$Ctl | Out-Null
@@ -92,12 +98,19 @@ Remove-NetFirewallRule -DisplayName 'epsilon-rpc' -ErrorAction SilentlyContinue
 New-NetFirewallRule -DisplayName 'epsilon-rpc' -Direction Inbound -Action Allow -Program "$Dst\llama\ggml-rpc-server.exe" -RemoteAddress $Pool | Out-Null
 Write-Host "rules: epsilon-llama, epsilon-llama-vulkan (subnet + controller), epsilon-p2p (47100-47119 subnet), epsilon-rpc ($Pool)"
 
-Step "4/6 controller $Ctl`:8090"
+Step "4/7 controller $Ctl`:8090"
 $ok = (Test-NetConnection $Ctl -Port 8090 -WarningAction SilentlyContinue).TcpTestSucceeded
 if ($ok) { Write-Host 'reachable' } else { Write-Host 'NOT reachable' }
 
-Step '5/6 scheduled task -> boot loader (runs in the logged-on user session: SYSTEM cannot see keyboard and mouse)'
-$act = New-ScheduledTaskAction -Execute "$Dst\epsilon-boot.exe" -Argument "-root $Dst -controller http://${Ctl}:8090" -WorkingDirectory $Dst
+Step '5/7 seed: put the current signed release into a free slot (boot loader picks it up and trial-starts it)'
+$ErrorActionPreference = 'Continue'
+& "$Dst\seed\epsilon-probe.exe" -seed -config "$Dst\probe.json" -root $Dst 2>&1 | ForEach-Object { Write-Host $_ }
+$seedExit = $LASTEXITCODE
+$ErrorActionPreference = 'Stop'
+if ($seedExit -eq 0) { Write-Host 'seed OK' } else { Write-Host "seed failed (exit $seedExit): boot loader will have nothing to start until the probe gets a slot" }
+
+Step '6/7 scheduled task -> boot loader (runs in the logged-on user session: SYSTEM cannot see keyboard and mouse)'
+$act = New-ScheduledTaskAction -Execute "$Dst\epsilon-boot.exe" -Argument "-root $Dst" -WorkingDirectory $Dst
 $trg = New-ScheduledTaskTrigger -AtLogOn
 $who = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited   # BUILTIN\Users = whoever logs on, not elevated
 $set = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
@@ -107,7 +120,7 @@ Start-Sleep 8
 if (Get-Process epsilon-boot -ErrorAction SilentlyContinue) { Write-Host 'boot loader running (logs: D:\epsilon\boot.log, probe.log)' }
 else { Write-Host 'boot loader not running yet (nobody logged on?) - it starts at next logon' }
 
-Step '6/6 big models for pool heads'
+Step '7/7 big models for pool heads'
 if ($Heads -contains $env:COMPUTERNAME) {
     foreach ($m in 'Qwen3.8-27B-Q4_K_M.gguf', 'mtp-Qwen3.8-27B-Q4_0.gguf') {
         if ((Test-Path "$Dst\models\$m") -and (Get-Item "$Dst\models\$m").Length -eq (RemoteSize "pkg/models/$m")) { Write-Host "$m already there"; continue }
