@@ -98,6 +98,8 @@ func (c *Controller) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/nodes/{node}/logs", c.apiAuth(c.requestLogs))
 	mux.HandleFunc("GET /v1/nodes/{node}/logs", c.apiAuth(c.nodeLogs))
 	mux.HandleFunc("POST /v1/logs", c.probeAuth(c.uploadLogs))
+	mux.Handle("GET /ui/", uiHandler())
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, "/ui/", http.StatusFound) })
 	if c.cfg.FilesDir != "" { // 学生机上不了外网，要什么从主控拉
 		mux.Handle("GET /dl/", c.apiAuth(http.StripPrefix("/dl/", http.FileServer(http.Dir(c.cfg.FilesDir))).ServeHTTP))
 		mux.HandleFunc("GET /v1/boot/release", c.probeAuth(c.bootFile))
@@ -374,6 +376,9 @@ func (c *Controller) listNodes(w http.ResponseWriter, _ *http.Request) {
 		Inflight int         `json:"inflight"`
 		GPUs     []proto.GPU `json:"gpus"`
 		Chunks   int         `json:"chunks"` // 持有的块数
+		MemFree  int         `json:"mem_free_mb,omitempty"`
+		Room     string      `json:"room,omitempty"`
+		Switch   string      `json:"switch,omitempty"`
 	}
 	c.mu.Lock()
 	now := c.now()
@@ -385,7 +390,8 @@ func (c *Controller) listNodes(w http.ResponseWriter, _ *http.Request) {
 		}
 		rows = append(rows, row{Node: name, Addr: n.addr, Version: v, Boot: n.hb.Boot, AgoSec: int(now.Sub(n.seen).Seconds()),
 			Running: n.hb.Running, Serving: c.alive(n, now), Reason: n.hb.Reason, Idle: n.hb.IdleSeconds, Foreign: n.hb.ForeignGPU,
-			Inflight: n.inflight, GPUs: n.hb.GPUs, Chunks: len(n.chunks)})
+			Inflight: n.inflight, GPUs: n.hb.GPUs, Chunks: len(n.chunks), MemFree: n.hb.MemFreeMB,
+			Room: c.cfg.Topology[name].Room, Switch: c.cfg.Topology[name].Switch})
 	}
 	c.mu.Unlock()
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Node < rows[j].Node })

@@ -77,6 +77,8 @@ scp dist/epsilon-controller 221:/opt/epsilon/
 
 看节点：`curl -H 'Authorization: Bearer <api_key>' http://221:8090/v1/nodes`
 
+网页控制台：浏览器打开 `http://<controller>:8090/`（跳到 `/ui/`），右上角填 `api_keys` 里的一个 key。节点按教室分组、5 秒刷新；点一台看显卡详情、最近事件、一键拉日志；缓存页看各制品分布、下发 / 撤掉预热；事件页按节点 / 类型筛；对话页直接试路由。页面打包在主控里，不引外部资源，本身不带秘密，数据都走 `/v1/*`（要 key）。
+
 用模型：任何 OpenAI 兼容客户端，`base_url = http://221:8090/v1`，`model = qwen3.5-4b`。响应头 `X-Epsilon-Node` 是实际干活的机器。
 
 P2P 分块分发（第 2 阶段，契约见 `docs/p2p.md`）在 `controller.json` 里配：

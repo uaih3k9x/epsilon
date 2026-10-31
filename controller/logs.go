@@ -86,6 +86,7 @@ func (c *Controller) requestLogs(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]int64{"request": id})
 }
 

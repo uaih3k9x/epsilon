@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Epsilon 主控</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #fff; --line: #e3e6ea; --text: #1d2228; --dim: #6b7480;
+  --ok: #1f9d55; --warn: #c27c0e; --bad: #d64545; --idle: #8a94a0; --accent: #2f6fde;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #14171b; --panel: #1c2026; --line: #2c323a; --text: #e4e7eb; --dim: #8b95a1;
+          --ok: #3fbf73; --warn: #e0a030; --bad: #f06a6a; --idle: #6b7480; --accent: #6b9cf5; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 2; }
+header h1 { font-size: 16px; margin: 0 8px 0 0; }
+nav { display: flex; gap: 4px; }
+nav a { padding: 4px 10px; border-radius: 6px; color: var(--dim); text-decoration: none; }
+nav a.on { background: var(--bg); color: var(--text); font-weight: 600; }
+.grow { flex: 1; }
+input, select, textarea, button { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+button { cursor: pointer; background: var(--panel); }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+main { padding: 16px; max-width: 1400px; margin: 0 auto; }
+.cards { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; min-width: 110px; }
+.card b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+.card span { color: var(--dim); font-size: 12px; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 16px; overflow: hidden; }
+section > h2 { font-size: 14px; margin: 0; padding: 8px 12px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+section > h2 small { color: var(--dim); font-weight: normal; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 5px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--dim); font-weight: normal; font-size: 12px; }
+tbody tr:last-child td { border-bottom: 0; }
+table.fixed { table-layout: fixed; min-width: 1150px; }
+table.fixed td { overflow: hidden; text-overflow: ellipsis; }
+tr.click { cursor: pointer; }
+tr.click:hover td { background: var(--bg); }
+tr.sel td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .dim { color: var(--dim); }
+.bg-ok { background: var(--ok); } .bg-warn { background: var(--warn); } .bg-bad { background: var(--bad); } .bg-idle { background: var(--idle); }
+.mono { font-family: var(--mono); font-size: 12px; }
+.bar { display: inline-block; width: 60px; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; vertical-align: middle; margin-right: 6px; }
+.bar i { display: block; height: 100%; background: var(--accent); }
+.detail { padding: 12px; display: grid; gap: 12px; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; }
+.kv dt { color: var(--dim); } .kv dd { margin: 0; }
+pre { margin: 0; padding: 10px; background: var(--bg); border-radius: 6px; overflow: auto; max-height: 420px; font: 12px/1.45 var(--mono); white-space: pre-wrap; word-break: break-all; }
+details summary { cursor: pointer; padding: 4px 0; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px 12px; }
+.empty { padding: 16px 12px; color: var(--dim); }
+#msg { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 6px 14px; border-radius: 6px; display: none; z-index: 5; max-width: 90vw; }
+#chatOut { min-height: 120px; max-height: 60vh; }
+textarea { width: 100%; resize: vertical; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Epsilon 主控</h1>
+  <nav id="tabs">
+    <a href="#nodes">节点</a><a href="#cache">缓存</a><a href="#events">事件</a><a href="#chat">对话</a>
+  </nav>
+  <span class="grow"></span>
+  <span id="conn" class="dim"></span>
+  <input id="key" type="password" placeholder="api key" size="18" autocomplete="off">
+  <button id="saveKey">保存</button>
+</header>
+<main id="view"></main>
+<div id="msg"></div>
+<script>
+"use strict";
+const STALE = 30; // 跟主控 stale_seconds 默认值一致：超过就算掉线
+
+// ---- 小工具 ----
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (k === "class") e.className = v;
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null && k !== false) e.append(k instanceof Node ? k : String(k));
+  return e;
+}
+const $ = id => document.getElementById(id);
+function store(k, v) { try { if (v === undefined) return localStorage.getItem(k) || ""; localStorage.setItem(k, v); } catch { return ""; } }
+function toast(t) { const m = $("msg"); m.textContent = t; m.style.display = "block"; clearTimeout(toast.t); toast.t = setTimeout(() => m.style.display = "none", 3000); }
+function bytes(n) { if (!n) return "0"; const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1024 && i < 4) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + " " + u[i]; }
+function ago(s) { if (s < 0) return "—"; if (s < 60) return s + " 秒"; if (s < 3600) return Math.floor(s / 60) + " 分"; if (s < 86400) return Math.floor(s / 3600) + " 时"; return Math.floor(s / 86400) + " 天"; }
+function when(t) { const d = new Date(t); return isNaN(d) ? t : d.toLocaleString("zh-CN", { hour12: false }); }
+function bar(p) { return h("span", { class: "bar" }, h("i", { style: `width:${Math.max(0, Math.min(100, p))}%` })); }
+
+let key = store("eps-key");
+$("key").value = key;
+$("saveKey").onclick = () => { key = $("key").value.trim(); store("eps-key", key); toast("已保存"); render(); };
+$("key").onkeydown = e => { if (e.key === "Enter") $("saveKey").click(); };
+
+async function api(path, opt = {}) {
+  const r = await fetch(path, { ...opt, headers: { ...(opt.headers || {}), Authorization: "Bearer " + key } });
+  if (r.status === 401) { $("conn").textContent = "key 不对"; $("conn").className = "bad"; throw new Error("key 不对"); }
+  if (!r.ok) {
+    let m = r.status + "";
+    try { const j = await r.json(); m = j.error?.message || m; } catch {}
+    const e = new Error(m); e.status = r.status; throw e;
+  }
+  $("conn").textContent = "已连接"; $("conn").className = "ok";
+  const t = await r.text(); // 有的接口没标 Content-Type，能解析就当 JSON
+  try { return JSON.parse(t); } catch { return t; }
+}
+
+// ---- 节点 ----
+function state(n) {
+  if (n.seconds_since_heartbeat > STALE) return ["离线", "bad", "bg-bad"];
+  if (n.serving) return ["服务中", "ok", "bg-ok"];
+  if (n.running) return ["启动中", "warn", "bg-warn"];
+  return ["让位", "dim", "bg-idle"];
+}
+let selected = location.hash.split("/")[1] ? decodeURIComponent(location.hash.split("/")[1]) : "";
+
+async function viewNodes(v) {
+  const nodes = await api("/v1/nodes");
+  const on = nodes.filter(n => n.seconds_since_heartbeat <= STALE);
+  const vram = on.reduce((a, n) => a + (n.gpus || []).reduce((b, g) => b + g.mem_total_mb, 0), 0);
+  const used = on.reduce((a, n) => a + (n.gpus || []).reduce((b, g) => b + g.mem_used_mb, 0), 0);
+  v.append(h("div", { class: "cards" },
+    card(on.length + " / " + nodes.length, "在线 / 登记"),
+    card(on.filter(n => n.serving).length, "服务中"),
+    card(on.filter(n => !n.serving && !n.running).length, "让位"),
+    card(on.reduce((a, n) => a + n.inflight, 0), "在途请求"),
+    card(vram ? Math.round(used / 1024) + " / " + Math.round(vram / 1024) + " GB" : "—", "显存 已用 / 总量")));
+
+  const rooms = new Map();
+  for (const n of nodes) { const r = n.room || ""; if (!rooms.has(r)) rooms.set(r, []); rooms.get(r).push(n); }
+  const names = [...rooms.keys()].sort((a, b) => (a === "") - (b === "") || a.localeCompare(b));
+  if (!nodes.length) v.append(h("section", {}, h("div", { class: "empty" }, "还没有节点登记")));
+  for (const r of names) {
+    const list = rooms.get(r);
+    const sec = h("section", {}, h("h2", {}, r || "未分教室", h("small", {}, list.filter(n => n.seconds_since_heartbeat <= STALE).length + " / " + list.length + " 在线")));
+    const tb = h("tbody");
+    for (const n of list) {
+      const [txt, cls, bg] = state(n);
+      const g = (n.gpus || [])[0];
+      const tr = h("tr", { class: "click" + (n.node === selected ? " sel" : ""), onclick: () => { selected = selected === n.node ? "" : n.node; location.hash = "nodes" + (selected ? "/" + encodeURIComponent(selected) : ""); } },
+        h("td", {}, h("span", { class: "dot " + bg }), n.node),
+        h("td", { class: cls, title: n.reason || "" }, txt, n.reason && !n.serving ? h("span", { class: "dim" }, " · " + n.reason) : null),
+        h("td", {}, n.running || h("span", { class: "dim" }, "—")),
+        h("td", {}, g ? [bar(g.util), g.util + "%"] : h("span", { class: "dim" }, "—")),
+        h("td", {}, g ? Math.round(g.mem_used_mb / 1024 * 10) / 10 + " / " + Math.round(g.mem_total_mb / 1024) + " GB" : ""),
+        h("td", {}, g ? g.temp_c + "°C" : ""),
+        h("td", {}, n.idle_seconds < 0 ? "—" : ago(n.idle_seconds)),
+        h("td", {}, n.inflight || ""),
+        h("td", {}, n.chunks || ""),
+        h("td", { class: "mono" }, n.version, n.boot ? h("span", { class: "dim" }, " / " + n.boot) : null),
+        h("td", { class: n.seconds_since_heartbeat > STALE ? "bad" : "dim" }, ago(n.seconds_since_heartbeat) + "前"));
+      tb.append(tr);
+      if (n.node === selected) tb.append(h("tr", {}, h("td", { colspan: 11, style: "padding:0;white-space:normal" }, nodeDetail(n))));
+    }
+    // 各教室的表列宽一致，上下好对照
+    const cols = [["节点", 110], ["状态", 260], ["工作负载", 120], ["显卡", 120], ["显存", 100], ["温度", 60], ["键鼠空闲", 80], ["在途", 50], ["块", 50], ["版本 / 引导器", 120], ["心跳", 80]];
+    sec.append(h("div", { class: "scroll" }, h("table", { class: "fixed" },
+      h("colgroup", {}, cols.map(([, w]) => h("col", { style: `width:${w}px` }))),
+      h("thead", {}, h("tr", {}, cols.map(([t]) => h("th", {}, t)))), tb)));
+    v.append(sec);
+  }
+}
+function card(b, s) { return h("div", { class: "card" }, h("b", {}, b), h("span", {}, s)); }
+
+// 详情面板在每次刷新时重建，日志内容放在这里免得被刷掉
+const logCache = {};
+function nodeDetail(n) {
+  const box = h("div", { class: "detail" });
+  const dl = h("dl", { class: "kv" });
+  for (const [k, val] of [["地址", n.addr], ["位置", [n.room, n.switch].filter(Boolean).join(" · ") || "—"],
+    ["外来显卡进程", (n.foreign_gpu || []).join(", ") || "—"], ["空闲内存", n.mem_free_mb ? bytes(n.mem_free_mb * 1048576) : "—"],
+    ...(n.gpus || []).map((g, i) => ["显卡 " + i, `${g.name} · ${g.util}% · ${g.mem_used_mb}/${g.mem_total_mb} MB · ${g.temp_c}°C · ${g.power_w} W`])])
+    dl.append(h("dt", {}, k), h("dd", { class: "mono" }, val));
+  box.append(dl);
+
+  const logs = h("div");
+  const btn = h("button", { class: "primary", onclick: () => pullLogs(n.node, btn, logs) }, "拉日志");
+  box.append(h("div", { style: "display:flex;gap:8px;align-items:center" }, btn,
+    h("span", { class: "dim" }, "下次心跳时它把日志末尾传上来，一般 10 秒内")));
+  box.append(logs);
+  if (logCache[n.node]) showLogs(logs, logCache[n.node]);
+
+  const evBox = h("div", {}, h("span", { class: "dim" }, "事件加载中…"));
+  box.append(evBox);
+  api("/v1/events?limit=20&node=" + encodeURIComponent(n.node)).then(evs => evBox.replaceChildren(eventTable(evs, false))).catch(e => evBox.textContent = e.message);
+  return box;
+}
+async function pullLogs(node, btn, box) {
+  btn.disabled = true;
+  try {
+    const { request } = await api(`/v1/nodes/${encodeURIComponent(node)}/logs`, { method: "POST" });
+    for (let i = 0; i < 45; i++) {
+      btn.textContent = "等它传上来… " + (i * 2) + " 秒";
+      await new Promise(r => setTimeout(r, 2000));
+      try {
+        const l = await api(`/v1/nodes/${encodeURIComponent(node)}/logs`);
+        if (l.request === request) { logCache[node] = l; render(); toast(node + " 的日志到了"); return; }
+      } catch (e) { if (e.status !== 404) throw e; }
+    }
+    toast("90 秒没等到，机器可能离线了");
+  } catch (e) { toast(e.message); }
+  finally { btn.disabled = false; btn.textContent = "拉日志"; }
+}
+function showLogs(box, l) {
+  box.replaceChildren(h("div", { class: "dim" }, "日志 · " + when(l.time)),
+    ...Object.entries(l.files || {}).sort().map(([f, t], i) =>
+      h("details", { open: i === 0 }, h("summary", { class: "mono" }, f + "（" + bytes(new Blob([t]).size) + "）"), h("pre", {}, t))));
+}
+
+// ---- 事件 ----
+function eventTable(evs, withNode) {
+  if (!evs.length) return h("div", { class: "empty" }, "没有事件");
+  return h("div", { class: "scroll" }, h("table", {},
+    h("thead", {}, h("tr", {}, ["时间", withNode && "节点", "类型", "内容"].filter(Boolean).map(t => h("th", {}, t)))),
+    h("tbody", {}, evs.map(e => h("tr", {},
+      h("td", { class: "dim" }, when(e.time)), withNode ? h("td", {}, e.node) : null,
+      h("td", { class: "mono " + (/fail|rollback|rescue|crash|error/.test(e.kind) ? "bad" : "") }, e.kind),
+      h("td", { style: "white-space:normal" }, e.detail))))));
+}
+let evFilter = { node: "", kind: "" };
+async function viewEvents(v) {
+  const q = new URLSearchParams({ limit: 200 });
+  if (evFilter.node) q.set("node", evFilter.node);
+  if (evFilter.kind) q.set("kind", evFilter.kind);
+  const evs = await api("/v1/events?" + q);
+  const node = h("input", { placeholder: "节点", value: evFilter.node, size: 10 });
+  const kind = h("input", { placeholder: "类型，如 boot_rollback", value: evFilter.kind, size: 20 });
+  const go = () => { evFilter = { node: node.value.trim(), kind: kind.value.trim() }; render(); };
+  node.onkeydown = kind.onkeydown = e => e.key === "Enter" && go();
+  v.append(h("section", {}, h("h2", {}, "事件", h("small", {}, "每台留最近 50 条，新的在前")),
+    h("div", { class: "row" }, node, kind, h("button", { onclick: go }, "筛选")), eventTable(evs, true)));
+}
+
+// ---- 缓存 ----
+async function viewCache(v) {
+  let c;
+  try { c = await api("/v1/cache"); }
+  catch (e) { if (e.status === 404) { v.append(h("section", {}, h("div", { class: "empty" }, "主控没配 chunks_dir，P2P 和缓存没开"))); return; } throw e; }
+  const online = c.nodes.length;
+  v.append(h("div", { class: "cards" },
+    card(c.manifests.length, "制品"), card(online, "在线节点"), card(c.offline_nodes, "离线节点"),
+    card(bytes(c.nodes.reduce((a, n) => a + n.bytes, 0)), "全机房缓存合计")));
+
+  const tb = h("tbody");
+  for (const m of c.manifests) {
+    const p = online ? m.complete_nodes * 100 / online : 0;
+    tb.append(h("tr", {},
+      h("td", { class: "mono" }, m.id), h("td", {}, bytes(m.bytes)), h("td", {}, m.chunks),
+      h("td", {}, bar(p), m.complete_nodes + " 齐", m.partial_nodes ? h("span", { class: "warn" }, " · " + m.partial_nodes + " 拉了一半") : null),
+      h("td", { style: "white-space:normal" }, (m.rooms || []).map(r => h("span", { class: "dim", style: "margin-right:12px" }, (r.room || "未分") + " " + r.complete_nodes + (r.partial_nodes ? "+" + r.partial_nodes : ""))))));
+  }
+  v.append(h("section", {}, h("h2", {}, "制品", h("small", {}, "“齐”= 块全在本地")),
+    c.manifests.length ? h("div", { class: "scroll" }, h("table", {}, h("thead", {}, h("tr", {}, ["清单", "大小", "块", "持有", "按教室（齐+一半）"].map(t => h("th", {}, t)))), tb)) : h("div", { class: "empty" }, "还没有制品")));
+
+  // 预热
+  const rules = h("tbody");
+  for (const r of c.preload) {
+    const target = r.all ? "全部节点" : r.room ? "教室 " + r.room : (r.nodes || []).join(", ");
+    rules.append(h("tr", {}, h("td", { class: "mono" }, r.manifest), h("td", { style: "white-space:normal" }, target),
+      h("td", {}, h("button", { onclick: async () => {
+        if (!confirm("撤掉 " + r.manifest + " 的预热？已经拉下来的块不会删。")) return;
+        try { await api("/v1/cache/preload?manifest=" + encodeURIComponent(r.manifest), { method: "DELETE" }); toast("已撤掉"); render(); } catch (e) { toast(e.message); }
+      } }, "撤掉"))));
+  }
+  const man = h("select", {}, c.manifests.map(m => h("option", { value: m.id }, m.id)));
+  const kind = h("select", {}, h("option", { value: "all" }, "全部节点"), h("option", { value: "room" }, "某间教室"), h("option", { value: "nodes" }, "指定节点"));
+  const arg = h("input", { placeholder: "", size: 24, style: "display:none" });
+  kind.onchange = () => { arg.style.display = kind.value === "all" ? "none" : ""; arg.placeholder = kind.value === "room" ? "教室，如 R1" : "节点，逗号分隔"; };
+  const add = async () => {
+    const body = { manifest: man.value };
+    if (kind.value === "all") body.all = true;
+    else if (kind.value === "room") body.room = arg.value.trim();
+    else body.nodes = arg.value.split(/[,，\s]+/).filter(Boolean);
+    try { await api("/v1/cache/preload", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }); toast("已下发，下次心跳生效"); render(); } catch (e) { toast(e.message); }
+  };
+  v.append(h("section", {}, h("h2", {}, "预热", h("small", {}, "后台把块拉进本地缓存，不拼文件、不影响正在跑的")),
+    c.preload.length ? h("div", { class: "scroll" }, h("table", {}, h("thead", {}, h("tr", {}, ["清单", "范围", ""].map(t => h("th", {}, t)))), rules)) : h("div", { class: "empty" }, "没有预热规则"),
+    c.manifests.length ? h("div", { class: "row", style: "border-top:1px solid var(--line)" }, man, kind, arg, h("button", { class: "primary", onclick: add }, "下发预热")) : null));
+
+  // 每台节点
+  const nb = h("tbody");
+  for (const n of [...c.nodes].sort((a, b) => a.node.localeCompare(b.node)))
+    nb.append(h("tr", {}, h("td", {}, n.node), h("td", { class: "dim" }, n.room || ""), h("td", {}, bytes(n.bytes)), h("td", {}, n.chunks),
+      h("td", { style: "white-space:normal" }, n.manifests.map(m => h("span", { style: "margin-right:14px" }, bar(m.percent), h("span", { class: "mono" }, m.id), " " + m.percent + "%")))));
+  v.append(h("section", {}, h("h2", {}, "每台节点", h("small", {}, "只列在线的")),
+    c.nodes.length ? h("div", { class: "scroll" }, h("table", {}, h("thead", {}, h("tr", {}, ["节点", "教室", "缓存", "块", "各清单进度"].map(t => h("th", {}, t)))), nb)) : h("div", { class: "empty" }, "没有在线节点")));
+}
+
+// ---- 对话（试一下路由通不通） ----
+let chatBusy = null;
+async function viewChat(v) {
+  if (v.dataset.keep) return;
+  const ms = await api("/v1/models");
+  const model = h("select", {}, ms.data.map(m => h("option", { value: m.id }, m.id)));
+  const input = h("textarea", { rows: 4, placeholder: "随便问点什么，Ctrl+Enter 发送" });
+  const out = h("pre", { id: "chatOut" });
+  const info = h("span", { class: "dim" });
+  const send = h("button", { class: "primary" }, "发送");
+  const stop = h("button", { disabled: true }, "停");
+  send.onclick = async () => {
+    if (!input.value.trim()) return;
+    out.textContent = ""; info.textContent = "等首字…";
+    send.disabled = true; stop.disabled = false;
+    chatBusy = new AbortController();
+    const t0 = performance.now(); let first = 0, n = 0;
+    try {
+      const r = await fetch("/v1/chat/completions", { method: "POST", signal: chatBusy.signal,
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + key },
+        body: JSON.stringify({ model: model.value, stream: true, messages: [{ role: "user", content: input.value }] }) });
+      if (!r.ok) { let m = r.status + ""; try { m = (await r.json()).error?.message || m; } catch {} throw new Error(m); }
+      const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+      for (;;) {
+        const { value, done } = await rd.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+          if (!line.startsWith("data:")) continue;
+          const d = line.slice(5).trim(); if (d === "[DONE]") continue;
+          try {
+            const delta = JSON.parse(d).choices?.[0]?.delta || {};
+            const piece = (delta.reasoning_content || "") + (delta.content || "");
+            if (!piece) continue;
+            if (!first) first = performance.now();
+            n++; out.textContent += piece;
+          } catch {}
+        }
+        if (first) info.textContent = `首字 ${((first - t0) / 1000).toFixed(1)} 秒 · ${n} 段 · ${(n / Math.max(.001, (performance.now() - first) / 1000)).toFixed(1)} 段/秒`;
+      }
+    } catch (e) { if (e.name !== "AbortError") { info.textContent = ""; toast(e.message); } }
+    finally { send.disabled = false; stop.disabled = true; chatBusy = null; }
+  };
+  stop.onclick = () => chatBusy && chatBusy.abort();
+  input.onkeydown = e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) send.click(); };
+  v.dataset.keep = "1";
+  v.append(h("section", {}, h("h2", {}, "对话", h("small", {}, "经主控路由到某台在服务的学生机")),
+    ms.data.length ? h("div", { class: "detail" }, h("div", { style: "display:flex;gap:8px;align-items:center" }, model, send, stop, info), input, out)
+                   : h("div", { class: "empty" }, "现在没有节点在服务")));
+}
+
+// ---- 路由和刷新 ----
+const views = { nodes: viewNodes, cache: viewCache, events: viewEvents, chat: viewChat };
+let rendering = false, tab = "";
+async function render() {
+  const t = (location.hash.slice(1).split("/")[0]) || "nodes";
+  for (const a of $("tabs").children) a.classList.toggle("on", a.getAttribute("href") === "#" + t);
+  if (!key) { $("view").replaceChildren(h("section", {}, h("div", { class: "empty" }, "先在右上角填 api key（主控配置里的 api_keys）"))); return; }
+  if (rendering) return;
+  rendering = true;
+  const keep = t === "chat" && tab === "chat";
+  const v = keep ? $("view") : h("main", { id: "view" });
+  try { await (views[t] || viewNodes)(v); }
+  catch (e) { if (!keep) v.replaceChildren(h("section", {}, h("div", { class: "empty bad" }, "出错了：" + e.message))); }
+  finally { rendering = false; }
+  if (!keep) {
+    const y = scrollY;
+    $("view").replaceWith(v); scrollTo(0, y);
+  }
+  tab = t;
+}
+addEventListener("hashchange", () => { selected = decodeURIComponent(location.hash.split("/")[1] || ""); render(); });
+// 节点页 5 秒刷一次；在输入框里打字时不刷，免得打断
+setInterval(() => {
+  const t = location.hash.slice(1).split("/")[0] || "nodes";
+  const typing = document.activeElement && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName) && document.activeElement.id !== "key";
+  if (t === "nodes" && !typing && !document.hidden) render();
+}, 5000);
+render();
+</script>
+</body>
+</html>
