@@ -28,6 +28,16 @@ type Heartbeat struct {
 	Running     string   `json:"running"` // 正在跑的工作负载名，空 = 没跑
 	Serving     *Serving `json:"serving,omitempty"`
 	Reason      string   `json:"reason"` // 为什么是现在这个状态（让位原因等）
+	Disk        *Disk    `json:"disk,omitempty"`
+}
+
+// Disk 是 artifact_root（D:\epsilon）所在盘的情况（设计书 21.3）。总量 / 剩余每次心跳现取；分项占用后台每 10 分钟算一次。
+type Disk struct {
+	TotalMB     int64            `json:"total_mb"`
+	FreeMB      int64            `json:"free_mb"`
+	UsageMB     map[string]int64 `json:"usage_mb,omitempty"`      // models / chunks / slots / logs / other
+	UsageAgeSec int              `json:"usage_age_sec,omitempty"` // 分项是多久前算的
+	Complete    bool             `json:"complete,omitempty"`      // false = 上次统计超时，分项只算了一部分
 }
 
 // Serving 表示工作负载起来了、健康检查通过，可以接请求。

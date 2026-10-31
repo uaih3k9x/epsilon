@@ -60,9 +60,7 @@ func (s *Supervisor) Ensure(name string, w Workload, want bool) {
 	cmd.Dir = w.Dir
 	cmd.Env = append(os.Environ(), w.env...)
 	if w.Log != "" {
-		if st, err := os.Stat(w.Log); err == nil && st.Size() > 20<<20 {
-			os.Remove(w.Log) // 超过 20 MB 从头记
-		}
+		RotateLog(w.Log, WorkloadLogMax) // 超了留一份 .1 再从头记，崩溃循环时旧日志还在
 		if f, err := os.OpenFile(w.Log, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
 			fmt.Fprintf(f, "\n===== %s 启动 %s %v\n", time.Now().Format("2006-01-02 15:04:05"), w.Exe, w.Args)
 			cmd.Stdout, cmd.Stderr = f, f

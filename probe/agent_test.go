@@ -42,8 +42,9 @@ func (f *fakeSys) set(idle, vram int) {
 	defer f.mu.Unlock()
 	f.idle, f.vram = idle, vram
 }
-func (f *fakeSys) ComputeApps() string { f.mu.Lock(); defer f.mu.Unlock(); return f.apps }
-func (f *fakeSys) MemFreeMB() int      { return 20000 }
+func (f *fakeSys) ComputeApps() string               { f.mu.Lock(); defer f.mu.Unlock(); return f.apps }
+func (f *fakeSys) MemFreeMB() int                    { return 20000 }
+func (f *fakeSys) DiskMB(string) (total, free int64) { return 100000, 4000 }
 
 type fakeController struct {
 	mu       sync.Mutex

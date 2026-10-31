@@ -35,9 +35,7 @@ func main() {
 	root := flag.String("root", "", "引导器根目录（A/B 槽、boot-state.json）；默认 probe.json 所在目录")
 	seedOnly := flag.Bool("seed", false, "安装、救援用：跑一轮 loader 把版本放进槽就退出")
 	flag.Parse()
-	if st, err := os.Stat(*logPath); err == nil && st.Size() > 10<<20 {
-		os.Remove(*logPath) // 超过 10 MB 就从头记
-	}
+	probe.RotateLog(*logPath, probe.ProbeLogMax) // 超了留一份 .1 再从头记；运行中由 Agent 每分钟再查
 	if f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
 		log.SetOutput(io.MultiWriter(os.Stderr, f))
 	}

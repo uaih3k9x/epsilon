@@ -39,7 +39,7 @@ table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nu
 th, td { text-align: left; padding: 5px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 th { color: var(--dim); font-weight: normal; font-size: 12px; }
 tbody tr:last-child td { border-bottom: 0; }
-table.fixed { table-layout: fixed; min-width: 1150px; }
+table.fixed { table-layout: fixed; min-width: 1240px; }
 table.fixed td { overflow: hidden; text-overflow: ellipsis; }
 tr.click { cursor: pointer; }
 tr.click:hover td { background: var(--bg); }
@@ -78,6 +78,7 @@ textarea { width: 100%; resize: vertical; }
 <script>
 "use strict";
 const STALE = 30; // 跟主控 stale_seconds 默认值一致：超过就算掉线
+const DISK_LOW_GB = 20; // 设计书 21.6 的吃紧线：低于这个标红
 
 // ---- 小工具 ----
 function h(tag, attrs, ...kids) {
@@ -158,19 +159,33 @@ async function viewNodes(v) {
         h("td", {}, g ? g.temp_c + "°C" : ""),
         h("td", {}, n.idle_seconds < 0 ? "—" : ago(n.idle_seconds)),
         h("td", {}, n.inflight || ""),
+        diskCell(n.disk),
         h("td", {}, n.chunks || ""),
         h("td", { class: "mono" }, n.version, n.boot ? h("span", { class: "dim" }, " / " + n.boot) : null),
         h("td", { class: n.seconds_since_heartbeat > STALE ? "bad" : "dim" }, ago(n.seconds_since_heartbeat) + "前"));
       tb.append(tr);
-      if (n.node === selected) tb.append(h("tr", {}, h("td", { colspan: 11, style: "padding:0;white-space:normal" }, nodeDetail(n))));
+      if (n.node === selected) tb.append(h("tr", {}, h("td", { colspan: 12, style: "padding:0;white-space:normal" }, nodeDetail(n))));
     }
     // 各教室的表列宽一致，上下好对照
-    const cols = [["节点", 110], ["状态", 260], ["工作负载", 120], ["显卡", 120], ["显存", 100], ["温度", 60], ["键鼠空闲", 80], ["在途", 50], ["块", 50], ["版本 / 引导器", 120], ["心跳", 80]];
+    const cols = [["节点", 110], ["状态", 260], ["工作负载", 120], ["显卡", 120], ["显存", 100], ["温度", 60], ["键鼠空闲", 80], ["在途", 50], ["D 盘剩余", 90], ["块", 50], ["版本 / 引导器", 120], ["心跳", 80]];
     sec.append(h("div", { class: "scroll" }, h("table", { class: "fixed" },
       h("colgroup", {}, cols.map(([, w]) => h("col", { style: `width:${w}px` }))),
       h("thead", {}, h("tr", {}, cols.map(([t]) => h("th", {}, t)))), tb)));
     v.append(sec);
   }
+}
+function diskCell(d) {
+  if (!d || !d.total_mb) return h("td", { class: "dim" }, "—");
+  const gb = d.free_mb / 1024;
+  return h("td", { class: gb < DISK_LOW_GB ? "bad" : "", title: `共 ${Math.round(d.total_mb / 1024)} GB` }, gb.toFixed(gb < 10 ? 1 : 0) + " GB");
+}
+function diskDetail(d) {
+  if (!d || !d.total_mb) return "—";
+  const names = { models: "模型", chunks: "块缓存", slots: "槽 A/B/R", logs: "日志", other: "其他" };
+  const parts = Object.entries(d.usage_mb || {}).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${names[k] || k} ${bytes(v * 1048576)}`);
+  let s = `剩 ${bytes(d.free_mb * 1048576)} / 共 ${bytes(d.total_mb * 1048576)}`;
+  if (parts.length) s += ` · epsilon 里：${parts.join("，")}` + (d.complete ? "" : "（上次统计超时，不全）") + ` · ${ago(d.usage_age_sec || 0)}前统计`;
+  return s;
 }
 function card(b, s) { return h("div", { class: "card" }, h("b", {}, b), h("span", {}, s)); }
 
@@ -181,6 +196,7 @@ function nodeDetail(n) {
   const dl = h("dl", { class: "kv" });
   for (const [k, val] of [["地址", n.addr], ["位置", [n.room, n.switch].filter(Boolean).join(" · ") || "—"],
     ["外来显卡进程", (n.foreign_gpu || []).join(", ") || "—"], ["空闲内存", n.mem_free_mb ? bytes(n.mem_free_mb * 1048576) : "—"],
+    ["D 盘", diskDetail(n.disk)],
     ...(n.gpus || []).map((g, i) => ["显卡 " + i, `${g.name} · ${g.util}% · ${g.mem_used_mb}/${g.mem_total_mb} MB · ${g.temp_c}°C · ${g.power_w} W`])])
     dl.append(h("dt", {}, k), h("dd", { class: "mono" }, val));
   box.append(dl);

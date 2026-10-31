@@ -25,6 +25,7 @@ type System interface {
 	GPUs() []proto.GPU   // nvidia-smi
 	ComputeApps() string // nvidia-smi --query-compute-apps 原始输出
 	MemFreeMB() int
+	DiskMB(path string) (total, free int64) // path 所在盘；拿不到就 0, 0
 }
 
 type Agent struct {
@@ -61,6 +62,17 @@ type Agent struct {
 	Boot     string // 引导器版本/槽位，原样上报
 	OnOnline func() // 第一次心跳成功（或离线确认）时调一次：告诉引导器"这个版本能用"
 	LogPath  string // 探针自己的日志；主控要日志时一起传
+
+	logMax, workloadLogMax int64     // 日志轮转上限（logrotate.go）
+	rotatedAt              time.Time // 上次查日志大小
+
+	usageEvery    time.Duration // 分项占用多久算一次（disk.go）
+	usageStarted  time.Time
+	usageBusy     atomic.Bool
+	umu           sync.Mutex // 以下和后台统计共享
+	usage         map[string]int64
+	usageAt       time.Time
+	usageComplete bool
 
 	logDone atomic.Int64 // 已经传过的日志请求号
 	logBusy atomic.Bool  // 正在传，别重复开
@@ -105,7 +117,7 @@ func NewAgent(cfg Config, sys System, version string) *Agent {
 		client: &http.Client{Timeout: 10 * time.Second}, desired: proto.DesiredState{}.Defaults(),
 		lastOK: time.Now(), maxOfflineUnit: time.Minute, offlineAfter: time.Minute, gpuEvery: 5 * time.Second,
 		vram: vramBook{grace: 30 * time.Second}, upload: newLimiter(), p2pClient: &http.Client{},
-		fetchParallel: 4, sourceTimeout: 30 * time.Second, retryUnit: time.Second, fetchRetry: time.Minute,
+		fetchParallel: 4, sourceTimeout: 30 * time.Second, retryUnit: time.Second, fetchRetry: time.Minute, logMax: ProbeLogMax, workloadLogMax: WorkloadLogMax, usageEvery: 10 * time.Minute,
 		ready: map[string]bool{}, jobs: map[string]*fetchJob{}, failedAt: map[string]time.Time{}, lastErr: map[string]string{},
 		manifests: map[string]proto.Manifest{}}
 	a.fetchCtx, a.stopFetch = context.WithCancel(context.Background())
@@ -177,6 +189,8 @@ func (a *Agent) Step(now time.Time) {
 			a.sendEvent(e)
 		}
 	}
+	a.rotateLogs(now)
+	a.startUsage(now)
 	// 走到这里说明主循环在正常跑
 	if a.OnOnline != nil && a.netFailed && !a.httpFailed && now.Sub(a.startedAt) >= a.offlineAfter {
 		log.Printf("主控连不上，按网络故障离线确认")
@@ -323,7 +337,7 @@ func (a *Agent) heartbeat(obs Observed) bool {
 	st := a.sup.Status()
 	hb := proto.Heartbeat{Node: a.cfg.Node, Version: a.version, Boot: a.Boot, IdleSeconds: obs.IdleSeconds,
 		ForeignGPU: obs.ForeignGPU, GPUs: a.gpus, MemFreeMB: a.sys.MemFreeMB(),
-		Running: st.Name, Reason: a.reason}
+		Running: st.Name, Reason: a.reason, Disk: a.disk()}
 	if st.Healthy && a.mode == Run { // 保温档：模型在显存里，但不接新请求
 		hb.Serving = &proto.Serving{Model: st.Model, Port: st.Port}
 	}

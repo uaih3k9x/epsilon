@@ -47,3 +47,18 @@ func memFreeMB() int {
 	}
 	return int(m.ullAvailPhys >> 20)
 }
+
+var getDiskFreeSpaceEx = kernel32.NewProc("GetDiskFreeSpaceExW")
+
+func diskMB(path string) (total, free int64) {
+	p, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return 0, 0
+	}
+	var avail, tot, totFree uint64
+	if r, _, _ := getDiskFreeSpaceEx.Call(uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&avail)),
+		uintptr(unsafe.Pointer(&tot)), uintptr(unsafe.Pointer(&totFree))); r == 0 {
+		return 0, 0
+	}
+	return int64(tot >> 20), int64(avail >> 20)
+}

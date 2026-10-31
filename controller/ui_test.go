@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"epsilon/proto"
 )
 
 // 页面本身不带任何秘密，谁都能打开；数据接口照样要 key。
@@ -18,6 +20,9 @@ func TestUIPageIsPublicButDataNeedsKey(t *testing.T) {
 	r.Body.Close()
 	if r.StatusCode != 200 || !strings.HasPrefix(r.Header.Get("Content-Type"), "text/html") {
 		t.Fatalf("/ui/: %d %s", r.StatusCode, r.Header.Get("Content-Type"))
+	}
+	if r.Header.Get("Cache-Control") != "no-cache" { // 换了主控，浏览器不能还拿旧页面
+		t.Fatalf("Cache-Control = %q", r.Header.Get("Cache-Control"))
 	}
 	if !strings.Contains(string(b), "<title>Epsilon") {
 		t.Fatal("页面不对")
@@ -77,5 +82,24 @@ func TestRequestLogsAnswersJSON(t *testing.T) {
 	r.Body.Close()
 	if r.StatusCode != 200 || r.Header.Get("Content-Type") != "application/json" {
 		t.Fatalf("%d %q", r.StatusCode, r.Header.Get("Content-Type"))
+	}
+}
+
+// 心跳里的磁盘信息原样出现在节点列表里，网页靠它显示"D 盘剩余"。
+func TestNodesListCarriesDisk(t *testing.T) {
+	_, srv := newTestController(t)
+	post(t, srv.URL+"/v1/register", "tok", proto.Register{Node: "pc-01"}).Body.Close()
+	post(t, srv.URL+"/v1/heartbeat", "tok", proto.Heartbeat{Node: "pc-01",
+		Disk: &proto.Disk{TotalMB: 476000, FreeMB: 12000, UsageMB: map[string]int64{"models": 2600}, Complete: true}}).Body.Close()
+	req, _ := http.NewRequest("GET", srv.URL+"/v1/nodes", nil)
+	req.Header.Set("Authorization", "Bearer sk-1")
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	if !strings.Contains(string(b), `"disk":{"total_mb":476000,"free_mb":12000,"usage_mb":{"models":2600},"complete":true}`) {
+		t.Fatalf("没带磁盘: %s", b)
 	}
 }

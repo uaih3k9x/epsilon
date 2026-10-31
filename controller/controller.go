@@ -377,6 +377,7 @@ func (c *Controller) listNodes(w http.ResponseWriter, _ *http.Request) {
 		GPUs     []proto.GPU `json:"gpus"`
 		Chunks   int         `json:"chunks"` // 持有的块数
 		MemFree  int         `json:"mem_free_mb,omitempty"`
+		Disk     *proto.Disk `json:"disk,omitempty"`
 		Room     string      `json:"room,omitempty"`
 		Switch   string      `json:"switch,omitempty"`
 	}
@@ -390,7 +391,7 @@ func (c *Controller) listNodes(w http.ResponseWriter, _ *http.Request) {
 		}
 		rows = append(rows, row{Node: name, Addr: n.addr, Version: v, Boot: n.hb.Boot, AgoSec: int(now.Sub(n.seen).Seconds()),
 			Running: n.hb.Running, Serving: c.alive(n, now), Reason: n.hb.Reason, Idle: n.hb.IdleSeconds, Foreign: n.hb.ForeignGPU,
-			Inflight: n.inflight, GPUs: n.hb.GPUs, Chunks: len(n.chunks), MemFree: n.hb.MemFreeMB,
+			Inflight: n.inflight, GPUs: n.hb.GPUs, Chunks: len(n.chunks), MemFree: n.hb.MemFreeMB, Disk: n.hb.Disk,
 			Room: c.cfg.Topology[name].Room, Switch: c.cfg.Topology[name].Switch})
 	}
 	c.mu.Unlock()

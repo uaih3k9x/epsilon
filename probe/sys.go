@@ -21,8 +21,9 @@ func (RealSystem) ComputeApps() string {
 	return nvidiaSmi("--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader,nounits")
 }
 
-func (RealSystem) IdleSeconds() int { return idleSeconds() }
-func (RealSystem) MemFreeMB() int   { return memFreeMB() }
+func (RealSystem) IdleSeconds() int                       { return idleSeconds() }
+func (RealSystem) MemFreeMB() int                         { return memFreeMB() }
+func (RealSystem) DiskMB(path string) (total, free int64) { return diskMB(path) }
 
 func nvidiaSmi(args ...string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

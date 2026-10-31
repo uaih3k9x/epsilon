@@ -13,5 +13,9 @@ var uiFiles embed.FS
 
 func uiHandler() http.Handler {
 	sub, _ := fs.Sub(uiFiles, "ui")
-	return http.StripPrefix("/ui/", http.FileServer(http.FS(sub)))
+	files := http.StripPrefix("/ui/", http.FileServer(http.FS(sub)))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-cache") // 打包的文件没有修改时间，不加这个浏览器会一直用旧页面
+		files.ServeHTTP(w, r)
+	})
 }
