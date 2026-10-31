@@ -25,6 +25,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     Write-Host 'Run as administrator.'; return
 }
 if (-not (Test-Path D:\)) { Write-Host 'No D: drive (data disk).'; return }
+if (-not $env:EPS_KEY) { Write-Host 'EPS_KEY is not set. Paste the whole line into cmd or OSEasy, not into a PowerShell prompt.'; return }
 New-Item -ItemType Directory -Force $Dst | Out-Null
 icacls $Dst /grant "*S-1-5-32-545:(OI)(CI)M" /T /Q | Out-Null   # boot loader and probe run as a normal user
 try { Start-Transcript -Path "$Dst\install.log" -Force | Out-Null } catch {}
@@ -109,8 +110,11 @@ if ($ok) { Write-Host 'reachable' } else { Write-Host 'NOT reachable' }
 
 Step '5/7 seed: put the current signed release into a free slot (boot loader picks it up and trial-starts it)'
 $ErrorActionPreference = 'Continue'
+$enc = $null
+try { $enc = [Console]::OutputEncoding; [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}   # the probe prints UTF-8; 5.1 would decode it as the ANSI code page
 & "$R\epsilon-probe.exe" -seed -config "$Dst\probe.json" -root $Dst 2>&1 | ForEach-Object { Write-Host $_ }
 $seedExit = $LASTEXITCODE
+if ($enc) { try { [Console]::OutputEncoding = $enc } catch {} }
 $ErrorActionPreference = 'Stop'
 if ($seedExit -eq 0) { Write-Host 'seed OK' } else { Write-Host "seed failed (exit $seedExit): boot loader will have nothing to start until the probe gets a slot" }
 
