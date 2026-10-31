@@ -20,6 +20,12 @@ import (
 )
 
 func main() {
+	if handled, err := runJobCommand(os.Args[1:]); handled {
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	keyPath := flag.String("key", "dist/keys/release-main.key", "私钥（base64 种子）")
 	version := flag.String("version", "", "版本号；试坏过的版本号引导器不会再下，修好要换新号")
 	minBoot := flag.Int("min-boot", 2, "这版本体至少要哪个版本的引导器（只在本体真的依赖新引导器时调高：调高后旧引导器的机器装不了）")
