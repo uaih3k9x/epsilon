@@ -19,9 +19,12 @@ import (
 
 var chunkHash = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// manifestName 比 bootName 多一个 @：环境层的清单 ID 是 名字@版本（docs/jobs.md）。
+var manifestName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@-]*$`)
+
 // readManifest 读 <chunks_dir>/<id>.json；id 不合法或是预热规则文件当不存在。
 func (c *Controller) readManifest(id string) ([]byte, error) {
-	if !bootName.MatchString(id) || id+".json" == preloadFile {
+	if !manifestName.MatchString(id) || id+".json" == preloadFile {
 		return nil, os.ErrNotExist
 	}
 	return os.ReadFile(filepath.Join(c.cfg.ChunksDir, id+".json"))
