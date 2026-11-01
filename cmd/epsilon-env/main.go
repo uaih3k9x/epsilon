@@ -1,25 +1,35 @@
 // epsilon-env: 在机器上手工安装环境层（探针接上之前用来实测，契约见 docs/jobs.md）。
 // 用法: epsilon-env install -name py311-torch2.5-cu124@1 -digest <钥匙环里的摘要> -manifest <清单.json> -chunks <块目录> -root D:\epsilon [脚本 参数...]
 // 给了脚本就在装好后用层里的解释器跑它（-E -B），退出码原样返回。
+//
+// epsilon-env upload -id exp029-t0 -dir D:\epsilon\jobs\exp029-t0\output -config D:\epsilon\probe.json
+// 把任务输出传回主控，断了重跑就是续传。
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"time"
 
 	"epsilon/chunk"
 	"epsilon/envlayer"
+	"epsilon/joboutput"
 )
 
 func main() {
 	log.SetFlags(0)
+	if len(os.Args) >= 2 && os.Args[1] == "upload" {
+		upload(os.Args[2:])
+		return
+	}
 	if len(os.Args) < 2 || os.Args[1] != "install" {
-		log.Fatal("用法: epsilon-env install -name <名字@版本> -digest <sha256> -manifest <清单> -chunks <块目录> -root <目录>")
+		log.Fatal("用法: epsilon-env install -name <名字@版本> -digest <sha256> -manifest <清单> -chunks <块目录> -root <目录> [脚本 参数...]\n或: epsilon-env upload -id <任务> -dir <目录> -config <probe.json>")
 	}
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	name := fs.String("name", "", "环境层 名字@版本")
@@ -59,4 +69,36 @@ func main() {
 		}
 		log.Fatal(err)
 	}
+}
+
+func upload(args []string) {
+	fs := flag.NewFlagSet("upload", flag.ExitOnError)
+	id := fs.String("id", "", "任务 ID")
+	dir := fs.String("dir", "", "要传的目录")
+	config := fs.String("config", "", "probe.json：取主控地址和 token")
+	fs.Parse(args)
+	if *id == "" || *dir == "" || *config == "" {
+		log.Fatal("-id、-dir、-config 都要")
+	}
+	raw, err := os.ReadFile(*config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var cfg struct {
+		Controller string `json:"controller"`
+		Token      string `json:"token"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		log.Fatal(err)
+	}
+	start := time.Now()
+	m, err := joboutput.Upload(context.Background(), &http.Client{Timeout: 10 * time.Minute}, cfg.Controller, cfg.Token, *id, *dir, 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var total int64
+	for _, f := range m.Files {
+		total += f.Size
+	}
+	json.NewEncoder(os.Stdout).Encode(map[string]any{"job": *id, "files": len(m.Files), "bytes": total, "seconds": time.Since(start).Seconds()})
 }

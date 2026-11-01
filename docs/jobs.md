@@ -117,6 +117,22 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 
 真机验证：`<层目录>\python.exe -E -B deploy\envs\smoke\smoke.py`。
 
+## 任务输出回传
+
+代码在 `joboutput/`（探针侧）和 `controller/joboutput.go`（主控侧），命令行 `epsilon-env upload`。主控配 `jobs_dir` 才开；单任务上限 `job_output_max_mb`（默认 2048）。
+
+| 接口 | 认证 | 说明 |
+|---|---|---|
+| `HEAD /v1/jobs/{id}/chunks/{hash}` | probe token | 主控有没有这块；已完成的任务按清单回答 |
+| `PUT /v1/jobs/{id}/chunks/{hash}` | probe token | 传一块，内容和哈希对不上回 400，超上限回 413 |
+| `PUT /v1/jobs/{id}/output` | probe token | 传清单（`proto.Manifest`）。缺块回 409；校验整文件后才算完成 |
+| `GET /v1/jobs/{id}/output` | api key | 取清单，没完成回 404 |
+| `GET /v1/jobs/{id}/files/{路径}` | api key | 下载；只发清单里列的文件 |
+
+- **续传**：重新运行一遍就行，主控已有的块不再传。
+- **完成后冻结**：`manifest.json` 写好后内容不可改，同样内容再传直接成功，不同内容回 409。完成后删掉块目录，不留两份。
+- 现在 token 是所有探针共用的，任一探针能传任一任务的输出；哪台机器能传哪个任务要等主控队列（`/v1/jobs`）落地后再绑定。
+
 ## 还没做（按 issue #1）
 
 - 探针：拉钥匙环、持久化最高版本号（`job-keyring.version`，原子写）、拉任务包和代码包、二次核对哈希、执行；
