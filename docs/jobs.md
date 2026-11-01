@@ -16,7 +16,7 @@
 ```
 
 - 主控只分发这两个文件，**不能**加钥匙、改任务包；主控被拿下最坏是重复跑签过名的任务包。
-- 和本体发布签名一样：签名针对**原文字节**，验签不重新序列化。签名后的文件一个字节都不要改，重新排版也算改。
+- 和本体发布签名一样：签名针对**原文字节**，验签不重新序列化。`sign-job` 直接签 `job.json` 文件原文（审核人读到什么就签什么，未知字段也保留），文件要是无 BOM 的 UTF-8。签名后的文件一个字节都不要改，重新排版也算改。
 - 根公钥沿用 `loader.PublicKeys`（一主一备，任意一把验过即可）。
 
 ## 钥匙环
@@ -35,7 +35,8 @@
       "limits": {"max_hours": 4, "max_nodes": 20, "rooms": ["R1", "R2"], "network": false}
     }
   ],
-  "revoked_jobs": ["<任务包摘要>"]
+  "revoked_jobs": ["<任务包摘要>"],
+  "env_layers": {"py311-torch2.5-cu124@1": "<环境层清单的 SHA-256>"}
 }
 ```
 
@@ -50,6 +51,7 @@
 | `keys[].limits.max_nodes` / `rooms` | 主控派活时执行（`rooms` 空 = 不限） |
 | `keys[].limits.network` | false 时，要联网的任务包（`network: true`）一律不跑 |
 | `revoked_jobs` | 任务包摘要（`job.signed.json` 里 `job` 字段原文的 SHA-256，小写十六进制） |
+| `env_layers` | `名字@版本` → 环境层清单原文的 SHA-256。探针只用表里的环境层，拉到清单后核对摘要；主控换不了环境层 |
 
 - **吊销钥匙** = 发一份不含它的新版本钥匙环。
 - **吊销任务包** = 把它的摘要写进 `revoked_jobs`，发新版本。
@@ -67,10 +69,13 @@
 
 1. `key` 在钥匙环里、没过期，签名对得上这把钥匙；
 2. 摘要不在 `revoked_jobs` 里；
-3. `schema` = 1；`name`、`version`（x.y.z）、`env` / `data`（`名字@版本`）、`code_sha256`（64 位小写十六进制）格式合法；
-4. `entry` = `[解释器, 脚本, 参数…]`：解释器只能是 `python` / `python3`，脚本是 `code\` 下的相对 `.py` 路径、不含 `..`，后面不许出现 `-c` / `-m`；
-5. `gpu_mem_mb` 在 0–7168，`max_hours` > 0；
+3. 必填字段（`schema` `name` `version` `owner` `entry` `env` `gpu_mem_mb` `max_hours` `disk_max_mb` `output_max_mb` `code_sha256`）都有，不许写 `null`；
+   `schema` = 1；`name`、`version`（x.y.z）、`env` / `data`（`名字@版本`）、`code_sha256`（64 位小写十六进制）格式合法；`owner` 非空；`disk_max_mb` / `output_max_mb` ≥ 1；`env` 在钥匙环的 `env_layers` 里；
+4. `entry` = `[解释器, 脚本, 参数…]`：解释器只能是 `python` / `python3`，后面可以有 `-B` / `-u`（不影响执行什么代码；其他解释器参数不行），然后必须是脚本，脚本是 `code\` 下的相对 `.py` 路径、不含 `..`，后面不许出现 `-c` / `-m`；
+5. `gpu_mem_mb` 在 0–7168，`max_hours` > 0；`gpu` 不写按 `true` 算（读 `Job.NeedsGPU()`），GPU 任务的 `gpu_mem_mb` 不能是 0，纯 CPU 任务要明确写 `"gpu": false`；
 6. `max_hours` ≤ 钥匙的 `max_hours`；要联网的，钥匙必须有 `network` 权限。
+
+不影响安全和调度的问题只报 warning（`jobsign.JobWarnings`）：`description` 没写或超过 200 字、`owner` 格式不规范。`sign-job` 打印出来并写进 `job.signed.json` 的 `warnings` 留痕；这个字段不受签名保护，探针不看。
 
 `code_sha256` 和实际 `code.zip` 是否一致，签名时由 `sign-job` 核对；探针拉到代码包以后**还要再核一次**（还没实现）。
 

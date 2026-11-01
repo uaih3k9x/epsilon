@@ -143,9 +143,13 @@ func cmdSignJob(keyPath, name, ringPath, jobPath, codePath, out string) error {
 	if !match {
 		return fmt.Errorf("钥匙环里没有名叫 %q、公钥和这把私钥对得上的钥匙", name)
 	}
-	var j jobsign.Job
-	if err := readJSON(jobPath, &j); err != nil {
+	text, err := os.ReadFile(jobPath)
+	if err != nil {
 		return err
+	}
+	var j jobsign.Job
+	if err := json.Unmarshal(text, &j); err != nil {
+		return fmt.Errorf("%s 格式坏了: %v", jobPath, err)
 	}
 	sum, err := fileSHA256(codePath)
 	if err != nil {
@@ -154,12 +158,16 @@ func cmdSignJob(keyPath, name, ringPath, jobPath, codePath, out string) error {
 	if sum != j.CodeSHA256 {
 		return fmt.Errorf("code.zip 的 SHA-256 是 %s, job.json 里写的是 %s", sum, j.CodeSHA256)
 	}
-	sj, err := jobsign.SignJob(j, name, priv)
+	sj, err := jobsign.SignJob(text, name, priv)
 	if err != nil {
 		return err
 	}
 	if _, _, err := jobsign.VerifyJob(sj, kr, time.Now()); err != nil {
 		return fmt.Errorf("签完按探针规则验没过: %v", err)
+	}
+	sj.Warnings = jobsign.JobWarnings(j)
+	for _, w := range sj.Warnings {
+		fmt.Fprintln(os.Stderr, "warning:", w)
 	}
 	b, _ := json.MarshalIndent(sj, "", "  ")
 	return writeFileAtomic(out, b)
