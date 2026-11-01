@@ -2,7 +2,7 @@
 
 用层里的解释器跑: python -E -B job-runner.py --job-dir ... --code-zip ... --code-sha256 ... --params ... --script train.py
 核对 code.zip 哈希 → 展开成 code/ params.json output/ tmp/ → 跑脚本并采显存 → 汇总写 runner-done.json 并打印。
-跑过就不再跑；打印完默认挂着不退出，免得探针把它当崩溃反复拉起。
+跑过就不再跑；给了 --job-id 就把 output/ 传回主控。打印完默认挂着不退出，免得探针把它当崩溃反复拉起。
 """
 import argparse
 import hashlib
@@ -90,6 +90,20 @@ def run_job(job, code_zip, code_sha256, params, script, gpu_sampler=nvidia_smi_u
     return summary
 
 
+def upload_cmd(exe, job_id, job_dir, config):
+    return [exe, "upload", "-id", job_id, "-dir", str(Path(job_dir) / "output"), "-config", config]
+
+
+def upload_until_ok(cmd, run=lambda c: subprocess.run(c).returncode, sleep=time.sleep, tries=120, delay=60):
+    """回传失败只重传，不重跑任务；重传是续传，主控已有的块不再发。"""
+    for i in range(tries):
+        if run(cmd) == 0:
+            return True
+        if i + 1 < tries:
+            sleep(delay)
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--job-dir", required=True)
@@ -98,9 +112,15 @@ def main():
     ap.add_argument("--params", required=True)
     ap.add_argument("--script", required=True)
     ap.add_argument("--no-wait", action="store_true")
+    ap.add_argument("--job-id", help="给了就在跑完后回传 output/")
+    ap.add_argument("--upload-exe")
+    ap.add_argument("--probe-config")
     a = ap.parse_args()
     summary = run_job(a.job_dir, a.code_zip, a.code_sha256, a.params, a.script)
     print("JOB_DONE " + json.dumps(summary), flush=True)
+    if a.job_id:
+        ok = upload_until_ok(upload_cmd(a.upload_exe, a.job_id, a.job_dir, a.probe_config))
+        print("UPLOAD_DONE" if ok else "UPLOAD_FAILED", flush=True)
     while not a.no_wait:
         time.sleep(3600)
 

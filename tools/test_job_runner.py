@@ -93,3 +93,26 @@ def test_parse_nvidia_smi():
     assert jr.parse_mem("339\n") == 339
     assert jr.parse_mem("N/A\n") is None
     assert jr.parse_mem("") is None
+
+
+def test_upload_retries_until_success():
+    calls = []
+
+    def fake(cmd):
+        calls.append(cmd)
+        return 0 if len(calls) == 3 else 1
+
+    assert jr.upload_until_ok(["epsilon-env", "upload"], run=fake, sleep=lambda s: None) is True
+    assert len(calls) == 3
+
+
+def test_upload_gives_up_after_limit():
+    assert jr.upload_until_ok(["x"], run=lambda c: 1, sleep=lambda s: None, tries=2) is False
+
+
+def test_upload_command_passes_job_and_output_dir():
+    cmd = jr.upload_cmd("E:/epsilon-env.exe", "exp029-t0", "D:/jobs/exp029-t0", "D:/probe.json")
+    assert cmd[:2] == ["E:/epsilon-env.exe", "upload"]
+    assert cmd[cmd.index("-id") + 1] == "exp029-t0"
+    assert cmd[cmd.index("-dir") + 1].replace("\\", "/").endswith("exp029-t0/output")
+    assert cmd[cmd.index("-config") + 1] == "D:/probe.json"

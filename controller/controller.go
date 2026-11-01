@@ -21,17 +21,19 @@ import (
 )
 
 type Config struct {
-	Listen       string                        `json:"listen"`
-	ProbeToken   string                        `json:"probe_token"`
-	APIKeys      []string                      `json:"api_keys"`      // 空 = 路由不验 key
-	StaleSeconds int                           `json:"stale_seconds"` // 多久没心跳算掉线
-	Default      proto.DesiredState            `json:"default"`
-	Nodes        map[string]proto.DesiredState `json:"nodes"`          // 按节点整个覆盖默认值
-	FilesDir     string                        `json:"files_dir"`      // 给学生机下载的文件（运行库、新版探针）；空 = 不开
-	CanaryNodes  []string                      `json:"canary_nodes"`   // 这些节点的引导器取 release-canary/ 里的本体，其余取 release/
-	ChunksDir    string                        `json:"chunks_dir"`     // 制品清单和块（docs/p2p.md）；空 = 不开 P2P 接口
-	Topology     map[string]Place              `json:"topology"`       // 节点在哪间教室、哪台交换机，peers 排序用
-	SeedsPerRoom int                           `json:"seeds_per_room"` // 每间教室几台种子可以直接从主控拉块（默认 2）
+	Listen         string                        `json:"listen"`
+	ProbeToken     string                        `json:"probe_token"`
+	APIKeys        []string                      `json:"api_keys"`      // 空 = 路由不验 key
+	StaleSeconds   int                           `json:"stale_seconds"` // 多久没心跳算掉线
+	Default        proto.DesiredState            `json:"default"`
+	Nodes          map[string]proto.DesiredState `json:"nodes"`             // 按节点整个覆盖默认值
+	FilesDir       string                        `json:"files_dir"`         // 给学生机下载的文件（运行库、新版探针）；空 = 不开
+	CanaryNodes    []string                      `json:"canary_nodes"`      // 这些节点的引导器取 release-canary/ 里的本体，其余取 release/
+	ChunksDir      string                        `json:"chunks_dir"`        // 制品清单和块（docs/p2p.md）；空 = 不开 P2P 接口
+	JobsDir        string                        `json:"jobs_dir"`          // 任务输出回传（docs/jobs.md）；空 = 不开
+	JobOutputMaxMB int                           `json:"job_output_max_mb"` // 单个任务输出上限；没写 = 2048
+	Topology       map[string]Place              `json:"topology"`          // 节点在哪间教室、哪台交换机，peers 排序用
+	SeedsPerRoom   int                           `json:"seeds_per_room"`    // 每间教室几台种子可以直接从主控拉块（默认 2）
 }
 
 // Place 是节点的物理位置；不在 Topology 里的节点两项都是空串。
@@ -60,6 +62,8 @@ type Controller struct {
 	evSeq  int64
 	now    func() time.Time
 	proxy  *http.Client
+
+	jobMu sync.Mutex // 任务输出：完成判定和写 manifest.json 串行
 
 	// 预热规则单独一把锁：peers 持着 mu 时会经 desiredFor 读规则。加锁顺序只能 mu → pmu。
 	pmu     sync.RWMutex
@@ -104,6 +108,13 @@ func (c *Controller) Handler() http.Handler {
 		mux.Handle("GET /dl/", c.apiAuth(http.StripPrefix("/dl/", http.FileServer(http.Dir(c.cfg.FilesDir))).ServeHTTP))
 		mux.HandleFunc("GET /v1/boot/release", c.probeAuth(c.bootFile))
 		mux.HandleFunc("GET /v1/boot/files/{name}", c.probeAuth(c.bootFile))
+	}
+	if c.cfg.JobsDir != "" {
+		mux.HandleFunc("HEAD /v1/jobs/{id}/chunks/{hash}", c.probeAuth(c.jobChunkHead))
+		mux.HandleFunc("PUT /v1/jobs/{id}/chunks/{hash}", c.probeAuth(c.jobChunkPut))
+		mux.HandleFunc("PUT /v1/jobs/{id}/output", c.probeAuth(c.jobOutputPut))
+		mux.HandleFunc("GET /v1/jobs/{id}/output", c.apiAuth(c.jobOutputGet))
+		mux.HandleFunc("GET /v1/jobs/{id}/files/{path...}", c.apiAuth(c.jobFileGet))
 	}
 	if c.cfg.ChunksDir != "" {
 		mux.HandleFunc("GET /v1/manifests/{id}", c.probeAuth(c.manifest))
