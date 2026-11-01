@@ -133,6 +133,21 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 - **完成后冻结**：`manifest.json` 写好后内容不可改，同样内容再传直接成功，不同内容回 409。完成后删掉块目录，不留两份。
 - 现在 token 是所有探针共用的，任一探针能传任一任务的输出；哪台机器能传哪个任务要等主控队列（`/v1/jobs`）落地后再绑定。
 
+## 显存实测
+
+`tools/job-runner.py` 每秒采一次 `nvidia-smi`，结果写进任务摘要（`output/_runner/summary.json`，随输出回传，不计入任务自己的输出）：
+
+| 字段 | 含义 |
+|---|---|
+| `vram_baseline_mb` / `vram_peak_mb` / `vram_delta_mb` | 运行前整卡占用、运行中整卡峰值、两者之差 |
+| `vram_job_process_mb` | `nvidia-smi` 报的任务进程显存。Windows WDDM 下实测全是 `[N/A]`，这时为 `null`，不能靠它 |
+| `vram_allocator_peak_mb` | 任务 `RESULT.json` 自报的 `gpu_peak_allocated_mb`，不含 CUDA 上下文和驱动开销 |
+| `vram_reliable` / `vram_notes` | 基线缺失、采样失败、拿不到进程列表、运行中有别的 GPU 进程出现或退出时为 `false`，原因写在 notes |
+
+真机标定（RTX 4060，C445B-40）：任务分配 1024 MB 时差值两次都是 1129 MB，即 CUDA 上下文和驱动约多占 105 MB；中途另一进程分配 512 MB 时差值变成 1745 MB 并被标记。
+
+审核人按 `vram_delta_mb` 校对 `gpu_mem_mb`。`vram_reliable` 为 `false` 的数据不要用，换台机器重测。任务自己开的 GPU 子进程也会被标记，因为现在只认主进程的 pid。
+
 ## 还没做（按 issue #1）
 
 - 探针：拉钥匙环、持久化最高版本号（`job-keyring.version`，原子写）、拉任务包和代码包、二次核对哈希、执行；

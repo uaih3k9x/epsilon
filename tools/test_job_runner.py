@@ -116,3 +116,141 @@ def test_upload_command_passes_job_and_output_dir():
     assert cmd[cmd.index("-id") + 1] == "exp029-t0"
     assert cmd[cmd.index("-dir") + 1].replace("\\", "/").endswith("exp029-t0/output")
     assert cmd[cmd.index("-config") + 1] == "D:/probe.json"
+
+
+# --- 显存实测 (#5) ---
+
+BASE_APPS = {7: ("Microsoft.Photos.exe", None), 9: ("[Insufficient Permissions]", None)}
+
+
+def measure(pkg, gpu=lambda: 500, apps=lambda: dict(BASE_APPS)):
+    z, params, sha, job = pkg
+    return jr.run_job(job, z, sha, params, "train.py", gpu_sampler=gpu, apps_sampler=apps, sample_seconds=0.001)
+
+
+def test_clean_run_is_reliable(pkg):
+    s = measure(pkg)
+    assert s["vram_reliable"] is True and s["vram_notes"] == []
+
+
+def test_missing_baseline_is_unreliable(pkg):
+    readings = iter([None])
+    s = measure(pkg, gpu=lambda: next(readings, 800))
+    assert s["vram_reliable"] is False
+    assert s["vram_baseline_mb"] is None and s["vram_delta_mb"] is None
+    assert any("基线" in n for n in s["vram_notes"])
+
+
+def test_nvidia_smi_failure_midway_is_unreliable(pkg):
+    readings = iter([500, None])
+    s = measure(pkg, gpu=lambda: next(readings, 800))
+    assert s["vram_reliable"] is False
+    assert s["vram_baseline_mb"] == 500
+    assert any("采样失败" in n for n in s["vram_notes"])
+
+
+def test_process_list_unavailable_is_unreliable(pkg):
+    s = measure(pkg, apps=lambda: None)
+    assert s["vram_reliable"] is False
+    assert any("进程" in n for n in s["vram_notes"])
+
+
+def test_foreign_process_appearing_midway_is_flagged(pkg):
+    readings = iter([dict(BASE_APPS)])
+    s = measure(pkg, apps=lambda: next(readings, {**BASE_APPS, 42: ("game.exe", 3000)}))
+    assert s["vram_reliable"] is False
+    assert any("game.exe" in n and "42" in n for n in s["vram_notes"])
+
+
+def test_foreign_process_leaving_midway_is_flagged(pkg):
+    # 基线里的进程退出会把差值压低, 同样不可靠
+    readings = iter([dict(BASE_APPS)])
+    s = measure(pkg, apps=lambda: next(readings, {9: BASE_APPS[9]}))
+    assert s["vram_reliable"] is False
+    assert any("Microsoft.Photos.exe" in n for n in s["vram_notes"])
+
+
+def test_job_process_itself_is_not_foreign_and_reports_its_memory(pkg, monkeypatch):
+    z, params, sha, job = pkg
+    seen = {}
+    real_popen = jr.subprocess.Popen
+
+    def popen(*a, **k):
+        p = real_popen(*a, **k)
+        seen["pid"] = p.pid
+        return p
+
+    monkeypatch.setattr(jr.subprocess, "Popen", popen)
+
+    def apps():
+        return {**BASE_APPS, seen["pid"]: ("python.exe", 1234)} if "pid" in seen else dict(BASE_APPS)
+
+    s = jr.run_job(job, z, sha, params, "train.py", gpu_sampler=lambda: 500, apps_sampler=apps, sample_seconds=0.001)
+    assert s["vram_reliable"] is True, s["vram_notes"]
+    # 脚本可能快到采不到; 采到了就必须是任务进程自己的值
+    assert s["vram_job_process_mb"] in (None, 1234)
+
+
+def test_job_process_memory_comes_from_samples(monkeypatch, pkg):
+    z, params, sha, job = pkg
+    slow = pkg[0].parent / "slow.zip"
+    with jr.zipfile.ZipFile(slow, "w") as f:
+        f.writestr("train.py", "import time; time.sleep(0.5)\n")
+    sha = jr.hashlib.sha256(slow.read_bytes()).hexdigest()
+    pids = {}
+    real_popen = jr.subprocess.Popen
+
+    def popen(*a, **k):
+        p = real_popen(*a, **k)
+        pids["job"] = p.pid
+        return p
+
+    monkeypatch.setattr(jr.subprocess, "Popen", popen)
+    apps = lambda: {pids["job"]: ("python.exe", 1234)} if "job" in pids else {}
+    s = jr.run_job(job, slow, sha, params, "train.py", gpu_sampler=lambda: 500, apps_sampler=apps, sample_seconds=0.01)
+    assert s["vram_job_process_mb"] == 1234
+    assert s["vram_reliable"] is True, s["vram_notes"]
+
+
+def test_allocator_peak_comes_from_result(tmp_path, pkg):
+    z, params, sha, job = pkg
+    code = tmp_path / "a.zip"
+    with jr.zipfile.ZipFile(code, "w") as f:
+        f.writestr("train.py", """
+from pathlib import Path
+Path(__file__).resolve().parent.parent.joinpath("output", "RESULT.json").write_text('{"gpu_peak_allocated_mb": 812.5}')
+""")
+    sha = jr.hashlib.sha256(code.read_bytes()).hexdigest()
+    s = jr.run_job(job, code, sha, params, "train.py", gpu_sampler=lambda: 500, apps_sampler=lambda: {}, sample_seconds=0.001)
+    assert s["vram_allocator_peak_mb"] == 812.5
+
+
+def test_broken_result_json_does_not_crash_the_runner(tmp_path, pkg):
+    # 崩了探针会拉起, 整个任务重跑; RESULT.json 坏了要记下来, 不能重跑
+    z, params, sha, job = pkg
+    code = tmp_path / "b.zip"
+    with jr.zipfile.ZipFile(code, "w") as f:
+        f.writestr("train.py", """
+from pathlib import Path
+Path(__file__).resolve().parent.parent.joinpath("output", "RESULT.json").write_text('[1, 2')
+""")
+    sha = jr.hashlib.sha256(code.read_bytes()).hexdigest()
+    s = jr.run_job(job, code, sha, params, "train.py", gpu_sampler=lambda: None, apps_sampler=lambda: {}, sample_seconds=0.001)
+    assert s["result"] is None and s["returncode"] == 0
+    assert s["vram_allocator_peak_mb"] is None
+
+
+def test_parse_compute_apps_windows_output():
+    text = "1234, C:\\x\\python.exe, [N/A]\n7, Microsoft.Photos.exe, 300\nbad line\n"
+    assert jr.parse_apps(text) == {1234: ("C:\\x\\python.exe", None), 7: ("Microsoft.Photos.exe", 300)}
+    assert jr.parse_apps("") == {}
+
+
+def test_summary_goes_back_with_the_output(pkg):
+    z, params, sha, job = pkg
+    s = measure(pkg)
+    jr.publish_summary(job, s)
+    got = json.loads((job / "output" / "_runner" / "summary.json").read_text(encoding="utf-8"))
+    assert got["vram_reliable"] is True
+    # 不算进任务自己的输出
+    assert not any(f.startswith("_runner") for f in got["output_files"])
