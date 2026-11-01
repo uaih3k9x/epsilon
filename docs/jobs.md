@@ -140,9 +140,11 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 | 字段 | 含义 |
 |---|---|
 | `vram_baseline_mb` / `vram_peak_mb` / `vram_delta_mb` | 运行前整卡占用、运行中整卡峰值、两者之差 |
-| `vram_job_process_mb` | `nvidia-smi` 报的任务进程显存；WDDM 下常是 N/A，这时为 `null` |
+| `vram_job_process_mb` | `nvidia-smi` 报的任务进程显存。Windows WDDM 下实测全是 `[N/A]`，这时为 `null`，不能靠它 |
 | `vram_allocator_peak_mb` | 任务 `RESULT.json` 自报的 `gpu_peak_allocated_mb`，不含 CUDA 上下文和驱动开销 |
 | `vram_reliable` / `vram_notes` | 基线缺失、采样失败、拿不到进程列表、运行中有别的 GPU 进程出现或退出时为 `false`，原因写在 notes |
+
+真机标定（RTX 4060，C445B-40）：任务分配 1024 MB 时差值两次都是 1129 MB，即 CUDA 上下文和驱动约多占 105 MB；中途另一进程分配 512 MB 时差值变成 1745 MB 并被标记。
 
 审核人按 `vram_delta_mb` 校对 `gpu_mem_mb`。`vram_reliable` 为 `false` 的数据不要用，换台机器重测。任务自己开的 GPU 子进程也会被标记，因为现在只认主进程的 pid。
 
