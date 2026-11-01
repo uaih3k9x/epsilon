@@ -46,5 +46,5 @@ except Exception as error:
     check("torch", False, repr(error))
 
 report["ok"] = all(c["ok"] for c in report["checks"].values())
-print(json.dumps(report, ensure_ascii=False, indent=2))
+print(json.dumps(report, indent=2), flush=True)  # 纯 ASCII：重定向到文件时 Windows 用系统编码
 sys.exit(0 if report["ok"] else 1)

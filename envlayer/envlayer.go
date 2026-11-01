@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -29,6 +30,12 @@ const (
 type Result struct {
 	Dir   string
 	Files int
+}
+
+// Command 用层里的解释器跑脚本。层里没有 ._pth（它会让脚本目录进不了 sys.path），
+// 隔离靠 -E（不读 PYTHON* 环境变量和注册表），不写字节码靠 -B。
+func Command(dir string, args ...string) *exec.Cmd {
+	return exec.Command(filepath.Join(dir, Interpreter), append([]string{"-E", "-B"}, args...)...)
 }
 
 // Dir 是环境层解压后的目录。

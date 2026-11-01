@@ -41,6 +41,7 @@ func newP2PRig(t *testing.T, cfg Config) *p2pRig {
 	os.MkdirAll(filepath.Join(dir, h1[:2]), 0o755)
 	os.WriteFile(filepath.Join(dir, h1[:2], h1), []byte("blk1"), 0o644)
 	os.WriteFile(filepath.Join(dir, "secret.txt"), []byte("secret"), 0o644)
+	os.WriteFile(filepath.Join(dir, "py311-torch2.5-cu124@1.json"), []byte("layer"), 0o644)
 
 	cfg.ProbeToken, cfg.ChunksDir, cfg.StaleSeconds = "tok", dir, 30
 	if cfg.Default.Artifacts == nil {
@@ -104,6 +105,9 @@ func TestManifestAndChunkPaths(t *testing.T) {
 		{"/v1/manifests/nope", "tok", 404, ""},
 		{"/v1/manifests/..%2fsecret.txt", "tok", 404, ""},
 		{"/v1/manifests/.hidden", "tok", 404, ""},
+		{"/v1/manifests/py311-torch2.5-cu124@1", "tok", 200, "layer"}, // 环境层: 名字@版本
+		{"/v1/manifests/@1", "tok", 404, ""},
+		{"/v1/manifests/..%2f@1", "tok", 404, ""},
 		{"/v1/chunks/" + h1, "tok", 200, "blk1"},
 		{"/v1/chunks/" + h1, "", 401, ""},
 		{"/v1/chunks/" + strings.ToUpper(h1), "tok", 404, ""},

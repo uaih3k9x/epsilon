@@ -281,3 +281,12 @@ func TestInstallMissingChunkFails(t *testing.T) {
 		t.Fatal("缺块竟然装了")
 	}
 }
+
+func TestCommandAlwaysIsolates(t *testing.T) {
+	// 层里没有 ._pth, 隔离全靠 -E; 不写字节码靠 -B。调用方不能漏掉。
+	cmd := Command("/r/envs/x@1", "/j/code/train.py", "--a")
+	want := []string{filepath.Join("/r/envs/x@1", Interpreter), "-E", "-B", "/j/code/train.py", "--a"}
+	if strings.Join(cmd.Args, " ") != strings.Join(want, " ") || cmd.Path != want[0] {
+		t.Fatalf("命令不对: %q %q", cmd.Path, cmd.Args)
+	}
+}
