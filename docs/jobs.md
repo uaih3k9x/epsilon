@@ -95,6 +95,28 @@ epsilon-release sign-job -key dist/keys/reviewer-a.key -name reviewer-a \
 
 不带子命令时 `epsilon-release` 照旧做本体发布签名，用法不变。
 
+## 环境层
+
+代码在 `envlayer/`，配置在 `deploy/envs/<名字>/`，构建脚本 `tools/build-env-layer.py`。
+
+- **一层就是一个 zip**：清单（`proto.Manifest`）只有一个文件 `envs/<名字@版本>.zip`，走现有分块分发（`docs/p2p.md`），几万个小文件不进清单。
+- **信任**：钥匙环 `env_layers` 写清单原文的 SHA-256。探针先核对摘要，再拼 zip、解压到 `<root>/envs/<名字@版本>/`。解压先进临时目录，写好 stamp 再改名；路径穿越、链接、大小写冲突、缺 `python.exe` 都拒。
+- **不改旧层**：要加包就发新版本（`@2`）。构建是确定性的（文件排序、固定时间），embeddable Python 核 SHA-256，wheel 按 `requirements.lock` 的哈希装。
+
+构建和手工安装：
+
+```sh
+python3 tools/build-env-layer.py deploy/envs/py311-torch2.5-cu124 --out dist/envs   # 打印要写进钥匙环的摘要
+epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清单> -chunks <块目录> -root D:\epsilon
+```
+
+两个容易踩的点，执行器必须照做：
+
+1. **层里没有 `._pth`，执行时固定加 `-E -B`。** embeddable 自带的 `._pth` 会打开 `safe_path`（CPython `getpath.py`），脚本目录不进 `sys.path`，多文件任务一 `import` 就失败。`-E` 负责隔离（不读 `PYTHON*` 环境变量和注册表），脚本目录照常可用。
+2. **层内 pyc 是预编译的（`unchecked-hash`）。** 任务不写字节码，解压也不保留修改时间；不预编译的话，每次启动都要重新编译 torch。
+
+真机验证：`<层目录>\python.exe -E -B deploy\envs\smoke\smoke.py`。
+
 ## 还没做（按 issue #1）
 
 - 探针：拉钥匙环、持久化最高版本号（`job-keyring.version`，原子写）、拉任务包和代码包、二次核对哈希、执行；
