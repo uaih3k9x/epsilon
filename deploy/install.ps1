@@ -56,26 +56,32 @@ function EnsureZip($name) {
 }
 
 Step "1/7 files -> $Dst"
-Stop-ScheduledTask -TaskName epsilon-probe -ErrorAction SilentlyContinue
-Get-Process epsilon-boot, epsilon-probe, llama-server, ggml-rpc-server -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep 2
-Fetch 'pkg/probe.json' "$Dst\probe.json"
+# Download and verify first: a failed download or a bad hash must leave the probe running and slot R in place.
+Fetch 'pkg/probe.json' "$Dst\probe.json.new"
 Fetch 'pkg/vc_redist.x64.exe' "$Dst\vc_redist.x64.exe"
 Fetch 'upgrade/epsilon-boot.exe' "$Dst\epsilon-boot.exe.new"
 $got = (Get-FileHash "$Dst\epsilon-boot.exe.new" -Algorithm SHA256).Hash.ToLower()
 if ($got -ne $BootSha) { Remove-Item "$Dst\epsilon-boot.exe.new"; throw "boot loader hash mismatch: $got" }
-Move-Item "$Dst\epsilon-boot.exe.new" "$Dst\epsilon-boot.exe" -Force
 Write-Host "boot loader OK"
 # Rescue slot R (docs/boot.md): the signed release, written only by this installer. The boot loader verifies it
 # and runs it with -seed when slots A and B cannot run; we also use it below for the first seed.
-$R = "$Dst\R"
-Remove-Item -Recurse -Force $R -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force $R | Out-Null
-foreach ($f in 'release.json', 'epsilon-probe.exe', 'workloads.json') { Fetch "release/$f" "$R\$f" }
-$got = (Get-FileHash "$R\epsilon-probe.exe" -Algorithm SHA256).Hash.ToLower()
-if ($got -ne $SeedSha) { Remove-Item -Recurse -Force $R; throw "rescue probe hash mismatch: $got" }
-Remove-Item -Recurse -Force "$Dst\seed" -ErrorAction SilentlyContinue   # older installers kept the seed probe here
+# It ships in upgrade/seed/ next to this script, so promoting a new release/ cannot make $SeedSha stale;
+# the probe's loader then moves the machine on to the current release.
+$R = "$Dst\R"; $RNew = "$Dst\R.new"
+Remove-Item -Recurse -Force $RNew -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force $RNew | Out-Null
+foreach ($f in 'release.json', 'epsilon-probe.exe', 'workloads.json') { Fetch "upgrade/seed/$f" "$RNew\$f" }
+$got = (Get-FileHash "$RNew\epsilon-probe.exe" -Algorithm SHA256).Hash.ToLower()
+if ($got -ne $SeedSha) { Remove-Item -Recurse -Force $RNew; throw "rescue probe hash mismatch: $got" }
 Write-Host "rescue slot R OK"
+Stop-ScheduledTask -TaskName epsilon-probe -ErrorAction SilentlyContinue
+Get-Process epsilon-boot, epsilon-probe, llama-server, ggml-rpc-server -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep 2
+Move-Item "$Dst\probe.json.new" "$Dst\probe.json" -Force
+Move-Item "$Dst\epsilon-boot.exe.new" "$Dst\epsilon-boot.exe" -Force
+Remove-Item -Recurse -Force $R -ErrorAction SilentlyContinue
+Move-Item $RNew $R
+Remove-Item -Recurse -Force "$Dst\seed" -ErrorAction SilentlyContinue   # older installers kept the seed probe here
 New-Item -ItemType Directory -Force "$Dst\models" | Out-Null
 $model = 'models\Qwen3.5-4B-Q4_K_M.gguf'
 if ((Test-Path "$Dst\$model") -and (Get-Item "$Dst\$model").Length -eq (RemoteSize "pkg/models/Qwen3.5-4B-Q4_K_M.gguf")) { Write-Host 'model already there' }

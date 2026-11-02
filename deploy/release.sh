@@ -46,11 +46,16 @@ dist/build/epsilon-release -key dist/keys/release-main.key -version "$V" -out di
   dist/build/epsilon-probe.exe dist/build/workloads.json
 mkdir -p dist/deploy/upgrade
 cp dist/build/epsilon-boot.exe dist/deploy/upgrade/
-rm -f dist/deploy/upgrade/epsilon-probe-seed.exe   # 旧版装机脚本用的；现在救援槽 R 直接取 /dl/release/ 里签了名的发布
+rm -f dist/deploy/upgrade/epsilon-probe-seed.exe   # 旧版装机脚本用的
+# 救援槽 R 的内容和装机脚本放一起：换 release/ 不会让脚本里钉的哈希过期
+rm -rf dist/deploy/upgrade/seed
+mkdir dist/deploy/upgrade/seed
+cp dist/release/* dist/deploy/upgrade/seed/
 SHA=$(shasum -a 256 dist/build/epsilon-boot.exe | cut -d' ' -f1)
 SEED=$(shasum -a 256 dist/build/epsilon-probe.exe | cut -d' ' -f1)
 sed -e "s/@BOOT_SHA256@/$SHA/" -e "s/@SEED_SHA256@/$SEED/" -e "s/@CONTROLLER@/$EPS_CONTROLLER/" \
     -e "s/@POOL_HEADS@/$EPS_POOL_HEADS/" -e "s/@POOL_RANGE@/$EPS_POOL_RANGE/" deploy/install.ps1 > dist/deploy/upgrade/install.ps1
+sed -e "s/@CONTROLLER@/$EPS_CONTROLLER/" deploy/diag.ps1 > dist/deploy/upgrade/diag.ps1
 rm -f dist/deploy/upgrade/upgrade.ps1
 umask 077   # 哦易一整行命令，含 api key
 printf '%s\r\n' "powershell -NoProfile -ExecutionPolicy Bypass -Command \"\$env:EPS_KEY='$API_KEY'; iex (iwr http://$EPS_CONTROLLER:8090/dl/upgrade/install.ps1 -Headers @{Authorization='Bearer '+\$env:EPS_KEY} -UseBasicParsing).Content\"" > dist/deploy/哦易远程命令.txt
