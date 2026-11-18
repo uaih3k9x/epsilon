@@ -6,6 +6,7 @@ package boot
 // 状态 = boot-state.json（current/pending/good ∈ {"",A,B}，tries，bad，versions）
 //      × A、B、R 三个槽的内容 ∈ {好, 另一个版本（签名合法但版本对不上）, 被篡改, 缺失}
 //      × staged.json ∈ {无, A, B, 垃圾}。
+// 事件：崩溃/卡死不确认、确认、跑着的槽被篡改，以及 loader 改写非 current 槽、放 staged.json（loaderEvents）。
 // 从所有初始状态做 BFS（深度不超过 smDepth），每一步对照一个独立的模型（不调被测代码）检查：
 // 不 panic；不启动验不过或版本对不上的槽；I3（有退路时 tries 每次启动 +1 且不超过 MaxTries）；
 // I7；没有事件时 Pick 是不动点；有能跑的槽时这一轮一定启动点什么；没东西跑时一定要救援；
@@ -25,6 +26,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -333,6 +335,7 @@ func (w *smWorker) step(k smKey) (succ []smKey, errs []string) {
 
 	// 4. 事件
 	succ = append(succ, k2) // 崩溃 / 卡死不确认 / 没东西跑时时间流逝：state 不变
+	succ = append(succ, loaderEvents(k2)...)
 	if slot == "" {
 		return succ, errs
 	}
@@ -351,6 +354,33 @@ func (w *smWorker) step(k smKey) (succ []smKey, errs []string) {
 		succ = append(succ, k3)
 	}
 	return succ, errs
+}
+
+// loaderEvents 是 loader 在两轮之间能做的事：往非 current 的槽写进另一个签名版本（写完放 staged.json，
+// 或者放之前断电），以及单独放一个 staged.json（A / B / 垃圾）。这样 2.x 版本、bad=2.x 的状态也会遇到
+// staged.json 和槽被改写，不只是初始状态里那些。
+func loaderEvents(k smKey) []smKey {
+	var out []smKey
+	for _, s := range []string{"A", "B"} {
+		if s == k.Cur {
+			continue
+		}
+		for _, c := range []smContent{cGood, cOther} {
+			if c == k.content(s) {
+				continue
+			}
+			w := k.withContent(s, c)
+			out = append(out, w)
+			w.Staged = s
+			out = append(out, w)
+		}
+	}
+	for _, s := range []string{"A", "B", "junk"} {
+		w := k
+		w.Staged = s
+		out = append(out, w)
+	}
+	return out
 }
 
 func smInitial(short bool) []smKey {
@@ -465,6 +495,16 @@ func TestStateMachine(t *testing.T) {
 			break
 		}
 		t.Error(m)
+	}
+	reached := false // loader 事件真的生效了：bad 是 2.x 的状态也遇到了 staged.json
+	for k := range visited {
+		if strings.HasPrefix(k.Bad, "2.") && k.Staged != "" {
+			reached = true
+			break
+		}
+	}
+	if !reached {
+		t.Error("没走到 bad=2.x 又来 staged.json 的状态")
 	}
 	t.Logf("初始 %d 个状态，可达共 %d 个，%d 层收敛", initial, len(visited), depth)
 }
