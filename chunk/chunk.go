@@ -50,6 +50,30 @@ func SafePath(p string) bool {
 	return true
 }
 
+// WindowsSafe 判断相对路径（已过 SafePath）在 Windows 上能不能原样落盘（设计书 20.5）：
+// 不许保留设备名（CON、NUL、COM1、LPT9…，带扩展名也算，不分大小写），段尾不许是点或空格
+// （Win32 会悄悄去掉，"x.py." 落盘成 x.py）。
+func WindowsSafe(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if strings.HasSuffix(seg, ".") || strings.HasSuffix(seg, " ") {
+			return false
+		}
+		base, _, _ := strings.Cut(seg, ".")
+		if winReserved[strings.ToLower(strings.TrimRight(base, " "))] {
+			return false
+		}
+	}
+	return true
+}
+
+var winReserved = func() map[string]bool {
+	m := map[string]bool{"con": true, "prn": true, "aux": true, "nul": true, "conin$": true, "conout$": true}
+	for _, d := range []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "¹", "²", "³"} {
+		m["com"+d], m["lpt"+d] = true, true
+	}
+	return m
+}()
+
 // validID 判断清单 ID 能不能当文件名用（<id>.json）。
 func validID(id string) bool {
 	return id != "" && !strings.Contains(id, "/") && SafePath(id)

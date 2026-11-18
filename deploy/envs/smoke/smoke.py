@@ -1,4 +1,4 @@
-"""环境层真机冒烟。用执行器的方式跑: <层目录>\\python.exe -E -B smoke.py。全部通过退出 0，否则退出 1。"""
+"""环境层真机冒烟。用执行器的方式跑: <层目录>\\python.exe -E -s -B smoke.py。全部通过退出 0，否则退出 1。"""
 import json
 import sys
 import time

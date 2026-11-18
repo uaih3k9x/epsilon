@@ -25,16 +25,25 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"epsilon/chunk"
+	"epsilon/envlayer"
 	"epsilon/winproc"
 )
 
 // Runner 是 output/ 下的平台保留目录（运行摘要、日志副本）。
 const Runner = "_runner"
 
+// codeMaxBytes 是代码包解压后的总大小上限（设计书 20.4 第 4 条，防压缩炸弹）。测试里改小。
+var codeMaxBytes int64 = 256 << 20
+
+// maxPath 是 Windows 不开长路径时的上限（MAX_PATH 260，含结尾的 NUL），按 UTF-16 计。
+const maxPath = 259
+
 // Prepare 从头展开任务目录：旧的整个删掉（重跑从头来），解压代码包，写 params.json。
-// 代码包先整个查一遍再写：路径穿越、链接、大小写冲突都拒。
+// 代码包先整个查一遍再写（设计书 20.4、20.5）：路径穿越、链接、大小写冲突、Windows 保留名、
+// 段尾点和空格、路径总长、解压后总大小，有一条不过就整包拒。
 func Prepare(dir, codeZip string, params []byte) error {
 	zr, err := zip.OpenReader(codeZip)
 	if err != nil {
@@ -43,6 +52,12 @@ func Prepare(dir, codeZip string, params []byte) error {
 	defer zr.Close()
 	if err := checkZip(zr.File); err != nil {
 		return err
+	}
+	for _, f := range zr.File {
+		p := filepath.Join(dir, "code", filepath.FromSlash(strings.TrimSuffix(f.Name, "/")))
+		if len(utf16.Encode([]rune(p))) > maxPath {
+			return fmt.Errorf("代码包里的路径展开后超过 %d 字符: %q", maxPath, f.Name)
+		}
 	}
 	if err := os.RemoveAll(dir); err != nil {
 		return err
@@ -69,10 +84,15 @@ func Prepare(dir, codeZip string, params []byte) error {
 
 func checkZip(files []*zip.File) error {
 	seen := map[string]bool{}
+	var total uint64
 	for _, f := range files {
 		name := strings.TrimSuffix(f.Name, "/")
-		if !chunk.SafePath(name) {
+		if !chunk.SafePath(name) || !chunk.WindowsSafe(name) {
 			return fmt.Errorf("代码包里的路径不合法: %q", f.Name)
+		}
+		// 声明的大小由 archive/zip 在读的时候核对（多读一个字节就报错），所以加起来就是实际要写的
+		if total += f.UncompressedSize64; total > uint64(codeMaxBytes) {
+			return fmt.Errorf("代码包解压后超过 %d MB", codeMaxBytes>>20)
 		}
 		if f.Mode()&os.ModeType != 0 && !f.Mode().IsDir() {
 			return fmt.Errorf("代码包里不许有链接或特殊文件: %q", f.Name)
@@ -103,7 +123,8 @@ func writeEntry(f *zip.File, path string) error {
 	return err
 }
 
-// Spec 是一次运行。Entry 是 job.json 的 entry（已经过 jobsign 校验）：entry[0] 换成环境层的解释器，前面固定加 -E -B。
+// Spec 是一次运行。Entry 是 job.json 的 entry（已经过 jobsign 校验）：entry[0] 换成环境层的解释器，
+// 前面固定加 envlayer.Flags（-E -s -B）。
 type Spec struct {
 	Dir        string
 	Interp     string
@@ -135,7 +156,7 @@ func Run(ctx context.Context, s Spec) (Result, error) {
 		return Result{}, err
 	}
 	defer logf.Close()
-	args := append([]string{"-E", "-B"}, s.Entry[1:]...)
+	args := append(append([]string{}, envlayer.Flags...), s.Entry[1:]...)
 	fmt.Fprintf(logf, "===== %s 启动 %s %q\n", time.Now().Format("2006-01-02 15:04:05"), s.Interp, args)
 	cmd := exec.Command(s.Interp, args...)
 	cmd.Dir = filepath.Join(s.Dir, "code")

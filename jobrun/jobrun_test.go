@@ -16,7 +16,7 @@ import (
 	"epsilon/winproc"
 )
 
-// 测试二进制冒充解释器：参数是 -E -B <脚本> ...，脚本内容就是要干什么。
+// 测试二进制冒充解释器：参数是 -E -s -B <脚本> ...，脚本内容就是要干什么。
 func TestMain(m *testing.M) {
 	if os.Getenv("JOBRUN_FAKE_PY") == "1" {
 		os.Exit(fakePython(os.Args[1:]))
@@ -25,10 +25,11 @@ func TestMain(m *testing.M) {
 }
 
 func fakePython(args []string) int {
-	if len(args) < 3 || args[0] != "-E" || args[1] != "-B" {
+	if len(args) < 4 || args[0] != "-E" || args[1] != "-s" || args[2] != "-B" {
 		fmt.Fprintln(os.Stderr, "参数不对:", args)
 		return 90
 	}
+	args = args[1:] // 下面按 [-B, 脚本, 参数...] 用
 	b, err := os.ReadFile(args[2])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -45,7 +46,7 @@ func fakePython(args []string) int {
 		n, _ := strconv.Atoi(cmd[1])
 		return n
 	case "tree": // 起一个孙进程，把 pid 写下来，然后都睡着
-		c := exec.Command(os.Args[0], "-E", "-B", "sleep.py")
+		c := exec.Command(os.Args[0], "-E", "-s", "-B", "sleep.py")
 		c.Env = os.Environ()
 		os.WriteFile("sleep.py", []byte("sleep"), 0o644)
 		if err := c.Start(); err != nil {
@@ -55,6 +56,9 @@ func fakePython(args []string) int {
 		time.Sleep(time.Hour)
 	case "sleep":
 		time.Sleep(time.Hour)
+	case "args": // 把解释器收到的参数写下来
+		os.WriteFile("../output/args", []byte(strings.Join(os.Args[1:], " ")), 0o644)
+		return 0
 	case "fill": // 往 tmp 里写 2 MB
 		os.WriteFile("../tmp/big", make([]byte, 2<<20), 0o644)
 		time.Sleep(time.Hour)
@@ -149,6 +153,58 @@ func TestRunOK(t *testing.T) {
 	log, _ := os.ReadFile(filepath.Join(dir, "job.log"))
 	if !strings.Contains(string(log), "hello from job --flag") {
 		t.Fatalf("job.log 里没有输出: %q", log)
+	}
+}
+
+func TestRunDisablesUserSite(t *testing.T) {
+	// -E 不关用户 site-packages：%APPDATA%\Python\...\site-packages 里的 .pth 每次启动都会执行，
+	// 一个任务埋下的东西会跑进以后每个任务。必须带 -s。
+	dir := prepared(t, "args")
+	if _, err := Run(context.Background(), spec(dir)); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "output", "args"))
+	if !strings.HasPrefix(string(b), "-E -s -B main.py") {
+		t.Fatalf("解释器参数要以 -E -s -B 开头: %q", b)
+	}
+}
+
+func TestPrepareRejectsWindowsNames(t *testing.T) {
+	bad := []string{"nul", "CON.py", "lib/aux.txt", "Com1.log", "lpt9", "conin$", "helper.py.", "lib./x.py", "a /b.py", "x.py "}
+	for _, name := range bad {
+		dir := filepath.Join(t.TempDir(), "j")
+		if err := Prepare(dir, makeZip(t, map[string]string{"main.py": "ok", name: "x"}), []byte(`{}`)); err == nil {
+			t.Errorf("%q: Windows 上落不了盘或会变名，应该拒", name)
+		}
+	}
+	good := []string{"console.py", "nul_utils.py", "com10.py", "auxiliary/x.py", "con1x.txt", ".hidden"}
+	for _, name := range good {
+		dir := filepath.Join(t.TempDir(), "j")
+		if err := Prepare(dir, makeZip(t, map[string]string{"main.py": "ok", name: "x"}), []byte(`{}`)); err != nil {
+			t.Errorf("%q 应该能用: %v", name, err)
+		}
+	}
+}
+
+func TestPrepareRejectsLongPath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "j")
+	long := strings.Repeat("a", 100) + "/" + strings.Repeat("b", 100) + "/" + strings.Repeat("c", 100) + ".py"
+	if err := Prepare(dir, makeZip(t, map[string]string{"main.py": "ok", long: "x"}), []byte(`{}`)); err == nil {
+		t.Fatal("路径总长超过 260 应该拒")
+	}
+}
+
+func TestPrepareRejectsOversizeZip(t *testing.T) {
+	old := codeMaxBytes
+	codeMaxBytes = 100
+	defer func() { codeMaxBytes = old }()
+	dir := filepath.Join(t.TempDir(), "j")
+	err := Prepare(dir, makeZip(t, map[string]string{"main.py": "ok", "big.bin": strings.Repeat("x", 200)}), []byte(`{}`))
+	if err == nil {
+		t.Fatal("解压后超过上限应该在解压前拒")
+	}
+	if _, serr := os.Stat(filepath.Join(dir, "code")); serr == nil {
+		t.Fatal("超限要在动手之前拒，不能先解一半")
 	}
 }
 
