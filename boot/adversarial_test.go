@@ -294,6 +294,25 @@ func TestKnownIssueF1ExeNotRequiredInManifest(t *testing.T) {
 	}
 }
 
+// 记录现状（F1，救援槽 R）：救援走同一个 VerifySlot，R 的清单漏了本体时，R 里随便放的 exe 也会被运行。
+// F1 的改法（VerifySlot 要求清单里有 epsilon-probe.exe）对 R 一起生效。
+func TestKnownIssueF1RescueSlot(t *testing.T) {
+	b, priv, r := newBoot(t)
+	r.behave = func(slot, confirm string, p *fakeProc) { p.Kill() }
+	m := Manifest{Version: "0.0.1", MinBoot: 1, Files: []File{fileEntry("workloads.json", "{}")}}
+	_, raw := signedRaw(t, m, priv)
+	putRelease(t, b, RescueSlot, raw, map[string]string{"workloads.json": "{}", "epsilon-probe.exe": "任意未签名的程序"})
+	setState(t, b, State{})
+	why := b.rescueWhy()
+	if why == "" {
+		t.Fatal("没东西可跑却不救援")
+	}
+	b.rescue(nil, why)
+	if r.count(RescueSlot) != 1 {
+		t.Fatalf("现状变了（R 的清单缺本体时不运行）；更新 docs/boot.md 和这条用例。事件 %+v", events(t, b))
+	}
+}
+
 // 记录现状（F2）：bad 只记一个版本。两个坏版本交替下发时，每次都重新试满 MaxTries 次，来回空转。
 func TestKnownIssueF2BadRemembersOneVersion(t *testing.T) {
 	b, priv, _ := newBoot(t)
