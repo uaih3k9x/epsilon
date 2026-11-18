@@ -49,6 +49,9 @@ func addSeed(f *testing.F, args ...any) {
 // fuzzPriv 是固定的测试私钥：种子语料里的签名要跨进程、跨次运行都有效。
 var fuzzPriv = ed25519.NewKeyFromSeed(bytes.Repeat([]byte{7}, ed25519.SeedSize))
 
+// FixedKeyPublic 只在测试里导出，给 testkey_test.go（boot_test 包，能 import loader）核对它不在正式公钥里。
+func FixedKeyPublic() ed25519.PublicKey { return fuzzPriv.Public().(ed25519.PublicKey) }
+
 func fuzzKeys() []ed25519.PublicKey {
 	return []ed25519.PublicKey{fuzzPriv.Public().(ed25519.PublicKey)}
 }
