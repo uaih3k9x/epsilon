@@ -99,6 +99,9 @@ def _winsec():
     adv.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
     adv.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
     adv.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+    adv.LookupPrivilegeNameW.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    adv.AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                                          ctypes.c_void_p]
     return ctypes, wintypes, k32, adv
 
 
@@ -139,12 +142,72 @@ def lower_integrity():
     if rid > 0x1000:
         raise RuntimeError("完整性级别没降下来: 0x%x" % rid)
     return rid
+
+
+KEEP_PRIVILEGE = "SeChangeNotifyPrivilege"  # 绕过遍历检查：没有它连自己的任务目录都走不进去
+
+
+def drop_privileges():
+    """删掉自己令牌里除 SeChangeNotifyPrivilege 以外的特权（SE_PRIVILEGE_REMOVED，删了就回不来，子进程继承）。
+    工作站上 Users 有 SeShutdownPrivilege：不删的话任务能用 InitiateShutdownW 重启教室机。返回剩下的特权名。"""
+    ctypes, wintypes, k32, adv = _winsec()
+
+    class Luid(ctypes.Structure):
+        _fields_ = [("Low", wintypes.DWORD), ("High", wintypes.LONG)]
+
+    class LuidAndAttributes(ctypes.Structure):
+        _fields_ = [("Luid", Luid), ("Attributes", wintypes.DWORD)]
+
+    token = wintypes.HANDLE()
+    if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0x0008 | 0x0020, ctypes.byref(token)):  # QUERY | ADJUST_PRIVILEGES
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    def privileges():
+        need = wintypes.DWORD()
+        adv.GetTokenInformation(token, 3, None, 0, ctypes.byref(need))  # TokenPrivileges
+        buf = ctypes.create_string_buffer(max(need.value, 4))
+        if not adv.GetTokenInformation(token, 3, buf, len(buf), ctypes.byref(need)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        n = wintypes.DWORD.from_buffer(buf).value
+        out = []
+        for la in (LuidAndAttributes * n).from_buffer(buf, ctypes.sizeof(wintypes.DWORD)):
+            name = ctypes.create_unicode_buffer(64)
+            size = wintypes.DWORD(len(name))
+            if not adv.LookupPrivilegeNameW(None, ctypes.byref(la.Luid), name, ctypes.byref(size)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            out.append((name.value, Luid(la.Luid.Low, la.Luid.High)))
+        return out
+
+    try:
+        drop = [luid for name, luid in privileges() if name != KEEP_PRIVILEGE]
+        if drop:
+            class TokenPrivileges(ctypes.Structure):
+                _fields_ = [("Count", wintypes.DWORD), ("Privileges", LuidAndAttributes * len(drop))]
+
+            tp = TokenPrivileges(len(drop))
+            for i, luid in enumerate(drop):
+                tp.Privileges[i] = LuidAndAttributes(luid, 0x4)  # SE_PRIVILEGE_REMOVED
+            ctypes.set_last_error(0)
+            if not adv.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None) or ctypes.get_last_error():
+                raise ctypes.WinError(ctypes.get_last_error() or 1300)  # ERROR_NOT_ALL_ASSIGNED
+        left = sorted(name for name, _ in privileges())
+    finally:
+        k32.CloseHandle(token)
+    if [n for n in left if n != KEEP_PRIVILEGE]:
+        raise RuntimeError("特权没删干净: %s" % left)
+    return left
 # ---- winsec end ----
 
 
 @check("integrity_low")
 def _():
     return lower_integrity() <= 0x1000
+
+
+@check("privileges_dropped")
+def _():
+    left = drop_privileges()  # 和 sitecustomize 一样删；令牌里只许剩 SeChangeNotifyPrivilege
+    return left == [KEEP_PRIVILEGE], ",".join(left)
 
 
 @check("desktop")
@@ -172,6 +235,49 @@ def _():
 
 check("read_probe_json")(lambda: denied(lambda: open(CFG["probe_json"], "rb").close()))
 check("read_secrets")(lambda: denied(lambda: os.listdir(CFG["secrets_dir"])))
+# D: 不被还原，根上默认 Users 可读：学生、老师的文件和别的软件的配置都在那里
+check("read_data_disk")(lambda: denied(lambda: os.listdir(CFG["data_root"])))
+
+
+@check("exec_artifact_root")
+def _():
+    # D:\epsilon 下的 exe（探针、引导器、llama-server）任务账户不能执行，也不能按映像映射进来读
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                wintypes.DWORD, wintypes.HANDLE]
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    h = k32.CreateFileW(CFG["boot_exe"], 0x20, 0x1, None, 3, 0, None)  # FILE_EXECUTE, FILE_SHARE_READ, OPEN_EXISTING
+    if h and h != wintypes.HANDLE(-1).value:
+        k32.CloseHandle(h)
+        return False, "能以 FILE_EXECUTE 打开 " + CFG["boot_exe"]
+    err = ctypes.get_last_error()
+    return err == 5, "错误 %d" % err
+
+
+@check("hardlink_probe_json")
+def _():
+    # 硬链接共用一个文件对象：回传时探针会以自己的身份读出 probe.json，收回权限时会改它的 DACL
+    dst = job("output", "canary-link")
+    try:
+        os.link(CFG["probe_json"], dst)
+    except PermissionError:
+        return True, ""
+    except OSError as e:
+        return getattr(e, "winerror", None) == 5, "%s: %s" % (type(e).__name__, e)
+    os.remove(dst)
+    return False, "建出来了"
+
+
+@check("chdir_tmp")
+def _():
+    # 目录上要有 FILE_TRAVERSE：SetCurrentDirectory 打开的是目标目录本身，SeChangeNotify 只免中间各级
+    cwd = os.getcwd()
+    os.chdir(job("tmp"))
+    os.chdir(cwd)
+    return True
 check("write_code")(lambda: denied(lambda: create(job("code", "canary.txt"))))
 check("write_params")(lambda: denied(lambda: open(job("params.json"), "ab").close()))
 check("delete_params")(lambda: denied(lambda: os.remove(job("params.json"))))

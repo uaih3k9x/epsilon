@@ -55,8 +55,8 @@ const Desktop = `epsilon-job\Default`
 
 // SysChecks 是系统控制检查（python -I -S，不加载钩子）每一项都必须 ok 的单子；和 py/canary_sys.py 一一对应。
 var SysChecks = []string{
-	"integrity_low", "desktop",
-	"read_probe_json", "read_secrets",
+	"integrity_low", "privileges_dropped", "desktop",
+	"read_probe_json", "read_secrets", "read_data_disk", "exec_artifact_root", "hardlink_probe_json", "chdir_tmp",
 	"write_code", "write_params", "delete_params", "write_job_root", "write_sitecustomize", "write_env",
 	"write_tmp", "write_output",
 	"exec_tmp", "load_tmp_dll", "set_dacl_own_file",
@@ -68,7 +68,8 @@ var SysChecks = []string{
 // 另外探针自己从审计管道核对：主进程的就绪记录、sitecustomize 在环境层里、multiprocessing 子进程也发了就绪。
 var HookChecks = []string{
 	"hook_installed", "subprocess_blocked", "spawn_flags_blocked", "connect_blocked", "dns_blocked",
-	"unc_blocked", "env_tamper_blocked", "tmp_py_blocked", "dlopen_tmp_blocked", "mp_child",
+	"unc_blocked", "unc_paths_blocked", "env_tamper_blocked", "tmp_py_blocked", "rename_py_blocked", "dlopen_tmp_blocked",
+	"loopback_blocked", "socketpair_ok", "mp_child",
 }
 
 // CanaryLine 是金丝雀输出的一行。
@@ -128,6 +129,14 @@ type CanaryConfig struct {
 	SystemRoot     string
 }
 
+// volumeRoot 是 artifact_root 所在卷的根（D:\）：任务账户在那里必须什么都列不出来。
+func volumeRoot(p string) string {
+	if len(p) >= 2 && p[1] == ':' {
+		return p[:2] + `\`
+	}
+	return ""
+}
+
 func (c CanaryConfig) args() (string, error) {
 	host, port, err := net.SplitHostPort(c.Controller)
 	if err != nil {
@@ -140,6 +149,7 @@ func (c CanaryConfig) args() (string, error) {
 	b, err := json.Marshal(map[string]any{
 		"job_dir": c.JobDir, "env_dir": c.EnvDir,
 		"probe_json": winJoin(c.Root, "probe.json"), "secrets_dir": winJoin(c.Root, "secrets"),
+		"data_root": volumeRoot(c.Root), "boot_exe": winJoin(c.Root, "epsilon-boot.exe"),
 		"ctl_host": host, "ctl_port": p, "system_root": c.SystemRoot, "desktop": Desktop,
 	})
 	return string(b), err

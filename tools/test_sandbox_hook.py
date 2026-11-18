@@ -48,6 +48,10 @@ def test_process_creation_blocked(ctx, event):
     assert act(ctx, event, "cmd.exe") == "block"
 
 
+def test_spawn_must_not_set_cwd(ctx):
+    assert act(ctx, "_winapi.CreateProcess", EXE, spawn_cmd(), JOB + "\\tmp") == "block"
+
+
 def test_multiprocessing_spawn_shape_allowed(ctx):
     assert act(ctx, "_winapi.CreateProcess", EXE, spawn_cmd(), None) is None
     # 大小写和 / 不影响
@@ -77,13 +81,35 @@ def test_create_process_other_application_blocked(ctx):
 
 
 @pytest.mark.parametrize("event", sorted(sc.NET_EVENTS))
-def test_socket_only_loopback(ctx, event):
+def test_socket_never_leaves_loopback(ctx, event):
     s = object()
-    assert act(ctx, event, s, ("127.0.0.1", 5000)) is None
-    assert act(ctx, event, s, ("::1", 5000, 0, 0)) is None
-    assert act(ctx, event, s, ("localhost", 5000)) is None
     for addr in [("10.0.0.1", 8090), ("0.0.0.0", 47100), ("", 0), ("example.com", 443), "/tmp/sock", None]:
         assert act(ctx, event, s, addr) == "block", addr
+
+
+def test_bind_loopback_allowed(ctx):
+    for addr in [("127.0.0.1", 0), ("::1", 0, 0, 0), ("localhost", 5000)]:
+        assert act(ctx, "socket.bind", object(), addr) is None
+
+
+@pytest.mark.parametrize("event", ["socket.connect", "socket.sendto", "socket.sendmsg"])
+def test_loopback_only_to_own_ports(ctx, event):
+    # 回环不过防火墙：本机 epsilon-boot、p2p、推理、rpc、管理软件都在 127.0.0.1 上听。只许连本进程自己 bind 的端口
+    import socket
+    lsock = socket.socket()
+    try:
+        lsock.bind(("127.0.0.1", 0))
+        assert act(ctx, "socket.bind", lsock, ("127.0.0.1", 0)) is None
+        port = lsock.getsockname()[1]
+        other = object()
+        assert act(ctx, event, other, ("127.0.0.1", port)) is None   # socketpair、asyncio 的自连
+        assert act(ctx, event, other, ("localhost", port)) is None
+        for p in (port + 1, 47199, 8080, 50052):
+            assert act(ctx, event, other, ("127.0.0.1", p)) == "block", p
+            assert act(ctx, event, other, ("::1", p, 0, 0)) == "block", p
+    finally:
+        lsock.close()
+    assert act(ctx, event, object(), ("127.0.0.1", port)) == "block"  # 关了就不算自己的了
 
 
 def test_dns_only_localhost(ctx):
@@ -103,6 +129,36 @@ def test_dns_only_localhost(ctx):
 def test_unc_and_device_paths_blocked(ctx, path):
     for ev in ("open", "os.listdir", "os.scandir"):
         assert act(ctx, ev, path, "r", 0) == "block", (ev, path)
+
+
+@pytest.mark.parametrize("event", sorted(sc.PATH_ARGS))
+def test_unc_blocked_on_every_path_event(ctx, event):
+    # os.mkdir、rename、chdir……也会让内核以 System 身份发 SMB（带任务账户的 NTLM）：防火墙按 SID 管不到
+    for i in sc.PATH_ARGS[event]:
+        args = [JOB + "\\tmp\\a", JOB + "\\tmp\\b", 0, 0]
+        args[i] = "\\\\x.attacker.example\\s\\f"
+        assert act(ctx, event, *args) == "block", (event, i)
+    assert act(ctx, event, JOB + "\\tmp\\a", JOB + "\\tmp\\b", 0, 0) is None or event == "os.mkdir"
+
+
+def test_path_events_cover_cpython_ones():
+    for ev in ["os.mkdir", "os.rename", "os.remove", "os.rmdir", "os.chdir", "os.chmod", "os.utime", "os.link",
+               "os.symlink", "os.truncate", "os.add_dll_directory", "shutil.copyfile", "shutil.copytree",
+               "shutil.move", "shutil.rmtree", "shutil.unpack_archive", "tempfile.mkdtemp", "tempfile.mkstemp", "glob.glob"]:
+        assert ev in sc.PATH_ARGS, ev
+
+
+@pytest.mark.parametrize("event", ["os.rename", "os.link", "os.symlink", "shutil.copyfile", "shutil.move"])
+def test_cannot_make_code_files_by_rename_or_copy(ctx, event):
+    assert act(ctx, event, JOB + "\\tmp\\x.txt", JOB + "\\tmp\\x.py", None, None) == "block"
+    assert act(ctx, event, JOB + "\\tmp\\x.txt", JOB + "\\output\\evil.pth", None, None) == "block"
+    assert act(ctx, event, JOB + "\\tmp\\x.txt", JOB + "\\output\\y.txt", None, None) is None
+
+
+def test_private_mkdir_counted(ctx):
+    # Python 3.12.4+ 的 mkdir(mode=0o700) 建受保护 DACL 的目录，所有者完全控制：收回权限会失败，至少留痕
+    assert sc.decide("os.mkdir", (JOB + "\\tmp\\d", 0o700, None), ctx) == ("count", "os.mkdir.0o700")
+    assert act(ctx, "os.mkdir", JOB + "\\tmp\\d", 0o777, None) is None
 
 
 def test_pipes_and_long_paths_allowed(ctx):
@@ -214,12 +270,19 @@ def test_reentrant_events_ignored(ctx):
     assert len(calls) == 1
 
 
+def test_ready_record_carries_job_dir():
+    # 子进程的任务目录从环境变量来，_winapi.CreateProcess 的审计参数不含环境：探针核对就绪记录里的 job_dir
+    r = json.loads(sc.ready_record(JOB, 0x1000, now=lambda: 1.0, pid=lambda: 7, ppid=lambda: 1))
+    assert r["ev"] == "ready" and r["job_dir"] == JOB and r["il"] == "low" and r["pid"] == 7 and r["ppid"] == 1
+
+
 def test_unc_helper():
     assert sc.unc_or_device("\\\\host\\x") and not sc.unc_or_device("C:\\x") and not sc.unc_or_device("\\x")
 
 
 E2E = r'''
 import importlib.util, json, os, socket, subprocess, sys
+import encodings.idna  # getaddrinfo 懒加载它；这里的 sys.path 不在"环境层"里，装钩子以后导入会被拦
 spec = importlib.util.spec_from_file_location("eps_sc", sys.argv[1])
 sc = importlib.util.module_from_spec(spec); spec.loader.exec_module(sc)
 out = []
@@ -239,6 +302,12 @@ probe("connect", lambda: socket.create_connection(("192.0.2.1", 9), timeout=1))
 probe("dns", lambda: socket.getaddrinfo("example.invalid", 80))
 probe("env", lambda: os.environ.__setitem__("EPSILON_JOB_DIR", "x"))
 probe("socketpair", lambda: socket.socketpair())
+def own():
+    l = socket.socket(); l.bind(("127.0.0.1", 0)); l.listen(1)
+    c = socket.create_connection(l.getsockname()[:2], timeout=5); c.close(); l.close()
+probe("own_listener", own)
+probe("loopback_other", lambda: socket.create_connection(("127.0.0.1", 9), timeout=1))
+probe("unc_mkdir", lambda: os.mkdir("\\\\x.example\\s\\d"))
 print(json.dumps({"res": res, "env": os.environ.get("EPSILON_JOB_DIR"), "n": len(out)}))
 '''
 
@@ -252,4 +321,5 @@ def test_end_to_end_in_real_interpreter():
     assert r["subprocess"] == "blocked" and r["os.system"] == "blocked"
     assert r["connect"] == "blocked" and r["dns"] == "blocked" and r["env"] == "blocked"
     assert r["socketpair"] == "ran"  # 回环要放行：Windows 上 socketpair 和 asyncio 都靠它
+    assert r["own_listener"] == "ran" and r["loopback_other"] == "blocked" and r["unc_mkdir"] == "blocked"
     assert got["env"] == "orig" and got["n"] >= 5

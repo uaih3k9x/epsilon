@@ -150,10 +150,10 @@ func (f *plat) Start(l jobrun.Launch) (jobrun.Proc, error) {
 		go func() {
 			if f.hookReady {
 				w := a.dial()
-				fmt.Fprintf(w, `{"t":1,"ev":"ready","pid":110,"ppid":1,"il":"low","file":%q,"layer":"x"}`+"\n", f.hookFile)
+				fmt.Fprintf(w, `{"t":1,"ev":"ready","pid":110,"ppid":1,"il":"low","job_dir":%q,"file":%q,"layer":"x"}`+"\n", jobDirOf(l), f.hookFile)
 				if f.hookChild {
 					c := a.dial()
-					fmt.Fprintln(c, `{"t":1,"ev":"ready","pid":111,"ppid":110,"il":"low","file":"x","layer":"x"}`)
+					fmt.Fprintf(c, `{"t":1,"ev":"ready","pid":111,"ppid":110,"il":"low","job_dir":%q,"file":"x","layer":"x"}`+"\n", jobDirOf(l))
 					c.Close()
 				}
 				w.Close()
@@ -174,10 +174,13 @@ func (f *plat) Start(l jobrun.Launch) (jobrun.Proc, error) {
 	return p, nil
 }
 
+// jobDirOf 是 sitecustomize 会报的 job_dir（进程拿到的 EPSILON_JOB_DIR）。
+func jobDirOf(l jobrun.Launch) string { return envMap(l.Env)["EPSILON_JOB_DIR"] }
+
 func readyJob(code int) func(jobrun.Launch, *fakeAudit, *fakeProc) {
 	return func(l jobrun.Launch, a *fakeAudit, p *fakeProc) {
 		w := a.dial()
-		fmt.Fprintln(w, `{"t":1,"ev":"ready","pid":200,"ppid":1,"il":"low","file":"x","layer":"x"}`)
+		fmt.Fprintf(w, `{"t":1,"ev":"ready","pid":200,"ppid":1,"il":"low","job_dir":%q,"file":"x","layer":"x"}`+"\n", jobDirOf(l))
 		fmt.Fprintln(w, `{"t":2,"pid":200,"ev":"socket.connect","act":"block","args":"x"}`)
 		time.Sleep(20 * time.Millisecond)
 		w.Close()
@@ -407,7 +410,7 @@ func TestJobAuditDisconnectIsFailedNotRejected(t *testing.T) {
 	r := newRig(t, func(p *plat) {
 		p.job = func(l jobrun.Launch, a *fakeAudit, p *fakeProc) {
 			w := a.dial()
-			fmt.Fprintln(w, `{"t":1,"ev":"ready","pid":200,"ppid":1,"il":"low","file":"x","layer":"x"}`)
+			fmt.Fprintf(w, `{"t":1,"ev":"ready","pid":200,"ppid":1,"il":"low","job_dir":%q,"file":"x","layer":"x"}`+"\n", jobDirOf(l))
 			w.Close() // 任务把审计管道关了，自己接着跑
 			<-p.done
 		}

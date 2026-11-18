@@ -118,12 +118,34 @@ func TestCanaryConfigJSON(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"probe_json":"D:\\epsilon\\probe.json"`, `"secrets_dir":"D:\\epsilon\\secrets"`, `"ctl_host":"ctl.example"`, `"ctl_port":8090`, `"desktop":"epsilon-job\\Default"`} {
+	for _, want := range []string{`"data_root":"D:\\"`, `"boot_exe":"D:\\epsilon\\epsilon-boot.exe"`, `"probe_json":"D:\\epsilon\\probe.json"`, `"secrets_dir":"D:\\epsilon\\secrets"`, `"ctl_host":"ctl.example"`, `"ctl_port":8090`, `"desktop":"epsilon-job\\Default"`} {
 		if !strings.Contains(m, want) {
 			t.Fatalf("缺 %s: %s", want, m)
 		}
 	}
 	if _, err := (CanaryConfig{Controller: "nohost"}).args(); err == nil {
 		t.Fatal("主控地址要有端口")
+	}
+}
+
+// 审查补的几项：每一项都在单子里（单子和脚本一一对应由 TestCanaryScriptsReportEveryCheck 核对）
+func TestCanaryListsCoverReviewedControls(t *testing.T) {
+	has := func(list []string, n string) bool {
+		for _, x := range list {
+			if x == n {
+				return true
+			}
+		}
+		return false
+	}
+	for _, n := range []string{"privileges_dropped", "read_data_disk", "hardlink_probe_json", "chdir_tmp", "exec_artifact_root"} {
+		if !has(SysChecks, n) {
+			t.Fatalf("系统控制单子缺 %s", n)
+		}
+	}
+	for _, n := range []string{"unc_paths_blocked", "rename_py_blocked", "loopback_blocked", "socketpair_ok"} {
+		if !has(HookChecks, n) {
+			t.Fatalf("钩子单子缺 %s", n)
+		}
 	}
 }

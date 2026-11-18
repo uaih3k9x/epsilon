@@ -349,7 +349,7 @@ func (b *Box) hookCanary(ctx context.Context, j Job, env []string, cf canaryPath
 	if err != nil {
 		return nil, rejectf("建审计管道: %v", err)
 	}
-	w := newWatcher(log, b.readyTimeout(), b.grace())
+	w := newWatcher(log, b.readyTimeout(), b.grace(), j.Dir)
 	stop := serveAudit(srv, w)
 	main := 0
 	args := append(append([]string{}, envlayer.Flags...), "-c", canaryBoot, cf.hook, cf.cfg)
@@ -373,10 +373,17 @@ func (b *Box) hookCanary(ctx context.Context, j Job, env []string, cf canaryPath
 	return append(out, extra.String()...), nil
 }
 
+// winNorm 是 Windows 规则的比较形式：不分大小写，/ 和 \ 一样，去掉结尾的分隔符。
+func winNorm(s string) string {
+	return strings.TrimRight(strings.ToLower(strings.ReplaceAll(s, "/", `\`)), `\`)
+}
+
+// sameDir 按 Windows 规则判断两个目录是不是同一个（空的不算）。
+func sameDir(a, b string) bool { return a != "" && winNorm(a) == winNorm(b) }
+
 // within 按 Windows 规则判断 p 在不在 dir 下（不分大小写，/ 和 \ 一样）。
 func within(p, dir string) bool {
-	n := func(s string) string { return strings.TrimRight(strings.ToLower(strings.ReplaceAll(s, "/", `\`)), `\`) }
-	p, dir = n(p), n(dir)
+	p, dir = winNorm(p), winNorm(dir)
 	return dir != "" && strings.HasPrefix(p, dir+`\`)
 }
 
@@ -386,7 +393,7 @@ func (b *Box) runJob(ctx context.Context, j Job, env []string) (Result, error) {
 	if err != nil {
 		return Result{}, rejectf("建审计管道: %v", err)
 	}
-	w := newWatcher(log, b.readyTimeout(), b.grace())
+	w := newWatcher(log, b.readyTimeout(), b.grace(), j.Dir)
 	stop := serveAudit(srv, w)
 	main := 0
 	r, err := jobrun.Run(ctx, jobrun.Spec{Dir: j.Dir, Interp: j.Interp, Entry: j.Entry, Timeout: j.Timeout, DiskMaxMB: j.DiskMaxMB,

@@ -71,9 +71,41 @@ def _():
 
 check("connect_blocked")(lambda: blocked(lambda: socket.create_connection((CFG["ctl_host"], CFG["ctl_port"]), timeout=5)))
 check("dns_blocked")(lambda: blocked(lambda: socket.getaddrinfo("example.com", 80)))
-check("unc_blocked")(lambda: blocked(lambda: open("\\\\127.0.0.1\\c$\\epsilon-canary.txt", "rb")))
+UNC = "\\\\127.0.0.1\\c$\\epsilon-canary"
+check("unc_blocked")(lambda: blocked(lambda: open(UNC + ".txt", "rb")))
+
+
+@check("unc_paths_blocked")
+def _():
+    # 不止 open：mkdir、rename、chdir 也会发 SMB。os.stat 没有审计事件，拦不住（文档第 8 节）
+    for name, fn in [("mkdir", lambda: os.mkdir(UNC)), ("rename", lambda: os.rename(os.path.join(CFG["job_dir"], "tmp"), UNC)),
+                     ("chdir", lambda: os.chdir(UNC))]:
+        ok, detail = blocked(fn)
+        if not ok:
+            return False, name + ": " + detail
+    return True
 check("env_tamper_blocked")(lambda: blocked(lambda: os.environ.__setitem__("EPSILON_JOB_DIR", "C:\\")))
 check("tmp_py_blocked")(lambda: blocked(lambda: open(os.path.join(CFG["job_dir"], "tmp", "x.py"), "w")))
+
+
+@check("rename_py_blocked")
+def _():
+    src = os.path.join(CFG["job_dir"], "tmp", "x.txt")
+    with open(src, "w") as f:
+        f.write("pass\n")
+    return blocked(lambda: os.rename(src, os.path.join(CFG["job_dir"], "tmp", "x.py")))
+
+
+# 回环不过防火墙：本机别的服务（引导器、推理、rpc、管理软件）都在 127.0.0.1 上听。不是自己 bind 的端口就拦
+check("loopback_blocked")(lambda: blocked(lambda: socket.create_connection(("127.0.0.1", 9), timeout=5)))
+
+
+@check("socketpair_ok")
+def _():
+    a, b = socket.socketpair()  # Windows 上是 bind 回环再自连：asyncio 靠它
+    with a, b:
+        a.sendall(b"x")
+        return b.recv(1) == b"x"
 
 
 @check("dlopen_tmp_blocked")

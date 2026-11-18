@@ -5,7 +5,7 @@
 
 只在任务进程里装：令牌用户是 epsilon-job，或者探针设了 EPSILON_JOB_DIR。人手工跑层里的 python 不受影响。
 装的过程中任何一步出错就 os._exit(97)，因为 site.py 只会打印一句 "Error in sitecustomize" 然后接着跑。
-顺序：连审计管道 -> 降到 Low IL -> addaudithook -> 写就绪记录。之后才轮到用户代码。
+顺序：连审计管道 -> 降到 Low IL -> 删掉特权 -> addaudithook -> 写就绪记录。之后才轮到用户代码。
 
 策略（decide）是纯函数，在 Mac 上用 tools/test_sandbox_hook.py 测；路径一律按 Windows 规则（ntpath）比较。
 """
@@ -18,6 +18,7 @@ import reprlib
 import sys
 import threading
 import time
+import weakref
 
 EXIT_HOOK_FAILED = 97
 PIPE = "\\\\.\\pipe\\epsilon-audit"
@@ -31,7 +32,18 @@ PROC_EVENTS = frozenset({"subprocess.Popen", "os.system", "os.startfile", "os.sp
                          "os.posix_spawn", "webbrowser.open"})
 NET_EVENTS = frozenset({"socket.connect", "socket.sendto", "socket.sendmsg", "socket.bind"})
 DNS_EVENTS = frozenset({"socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr", "socket.getnameinfo"})
-PATH_EVENTS = frozenset({"open", "os.listdir", "os.scandir"})
+# 带路径的事件 → 哪几个参数是路径。都要拦 UNC：mkdir、rename、chdir 也会让内核以 System 身份发 SMB（带任务账户的 NTLM），
+# 防火墙按 SID 管不到。os.stat / os.path.exists 没有审计事件，拦不住（docs/jobs-sandbox.md 第 8 节）。
+PATH_ARGS = {
+    "open": (0,), "os.listdir": (0,), "os.scandir": (0,), "os.mkdir": (0,), "os.rename": (0, 1), "os.remove": (0,),
+    "os.rmdir": (0,), "os.chdir": (0,), "os.chmod": (0,), "os.chown": (0,), "os.utime": (0,), "os.link": (0, 1),
+    "os.symlink": (0, 1), "os.truncate": (0,), "os.add_dll_directory": (0,),
+    "shutil.copyfile": (0, 1), "shutil.copymode": (0, 1), "shutil.copystat": (0, 1), "shutil.copytree": (0, 1),
+    "shutil.move": (0, 1), "shutil.rmtree": (0,), "shutil.unpack_archive": (0, 1), "shutil.make_archive": (0, 2, 3),
+    "tempfile.mkstemp": (0,), "tempfile.mkdtemp": (0,), "glob.glob": (0,), "glob.glob/2": (0, 2),
+}
+# 能凭空造出 .py / .pth 的（目标是第二个参数）：先写 x.txt 再改名绕过 open 的检查
+DEST_EVENTS = frozenset({"os.rename", "os.link", "os.symlink", "shutil.copyfile", "shutil.move"})
 REG_WRITE_EVENTS = frozenset({"winreg.CreateKey", "winreg.DeleteKey", "winreg.DeleteValue", "winreg.SetValue",
                               "winreg.SaveKey", "winreg.LoadKey", "winreg.ConnectRegistry",
                               "winreg.DisableReflectionKey", "winreg.EnableReflectionKey"})
@@ -40,6 +52,7 @@ LOG_EVENTS = frozenset({"sys.addaudithook", "cpython.run_command", "cpython.run_
                         "cpython.run_interactivehook", "cpython.run_startup", "cpython.run_stdin"})
 CODE_SUFFIXES = (".py", ".pyc", ".pyw", ".pth")
 LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
+PRIVATE_MKDIR = 0o700  # Python 3.12.4+ 在 Windows 上给它建受保护 DACL（只有 SY、BA、所有者）
 SPAWN_FLAGS = frozenset({"-B", "-E", "-s"})
 SPAWN_MAIN = re.compile(r"from multiprocessing\.spawn import spawn_main; spawn_main\(parent_pid=\d+, pipe_handle=\d+\)")
 QUOTED_ARGS = re.compile(r'"[^"]*"(?: "[^"]*")*')
@@ -93,6 +106,27 @@ class Ctx:
         self.system32 = norm(ntpath.join(system_root, "System32"))
         self.getcwd = getcwd
         self._cache = {}
+        self._bound = weakref.WeakSet()  # 本进程 bind 在回环上的 socket
+        self._lock = threading.Lock()
+
+    def note_bound(self, sock):
+        try:
+            with self._lock:
+                self._bound.add(sock)
+        except TypeError:
+            pass  # 不能弱引用的（测试里的替身）
+
+    def own_port(self, port):
+        """port 是不是本进程自己 bind 的回环端口（socketpair、asyncio 的自连）。"""
+        with self._lock:
+            socks = list(self._bound)
+        for s in socks:
+            try:
+                if s.fileno() != -1 and s.getsockname()[1] == port:
+                    return True
+            except (OSError, AttributeError, IndexError, TypeError):
+                pass
+        return False
 
     def path(self, p):
         return norm(p, self.getcwd())
@@ -130,9 +164,9 @@ def loopback_lookup(event, args):
 
 
 def spawn_ok(args, ctx):
-    """_winapi.CreateProcess 只放行 multiprocessing spawn 的那一种：本层 python.exe，参数一个字不差。
-    多出 -S、-I 之类就能起一个没有钩子的子进程，所以别的一律拒。"""
-    if len(args) < 2 or not isinstance(args[0], str) or not isinstance(args[1], str):
+    """_winapi.CreateProcess 只放行 multiprocessing spawn 的那一种：本层 python.exe，参数一个字不差，不指定工作目录。
+    多出 -S、-I 之类就能起一个没有钩子的子进程，所以别的一律拒。审计参数不含环境块：子进程的 EPSILON_JOB_DIR 由探针核对就绪记录。"""
+    if len(args) < 3 or not isinstance(args[0], str) or not isinstance(args[1], str) or args[2] is not None:
         return False
     if norm(args[0]) != ctx.executable or not QUOTED_ARGS.fullmatch(args[1]):
         return False
@@ -163,19 +197,32 @@ def decide(event, args, ctx):
         return BLOCK
     if event == "_winapi.CreateProcess":
         return None if spawn_ok(args, ctx) else BLOCK
+    if event == "socket.bind":
+        if len(args) > 1 and loopback_addr(args[1]):
+            ctx.note_bound(args[0])
+            return None
+        return BLOCK
     if event in NET_EVENTS:
-        return None if len(args) > 1 and loopback_addr(args[1]) else BLOCK
+        # 回环不过防火墙（本机 epsilon-boot、p2p、推理、rpc 都在听）：只许连本进程自己 bind 的端口
+        if len(args) > 1 and loopback_addr(args[1]) and len(args[1]) > 1 and ctx.own_port(args[1][1]):
+            return None
+        return BLOCK
     if event in DNS_EVENTS:
         return None if loopback_lookup(event, args) else BLOCK
-    if event in PATH_EVENTS:
-        if not args or not isinstance(args[0], (str, bytes, os.PathLike)):
-            return None  # fd、None（当前目录）
-        if unc_or_device(args[0]):
-            return BLOCK
-        if event == "open":
+    if event in PATH_ARGS:
+        for i in PATH_ARGS[event]:
+            if i < len(args) and isinstance(args[i], (str, bytes, os.PathLike)) and unc_or_device(args[i]):
+                return BLOCK  # fd、None（当前目录）不管
+        if event == "open" and args and isinstance(args[0], (str, bytes, os.PathLike)):
             p = ctx.path(args[0])
             if p.endswith(CODE_SUFFIXES) and not ctx.trusted(p):
                 return BLOCK  # 写 .py 再导入、在别处埋 .pth
+        if event in DEST_EVENTS and len(args) > 1 and isinstance(args[1], (str, bytes, os.PathLike)):
+            p = ctx.path(args[1])
+            if p.endswith(CODE_SUFFIXES) and not ctx.trusted(p):
+                return BLOCK
+        if event == "os.mkdir" and len(args) > 1 and args[1] == PRIVATE_MKDIR:
+            return ("count", "os.mkdir.0o700")
         return None
     if event == "import":
         for entry in (args[2] if len(args) > 2 and args[2] else ()):
@@ -228,6 +275,13 @@ def short_args(event, args):
         return "len=%d" % (len(args[0]) if args and hasattr(args[0], "__len__") else -1)
     s = _repr.repr(args)
     return s.encode("ascii", "backslashreplace").decode("ascii")[:ARGS_MAX]
+
+
+def ready_record(job_dir, rid, now=time.time, pid=os.getpid, ppid=os.getppid):
+    """就绪记录。job_dir 是这个进程拿到的 EPSILON_JOB_DIR：探针核对，和任务目录不一致就当篡改（整树杀）。"""
+    r = {"t": round(now(), 3), "ev": "ready", "pid": pid(), "ppid": ppid(), "il": "low" if rid <= 0x1000 else hex(rid),
+         "job_dir": job_dir, "file": __file__, "layer": sys.prefix}
+    return (json.dumps(r, ensure_ascii=True) + "\n").encode("ascii")
 
 
 def record(event, act, args, n=None, now=time.time, pid=os.getpid):
@@ -286,6 +340,9 @@ def _winsec():
     adv.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
     adv.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
     adv.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+    adv.LookupPrivilegeNameW.argtypes = [wintypes.LPCWSTR, ctypes.c_void_p, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    adv.AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+                                          ctypes.c_void_p]
     return ctypes, wintypes, k32, adv
 
 
@@ -326,6 +383,60 @@ def lower_integrity():
     if rid > 0x1000:
         raise RuntimeError("完整性级别没降下来: 0x%x" % rid)
     return rid
+
+
+KEEP_PRIVILEGE = "SeChangeNotifyPrivilege"  # 绕过遍历检查：没有它连自己的任务目录都走不进去
+
+
+def drop_privileges():
+    """删掉自己令牌里除 SeChangeNotifyPrivilege 以外的特权（SE_PRIVILEGE_REMOVED，删了就回不来，子进程继承）。
+    工作站上 Users 有 SeShutdownPrivilege：不删的话任务能用 InitiateShutdownW 重启教室机。返回剩下的特权名。"""
+    ctypes, wintypes, k32, adv = _winsec()
+
+    class Luid(ctypes.Structure):
+        _fields_ = [("Low", wintypes.DWORD), ("High", wintypes.LONG)]
+
+    class LuidAndAttributes(ctypes.Structure):
+        _fields_ = [("Luid", Luid), ("Attributes", wintypes.DWORD)]
+
+    token = wintypes.HANDLE()
+    if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0x0008 | 0x0020, ctypes.byref(token)):  # QUERY | ADJUST_PRIVILEGES
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    def privileges():
+        need = wintypes.DWORD()
+        adv.GetTokenInformation(token, 3, None, 0, ctypes.byref(need))  # TokenPrivileges
+        buf = ctypes.create_string_buffer(max(need.value, 4))
+        if not adv.GetTokenInformation(token, 3, buf, len(buf), ctypes.byref(need)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        n = wintypes.DWORD.from_buffer(buf).value
+        out = []
+        for la in (LuidAndAttributes * n).from_buffer(buf, ctypes.sizeof(wintypes.DWORD)):
+            name = ctypes.create_unicode_buffer(64)
+            size = wintypes.DWORD(len(name))
+            if not adv.LookupPrivilegeNameW(None, ctypes.byref(la.Luid), name, ctypes.byref(size)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            out.append((name.value, Luid(la.Luid.Low, la.Luid.High)))
+        return out
+
+    try:
+        drop = [luid for name, luid in privileges() if name != KEEP_PRIVILEGE]
+        if drop:
+            class TokenPrivileges(ctypes.Structure):
+                _fields_ = [("Count", wintypes.DWORD), ("Privileges", LuidAndAttributes * len(drop))]
+
+            tp = TokenPrivileges(len(drop))
+            for i, luid in enumerate(drop):
+                tp.Privileges[i] = LuidAndAttributes(luid, 0x4)  # SE_PRIVILEGE_REMOVED
+            ctypes.set_last_error(0)
+            if not adv.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None) or ctypes.get_last_error():
+                raise ctypes.WinError(ctypes.get_last_error() or 1300)  # ERROR_NOT_ALL_ASSIGNED
+        left = sorted(name for name, _ in privileges())
+    finally:
+        k32.CloseHandle(token)
+    if [n for n in left if n != KEEP_PRIVILEGE]:
+        raise RuntimeError("特权没删干净: %s" % left)
+    return left
 # ---- winsec end ----
 
 
@@ -389,14 +500,13 @@ def _install():
     global INSTALLED
     fd = _open_pipe()
     rid = lower_integrity()
-    ctx = Ctx(os.environ["EPSILON_JOB_DIR"], ntpath.dirname(sys.executable), sys.executable,
-              os.environ.get("SystemRoot", "C:\\Windows"))
+    drop_privileges()
+    job_dir = os.environ["EPSILON_JOB_DIR"]
+    ctx = Ctx(job_dir, ntpath.dirname(sys.executable), sys.executable, os.environ.get("SystemRoot", "C:\\Windows"))
     write = _writer(fd)
     sys.addaudithook(make_hook(ctx, write))
     INSTALLED = True
-    ready = {"t": round(time.time(), 3), "ev": "ready", "pid": os.getpid(), "ppid": os.getppid(),
-             "il": "low" if rid <= 0x1000 else hex(rid), "file": __file__, "layer": sys.prefix}
-    write((json.dumps(ready, ensure_ascii=True) + "\n").encode("ascii"))
+    write(ready_record(job_dir, rid))
 
 
 def _main():

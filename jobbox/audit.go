@@ -36,9 +36,10 @@ type Record struct {
 	Act   string  `json:"act,omitempty"` // block / log / count；就绪记录没有
 	N     int     `json:"n,omitempty"`   // count 类：这个进程里累计多少次
 	Args  string  `json:"args,omitempty"`
-	IL    string  `json:"il,omitempty"`    // 就绪：完整性级别
-	File  string  `json:"file,omitempty"`  // 就绪：sitecustomize 的路径
-	Layer string  `json:"layer,omitempty"` // 就绪：环境层（sys.prefix）
+	IL    string  `json:"il,omitempty"`      // 就绪：完整性级别
+	Dir   string  `json:"job_dir,omitempty"` // 就绪：这个进程拿到的 EPSILON_JOB_DIR
+	File  string  `json:"file,omitempty"`    // 就绪：sitecustomize 的路径
+	Layer string  `json:"layer,omitempty"`   // 就绪：环境层（sys.prefix）
 }
 
 // Summary 写进 summary.json 的 audit（能力 35）。
@@ -171,9 +172,11 @@ func (l *Log) Bytes() []byte {
 // watcher 盯着一次运行的审计连接：
 //   - 主进程恢复运行后 readyTimeout 内没收到它的就绪 → AbortNoReady；
 //   - 主进程的连接断了、grace 内 Stop 没来（进程还在跑）→ AbortAudit；
-//   - 任何连接上记录格式不对、第一条不是就绪、pid 和就绪的对不上 → AbortAudit。
+//   - 任何连接上记录格式不对、第一条不是就绪、pid 和就绪的对不上 → AbortAudit；
+//   - 就绪记录的 job_dir 不是这个任务的目录 → AbortAudit（子进程的环境块被换了，它的钩子按别的目录判）。
 type watcher struct {
 	log          *Log
+	jobDir       string
 	readyTimeout time.Duration
 	grace        time.Duration
 	pid          chan int
@@ -194,8 +197,8 @@ const (
 	evBad
 )
 
-func newWatcher(l *Log, readyTimeout, grace time.Duration) *watcher {
-	w := &watcher{log: l, readyTimeout: readyTimeout, grace: grace, pid: make(chan int, 1),
+func newWatcher(l *Log, readyTimeout, grace time.Duration, jobDir string) *watcher {
+	w := &watcher{log: l, jobDir: jobDir, readyTimeout: readyTimeout, grace: grace, pid: make(chan int, 1),
 		ev: make(chan auditEvent), abort: make(chan string, 1), stopped: make(chan struct{})}
 	go w.run()
 	return w
@@ -244,7 +247,7 @@ func (w *watcher) Serve(r io.Reader) {
 		}
 		rec, perr := w.log.Add(bytes.TrimRight(line, "\r\n"))
 		switch {
-		case perr != nil, pid == 0 && rec.Ev != "ready", pid != 0 && rec.Pid != pid:
+		case perr != nil, pid == 0 && (rec.Ev != "ready" || !sameDir(rec.Dir, w.jobDir)), pid != 0 && rec.Pid != pid:
 			w.send(auditEvent{kind: evBad})
 			return
 		case pid == 0:
