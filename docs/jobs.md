@@ -73,7 +73,12 @@
    `schema` = 1；`name`、`version`（x.y.z）、`env` / `data`（`名字@版本`）、`code_sha256`（64 位小写十六进制）格式合法；`owner` 非空；`disk_max_mb` / `output_max_mb` ≥ 1；`env` 在钥匙环的 `env_layers` 里；
 4. `entry` = `[解释器, 脚本, 参数…]`：解释器只能是 `python` / `python3`，后面可以有 `-B` / `-u`（不影响执行什么代码；其他解释器参数不行），然后必须是脚本，脚本是 `code\` 下的相对 `.py` 路径、不含 `..`，后面不许出现 `-c` / `-m`；
 5. `gpu_mem_mb` 在 0–7168，`max_hours` > 0；`gpu` 不写按 `true` 算（读 `Job.NeedsGPU()`），GPU 任务的 `gpu_mem_mb` 不能是 0，纯 CPU 任务要明确写 `"gpu": false`；
-6. `max_hours` ≤ 钥匙的 `max_hours`；要联网的，钥匙必须有 `network` 权限。
+6. `max_hours` ≤ 钥匙的 `max_hours`；要联网的，钥匙必须有 `network` 权限；
+7. `params` 每一项的声明（`jobsign.CheckParamDecls`，签名时就查，免得签出来每次提交都 400）：
+   - 简写：`"int"` / `"number"` / `"string"` / `"bool"`；
+   - 对象：`{"type": 上面四种之一, "min": 数, "max": 数, "enum": [值...], "default": 值, "description": "给人看"}`，除 `type` 都可省；
+   - **别的键一律拒**（写错成 `minimum` 不能悄悄失效）；`min` / `max` 只许用在 `int` / `number`，`min` ≤ `max`；`enum` 不能是空数组，每一项都要符合类型和范围；`default` 要符合类型、范围，有 `enum` 时要在里面；
+   - 值的规则（`FillParams`，主控提交时、探针拿到时各查一次）：类型对、在范围和 `enum` 里，`int` 不许带小数，数字不许写成字符串；没声明的参数直接拒。
 
 不影响安全和调度的问题只报 warning（`jobsign.JobWarnings`）：`description` 没写或超过 200 字、`owner` 格式不规范。`sign-job` 打印出来并写进 `job.signed.json` 的 `warnings` 留痕；这个字段不受签名保护，探针不看。
 
@@ -112,10 +117,10 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 
 两个容易踩的点，执行器必须照做：
 
-1. **层里没有 `._pth`，执行时固定加 `-E -B`。** embeddable 自带的 `._pth` 会打开 `safe_path`（CPython `getpath.py`），脚本目录不进 `sys.path`，多文件任务一 `import` 就失败。`-E` 负责隔离（不读 `PYTHON*` 环境变量和注册表），脚本目录照常可用。
+1. **层里没有 `._pth`，执行时固定加 `-E -s -B`（`envlayer.Flags`）。** embeddable 自带的 `._pth` 会打开 `safe_path`（CPython `getpath.py`），脚本目录不进 `sys.path`，多文件任务一 `import` 就失败。没有 `._pth` 就是普通的 `site.py`，所以：`-E` 不读 `PYTHON*` 环境变量；**`-s` 不加用户 site-packages**（`%APPDATA%\Python\Python3xx\site-packages`）——`-E` 管不到它，那里的 `.pth` 每次启动都会执行，一个任务埋下的代码会跑进以后每个任务，签名和环境层摘要都管不到，而且比环境层的审计钩子（`sitecustomize`）还先跑。不能用 `-I`：它连脚本目录也从 `sys.path` 拿掉。
 2. **层内 pyc 是预编译的（`unchecked-hash`）。** 任务不写字节码，解压也不保留修改时间；不预编译的话，每次启动都要重新编译 torch。
 
-真机验证：`<层目录>\python.exe -E -B deploy\envs\smoke\smoke.py`。
+真机验证：`<层目录>\python.exe -E -s -B deploy\envs\smoke\smoke.py`。
 
 ## 任务输出回传
 
@@ -171,17 +176,19 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 | `DELETE /v1/jobs/{id}` | api key | 撤销：排队的不再派；派出去的从期望状态里去掉，探针看不到了就整树杀。已结束的回 409 |
 
 - **主控只能挑、填、选**：提交时用 `jobsign.VerifyJob` 核任务包（验签、过期、吊销、字段），`jobsign.FillParams` 按包里的 `params` 声明校验参数（类型、`min`/`max`、`enum`）并补 `default`。下发的是任务包原文，探针自己再验。
-- **提交时就拒**：任务包不存在 404；签名/钥匙/字段不过、带 `data`（数据集还没做）、`rooms` 超出钥匙权限、`chunks_dir` 里没有代码包或环境层的清单都是 400。
+- **提交时就拒**：任务包不存在 404；签名/钥匙/字段不过、带 `data`（数据集还没做）、`rooms` 超出钥匙权限、钥匙的 `max_nodes` 是 0、`chunks_dir` 里没有代码包或环境层的清单都是 400。
+- **`queue.json` 读坏了**：批任务停用，`POST` / `DELETE /v1/jobs` 回 503，主控**不再写** `queue.json`（坏文件里是旧任务和序号，等人修好或挪走再重启）。
 - **代码包约定**：清单 ID `code-<code_sha256>`，里面只有一个文件 `jobcode/<code_sha256>.zip`。在 Mac 上：把 `code.zip` 改名放到 `<目录>/jobcode/<sha>.zip`，`epsilon-chunk build -id code-<sha> -root <目录> -out <chunks_dir> jobcode/<sha>.zip`。
 - 任务号 `<任务名>-<序号>`，序号存在 `queue.json` 里接着往下排，不和 `jobs_dir` 里已有的目录撞。`count` 份就是 `count` 个任务号，各自回传输出。
 - **派活**（每次心跳和每 5 秒）：按提交顺序，给每个排队的任务挑一台节点（按名字排）：
   - 节点开了能力 32（心跳 `jobs: true`）、心跳没过期、手上没有没结束的任务（正在杀的旧任务也算占着）；
   - 在提交的 `nodes` / `rooms` 里；钥匙限了 `rooms` 的，节点必须在拓扑表里且在这些教室；
   - GPU 任务：心跳里第一张卡的显存总量 ≥ `gpu_mem_mb`；
-  - 这把钥匙现在占着的节点数 < `max_nodes`。**`max_nodes` 为 0 = 一台都不派**（宁可误拒）；
-  - 派之前用当前钥匙环复核一次：已吊销、钥匙过期的任务直接 `rejected`。
+  - 这把钥匙现在占着的节点数 < `max_nodes`。**`max_nodes` 为 0 = 一台都不派**（宁可误拒；提交后钥匙环才改成 0 的，排着的任务 `detail` 里写明原因）。"占着"除了主控派出去没结束的，还算探针还报着没结束的：撤销了正在杀的、失联了可能还在跑的（失联的最多算到它最后一次心跳后 `max_hours`，探针自己到时也会杀）；
+  - 派之前用当前钥匙环复核一次：已吊销、钥匙过期的任务直接 `rejected`。复核只在真要派的时候做（有空节点、钥匙有名额、挑得出节点），排队再多，每次心跳也只验要派出去的那几份。
 - **派了任务的节点先停推理**：心跳回包里 `job` 有值时 `workload` 置空；探针这边也会自己停（双保险）。
 - **失联从头重跑**：派到的节点心跳超过 `stale_seconds`，或探针重新登记时手上没有这次任务（重启过），任务放回队列，`attempt` 加一，丢掉上次没传完的输出块。重派先避开失联过的节点，实在没别的再用。超过 `job_max_retries` 次算 `failed`。退出码非 0、超时、超磁盘都是最终结果，**不重试**。
+- **输出已经传完的不重跑**：探针传完输出（`manifest.json` 冻结）到下一次心跳报结束状态之间重启或失联的，按回传的 `_runner/summary.json` 记结束状态（退出码 0 → `succeeded`，非 0 → `failed`，超时/超磁盘 → `killed`），`detail` 里注明"输出已传完，结束状态没报上来"。重跑的话新一次的摘要不同，回传必然 409。
 - **状态随心跳对账**：探针在登记和每次心跳里带 `job`（`proto.JobStatus`），主控只认当前派到的节点、当前这一次（`attempt`）。回包丢了（探针下一次心跳没报这个任务）就再发一次，不算失联。
 
 任务状态：`queued` → `assigned`（发出去了，探针还没报）→ `fetching` → `running` → `uploading` → `succeeded` / `failed`（退出码非 0、输出超限、回传失败、拉取超时、重试用完）/ `killed`（超时、超磁盘、撤销）/ `rejected`（探针或主控复核没过，一行代码都没跑）/ `cancelled`（撤销）。
@@ -193,7 +200,7 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 | 字段 | 默认 | 能力 | 说明 |
 |---|---|---|---|
 | `jobs` | `false` | 32 | 执行签名任务包。**上线前必须先做下面"上线前必须做"** |
-| `job_keyring` | `true` | 33 | 每 10 分钟拉一次钥匙环、记住最高版本号；关了就一个任务都验不了 |
+| `job_keyring` | `true` | 33 | 每 10 分钟拉一次钥匙环、记住最高版本号；关了就一个任务都验不了。主控没配批任务（404）只记一次日志 |
 
 一次任务（`probe/jobs.go`）：
 
@@ -202,11 +209,11 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 3. **时钟**：判断过期用的"现在"取 本机时间、主控回包的 `Date`、钥匙环 `issued` 里**最晚**的。主控可以骗探针提早判过期，骗不了它放过过期的钥匙。
 4. **环境层**：钥匙环 `env_layers` 的摘要核对清单 → 分块/P2P 拉 → 拼 zip → 解压（`envlayer`）。已经装好就直接用。
 5. **代码包**：取清单 `code-<code_sha256>`，只许一个文件 `jobcode/<sha>.zip`、整文件哈希等于 `code_sha256`；拉块、拼好后**整个文件重算 SHA-256**（二次核对，不信清单也不信 `.epsilon-ok` 校验戳），不符就删掉、拒跑。
-6. 环境层和代码包 2 小时内没拉齐算失败，放出机器。
-7. **展开**到 `<artifact_root>/jobs/<id>/`（`jobrun.Prepare`）：旧目录整个删掉从头来；`code/`（zip 解压，路径穿越、链接、大小写冲突都拒）、`data/`（空）、`params.json`（核过的参数）、`output/`、`tmp/`、`job.log`。
-8. **执行**（`jobrun.Run`）：`<环境层>\python.exe -E -B <entry[1:]...>`，工作目录 `code\`，**不经 shell**；`TMP`/`TEMP` 指到 `tmp\`。Windows 上挂起启动 → 放进新建的作业对象 → 再恢复，任务起的子进程逃不出这棵树；超时（`max_hours`）、写盘超过 `disk_max_mb`（`output/` + `tmp/` + `job.log`，每 10 秒查）、撤销时整棵树一起杀；主进程正常退出后树里剩下的也杀掉。探针自己死了作业对象句柄关闭，Windows 也会杀整棵。
-9. **回传**：写 `output/_runner/summary.json`（任务号、第几次、节点、任务包、签名者、摘要、参数、退出码、被杀原因、秒数）和 `output/_runner/job.log`（`job.log` 末尾 1 MB），再用 `joboutput` 回传（失败隔 30 秒续传，最多 5 轮）。成功、失败、超时、超磁盘都回传；撤销的不回传；`output/` 超过 `output_max_mb` 的算失败、不回传。
-10. 开始和结束各发一条 `job` 事件（任务号、第几次、任务包、签名者、摘要前 12 位、参数），钥匙环升版本发 `keyring` 事件。
+6. 第 1、4、5 步主控一时出错（连不上、超时、5xx）就退避重试（5 秒起翻倍，最多 2 分钟一次）；钥匙环、环境层和代码包 2 小时内没拉齐算失败，放出机器。验签、摘要、哈希不对直接 `rejected`，不重试。
+7. **展开**到 `<artifact_root>/jobs/<id>/`（`jobrun.Prepare`）：旧目录整个删掉从头来；`code/`（zip 解压前整包查一遍，有一条不过就拒：路径穿越、链接、大小写冲突、Windows 保留名 `CON` `NUL` `COM1` `LPT9` 等（带扩展名也算）、段尾的点和空格、展开后路径超过 259 字符、解压后合计超过 256 MB）、`data/`（空）、`params.json`（核过的参数）、`output/`、`tmp/`、`job.log`。
+8. **执行**（`jobrun.Run`）：`<环境层>\python.exe -E -s -B <entry[1:]...>`，工作目录 `code\`，**不经 shell**；`TMP`/`TEMP` 指到 `tmp\`。Windows 上挂起启动 → 放进新建的作业对象 → 再恢复，任务起的子进程逃不出这棵树；超时（`max_hours`）、写盘超过 `disk_max_mb`（`output/` + `tmp/` + `job.log`，每 10 秒查）、撤销时整棵树一起杀；主进程正常退出后树里剩下的也杀掉。探针自己死了作业对象句柄关闭，Windows 也会杀整棵。
+9. **回传**：写 `output/_runner/summary.json`（任务号、第几次、节点、任务包、签名者、摘要、参数、退出码、被杀原因、秒数）和 `output/_runner/job.log`（`job.log` 末尾 1 MB），再用 `joboutput` 回传（失败隔 30 秒续传，最多 5 轮）。成功、失败、超时、超磁盘都回传；撤销的不回传；`output/` 超过 `output_max_mb` 的算失败、不回传。**`output/_runner/` 只许平台写**：任务结束（整棵树已杀）后里面有任何东西，就是任务自己写的（伪造摘要、绕过 `output_max_mb`），算失败、不回传；摘要写不进去也算失败、不回传。
+10. 开始发一条 `job` 事件（任务号、第几次、任务包、签名者、摘要前 12 位、参数）；结束发一条（任务号、第几次、结束状态、签名者、摘要前 12 位、原因；验签之前就被拒的没有签名者，写明"没验过签"）。钥匙环升版本发 `keyring` 事件。
 
 ## 上线前必须做（issue #1 第 4 步，这一版没有）
 
