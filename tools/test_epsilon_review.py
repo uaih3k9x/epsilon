@@ -796,3 +796,20 @@ def test_attrgetter_needs_explanation():
 ])
 def test_more_bypasses(src, rule, level):
     assert level in levels_of(scan_py(src), rule)
+
+
+def test_bindings_are_scoped_per_function():
+    # 另一个函数里同名变量指向 .py，不该把这里的写入算成写 .py 再导入
+    src = ("import importlib\n"
+           "def a():\n    p = 'mod.py'\n    return importlib.import_module('json')\n"
+           "def b(out):\n    p = out / 'data.bin.txt'\n    p.write_bytes(b'')\n"
+           "def c(p):\n    p.write_text('x')\n"
+           "p = 'top.py'\n")
+    assert "write-then-import" not in rules(scan_py(src))
+    src2 = "import runpy\nP = 'gen.py'\ndef f():\n    open(P, 'w').write(s)\n    runpy.run_path(P)\n"
+    assert "write-then-import" in rules(scan_py(src2), REJECT)
+
+
+def test_sys_path_assignment_counts_as_import_mechanism():
+    src = "import sys\nopen('tmp/gen.py', 'w').write(s)\nsys.path = ['tmp'] + sys.path\nimport gen\n"
+    assert "write-then-import" in rules(scan_py(src), REJECT)

@@ -545,7 +545,7 @@ class _PyScan:
         self.name, self.lines = name, text.splitlines()
         self.out = []
         self.aliases = {}       # 名字 → 可能指向的限定名集合（文件内、不分流程）
-        self.bindings = {}      # 名字 → 赋给它的表达式列表（一跳数据流）
+        self.bindings = {}      # (作用域, 名字) → 赋给它的表达式列表（一跳数据流，按函数分作用域）
         self.flagged_imports = set()
         self.parent = {}
 
@@ -624,20 +624,40 @@ class _PyScan:
                 out.append(s)
             elif isinstance(n, ast.Name) and depth < 2 and n.id not in seen:
                 seen.add(n.id)
-                for v in self.bindings.get(n.id, ()):
+                for v in self._lookup(n):
                     out += self._consts(v, depth + 1, seen)
         return out
+
+    def _scope(self, node):
+        n = self.parent.get(node)
+        while n is not None and not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            n = self.parent.get(n)
+        return n   # None = 模块
+
+    def _bind(self, name_node, value):
+        self.bindings.setdefault((self._scope(name_node), name_node.id), []).append(value)
+
+    def _lookup(self, name_node):
+        """名字在它所在的函数里绑定了什么；没有就往外层函数、模块找。"""
+        scope = self._scope(name_node)
+        while True:
+            if (scope, name_node.id) in self.bindings:
+                return self.bindings[(scope, name_node.id)]
+            if scope is None:
+                return []
+            scope = self._scope(scope)
 
     def _mentions_py(self, node):
         return node is not None and any(s.lower().endswith((".py", ".pyw", ".pth", ".pyc")) for s in self._consts(node))
 
     # ---------------------------------------------------------------- 预处理
     def prepare(self, tree):
-        for node in ast.walk(tree):
+        self.nodes = list(ast.walk(tree))     # 只遍历一次，后面的规则都用它
+        for node in self.nodes:
             for child in ast.iter_child_nodes(node):
                 self.parent[child] = node
         assigns = []
-        for node in ast.walk(tree):
+        for node in self.nodes:
             if isinstance(node, ast.Import):
                 for a in node.names:
                     if a.asname:
@@ -655,13 +675,17 @@ class _PyScan:
                     for t in targets:
                         if isinstance(t, ast.Name):
                             assigns.append((t.id, node.value))
-                            self.bindings.setdefault(t.id, []).append(node.value)
+                            self._bind(t, node.value)
             elif isinstance(node, (ast.With, ast.AsyncWith)):
                 for item in node.items:
                     if isinstance(item.optional_vars, ast.Name):
-                        self.bindings.setdefault(item.optional_vars.id, []).append(item.context_expr)
+                        self._bind(item.optional_vars, item.context_expr)
             elif isinstance(node, (ast.For, ast.AsyncFor)) and isinstance(node.target, ast.Name):
-                self.bindings.setdefault(node.target.id, []).append(node.iter)
+                self._bind(node.target, node.iter)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                for a in node.args.posonlyargs + node.args.args + node.args.kwonlyargs + \
+                        [x for x in (node.args.vararg, node.args.kwarg) if x]:
+                    self.bindings.setdefault((node, a.arg), [])     # 参数：挡住外层同名变量
         for _ in range(5):  # 别名链 a = eval; b = a ...，到不动点为止
             changed = False
             for name, value in assigns:
@@ -705,13 +729,13 @@ class _PyScan:
     def run(self, tree):
         self.prepare(tree)
         docstrings = set()
-        for node in ast.walk(tree):
+        for node in self.nodes:
             if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.body:
                 first = node.body[0]
                 if isinstance(first, ast.Expr) and _const_str(first.value) is not None:
                     docstrings.add(id(first.value))
         writes_py, import_mech = [], False
-        for node in ast.walk(tree):
+        for node in self.nodes:
             parent = self.parent.get(node)
             if isinstance(node, ast.Import):
                 for a in node.names:
@@ -752,9 +776,9 @@ class _PyScan:
                 if node.attr in _DUNDERS:
                     self.add(EXPLAIN, "dunder-access", node, f"碰了内部属性 {node.attr}", "直接写要用的属性，别经过内部属性")
                 if isinstance(node.ctx, (ast.Store, ast.Del)):
-                    self._check_store(node, node)
+                    import_mech |= self._check_store(node, node)
             elif isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                self._check_store(node.value, node, node.slice)
+                import_mech |= self._check_store(node.value, node, node.slice)
             elif isinstance(node, ast.Call):
                 import_mech |= self._check_call(node, parent, writes_py)
             elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add) and not (
@@ -778,13 +802,17 @@ class _PyScan:
         return int(isinstance(node, ast.Call) and "builtins.chr" in self.resolve(node.func))
 
     def _check_store(self, target, node, key=None):
+        """赋值 / 删除的目标。改了导入状态返回 True（算动态导入机制）。"""
+        touched = False
         for q in self.resolve(target):
             if q in _IMPORT_STATE:
                 self.add(EXPLAIN, "import-machinery", node, f"改了 {q}", "别改导入路径；同目录的模块直接 import")
+                touched = True
             elif q.startswith("builtins.") and key is None and target is node:
                 self.add(EXPLAIN, "import-machinery", node, f"改写了内置函数 {q}", "送审单里说明")
             elif q == "os.environ" and key is not None:
                 self._check_env_key(key, node)
+        return touched
 
     def _check_env_key(self, key, node):
         keys = [s for s in self._consts(key)]
@@ -946,7 +974,7 @@ class _PyScan:
             for q in self.resolve(node.func.value):
                 if q in _IMPORT_STATE:
                     self.add(EXPLAIN, "import-machinery", node, f"改了 {q}", "别改导入路径；同目录的模块直接 import")
-                    import_mech |= q == "sys.path"
+                    import_mech = True
                 elif q == "os.environ":
                     keys = [ast.Constant(value=k.arg) for k in node.keywords if k.arg]
                     for a in node.args:
@@ -992,7 +1020,7 @@ class _PyScan:
             return bool(self.resolve(node.func) & {"pathlib.Path", "os.path.join", "builtins.str"}) and \
                 any(self._is_local(a, depth + 1) for a in node.args)
         if isinstance(node, ast.Name):
-            vals = self.bindings.get(node.id, ())
+            vals = self._lookup(node)
             return bool(vals) and all(self._is_local(v, depth + 1) for v in vals)
         return False
 
@@ -1012,7 +1040,7 @@ class _PyScan:
 def _param_uses(scan, tree):
     """代码里按字面量读的参数名：P["x"] / P.get("x")，P 是 json.load 的结果。"""
     loads = {}
-    for node in ast.walk(tree):
+    for node in scan.nodes:
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and \
                 scan.resolve(node.value.func) & {"json.load", "json.loads"}:
             for t in node.targets:
@@ -1022,7 +1050,7 @@ def _param_uses(scan, tree):
     if any(loads.values()):  # 认得出哪个是 params.json，就只看它
         loads = {k: v for k, v in loads.items() if v}
     uses = []
-    for node in ast.walk(tree):
+    for node in scan.nodes:
         key = None
         if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in loads:
             key = _const_str(node.slice)
