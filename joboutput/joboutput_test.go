@@ -295,3 +295,22 @@ func TestLinksAndJunctionsNotFollowed(t *testing.T) {
 		}
 	}
 }
+
+func TestHardLinksNotUploaded(t *testing.T) {
+	// 硬链接和原文件是同一个文件对象：任务从 output\ 链到 probe.json，WalkDir 看到的是普通文件，
+	// 探针以自己的身份读出来就回传给了提交者。链接数不是 1 的一律拒（docs/jobs-sandbox.md 第 3 节）。
+	secret := t.TempDir()
+	os.WriteFile(filepath.Join(secret, "probe.json"), []byte(`{"token":"x"}`), 0o644)
+	r := newRig(t, 10)
+	r.write("ok.txt", []byte("ok"))
+	if err := os.Link(filepath.Join(secret, "probe.json"), filepath.Join(r.src, "k")); err != nil {
+		t.Skip("建不了硬链接:", err)
+	}
+	_, err := Upload(context.Background(), http.DefaultClient, r.srv.URL, "tok", "j1", r.src, 1<<20)
+	if err == nil || !strings.Contains(err.Error(), "硬链接") {
+		t.Fatalf("要拒: %v", err)
+	}
+	if code, _ := r.req("GET", "/v1/jobs/j1/output", "key", nil); code != 404 {
+		t.Fatal("拒了就不该有清单")
+	}
+}
