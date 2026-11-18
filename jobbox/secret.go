@@ -52,9 +52,31 @@ func PipeSD(probeSID, jobSID string) string {
 	return "D:P(A;;0x12019b;;;" + jobSID + ")(A;;FA;;;SY)(A;;FA;;;" + probeSID + ")S:(ML;;NW;;;LW)"
 }
 
-// DesktopSD 是窗口站 epsilon-job 和桌面 Default：任务账户能用；没有 Low 标签的话，Low IL 进程初始化 user32 会失败。
+// 窗口站和桌面上任务账户的权限：全部具体权限 + READ_CONTROL，没有 WRITE_DAC、WRITE_OWNER、DELETE
+// （不然任务能改它们的 DACL，把探针排除在外或者给别人开门）。真机上 user32 初始化够不够见文档第 7 节。
+const (
+	winstaJobMask  = "0x2037f" // WINSTA_ENUMDESKTOPS…WINSTA_READSCREEN（0x37f）| READ_CONTROL
+	desktopJobMask = "0x201ff" // DESKTOP_READOBJECTS…DESKTOP_SWITCHDESKTOP（0x1ff）| READ_CONTROL
+)
+
+// WinstaSD 是窗口站 epsilon-job；DesktopSD 是它下面的桌面 Default。没有 Low 标签的话，Low IL 进程初始化 user32 会失败。
+func WinstaSD(probeSID, jobSID string) string {
+	return "D:P(A;;GA;;;SY)(A;;GA;;;" + probeSID + ")(A;;" + winstaJobMask + ";;;" + jobSID + ")S:(ML;;NW;;;LW)"
+}
+
 func DesktopSD(probeSID, jobSID string) string {
-	return "D:P(A;;GA;;;SY)(A;;GA;;;" + probeSID + ")(A;;GA;;;" + jobSID + ")S:(ML;;NW;;;LW)"
+	return "D:P(A;;GA;;;SY)(A;;GA;;;" + probeSID + ")(A;;" + desktopJobMask + ";;;" + jobSID + ")S:(ML;;NW;;;LW)"
+}
+
+// UsersSID 是 BUILTIN\Users。任务账户的本地组必须恰好是它：Administrators 不用说，
+// Backup Operators（S-1-5-32-551）的 SeBackup 能绕过所有 DACL，别的组也不该有。
+const UsersSID = "S-1-5-32-545"
+
+func groupsOK(sids []string) error {
+	if len(sids) == 1 && sids[0] == UsersSID {
+		return nil
+	}
+	return fmt.Errorf("账户 %s 的本地组是 %v，只许是 Users（%s）", JobUser, sids, UsersSID)
 }
 
 // isLogonCode：CreateProcessWithLogonW 的这些错误说明本机账户配置坏了（停接任务），不是这个任务的问题。
@@ -71,6 +93,20 @@ func isLogonCode(c uint32) bool {
 		return true
 	}
 	return false
+}
+
+// startError 把 CreateProcessWithLogonW 的错误码分成三类：登录（本机账户配置，LogonError）、
+// 这个任务的（解释器、工作目录、路径不对）、其余都算本机的（MachineError：停接任务，主控换一台）。
+func startError(code uint32, msg string) error {
+	if isLogonCode(code) {
+		return &LogonError{Code: code, Msg: msg}
+	}
+	err := fmt.Errorf("CreateProcessWithLogonW: %s（%d）", msg, code)
+	switch code {
+	case 2, 3, 123, 193, 206, 267: // FILE_NOT_FOUND PATH_NOT_FOUND INVALID_NAME BAD_EXE_FORMAT FILENAME_EXCED_RANGE DIRECTORY
+		return err
+	}
+	return &MachineError{Err: err}
 }
 
 // envBlock 是 CREATE_UNICODE_ENVIRONMENT 要的 UTF-16 环境块："K=V\0...\0\0"。变量里带 NUL 返回 nil。

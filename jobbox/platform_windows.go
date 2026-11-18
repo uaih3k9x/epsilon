@@ -47,6 +47,7 @@ var (
 	procCreateDesktopW          = user32.NewProc("CreateDesktopW")
 	procGetProcessWindowStation = user32.NewProc("GetProcessWindowStation")
 	procSetProcessWindowStation = user32.NewProc("SetProcessWindowStation")
+	procCloseWindowStation      = user32.NewProc("CloseWindowStation")
 	procWTSEnumerateProcessesEx = wtsapi32.NewProc("WTSEnumerateProcessesExW")
 	procWTSFreeMemoryEx         = wtsapi32.NewProc("WTSFreeMemoryExW")
 	procNetUserGetLocalGroups   = netapi32.NewProc("NetUserGetLocalGroups")
@@ -74,6 +75,7 @@ const (
 	errorPipeConnected        = 535
 
 	winstaAllAccess = 0x37f | 0xf0000
+	cwfCreateOnly   = 0x1 // 同名窗口站已经存在就失败，不打开别人的（和它的 DACL）
 	genericAll      = 0x10000000
 	genericWrite    = 0x40000000
 
@@ -83,7 +85,7 @@ const (
 	processTerminate        = 0x0001
 	lgIncludeIndirect       = 0x1
 	maxPreferredLength      = 0xffffffff
-	adminsSID               = "S-1-5-32-544"
+	errorNoneMapped         = 1332 // LookupAccountName：没有这个账户
 )
 
 type winPlatform struct {
@@ -242,26 +244,26 @@ func unprotect(blob, entropy []byte) ([]byte, error) {
 	return append([]byte(nil), unsafe.Slice(out.data, out.size)...), nil
 }
 
-// inAdministrators 查账户（含间接）在不在 Administrators 里。按 SID 比，不按组名（组名是本地化的）。
-func inAdministrators(user string) (bool, error) {
+// localGroups 是账户（含间接）所在本地组的 SID。按 SID 比，不按组名（组名是本地化的）；查不了 SID 的组算错误。
+func localGroups(user string) ([]string, error) {
 	var buf unsafe.Pointer
 	var read, total uint32
 	rc, _, _ := procNetUserGetLocalGroups.Call(0, uintptr(unsafe.Pointer(utf16p(user))), 0, lgIncludeIndirect,
 		uintptr(unsafe.Pointer(&buf)), maxPreferredLength, uintptr(unsafe.Pointer(&read)), uintptr(unsafe.Pointer(&total)))
 	if rc != 0 {
-		return false, fmt.Errorf("NetUserGetLocalGroups: %v", syscall.Errno(rc))
+		return nil, fmt.Errorf("NetUserGetLocalGroups: %v", syscall.Errno(rc))
 	}
 	defer procNetApiBufferFree.Call(uintptr(buf))
+	var sids []string
 	for _, name := range unsafe.Slice((**uint16)(buf), read) {
 		sid, _, _, err := syscall.LookupSID("", wstr(name))
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("本地组 %s 的 SID: %v", wstr(name), err)
 		}
-		if s, _ := sid.String(); s == adminsSID {
-			return true, nil
-		}
+		s, _ := sid.String()
+		sids = append(sids, s)
 	}
-	return false, nil
+	return sids, nil
 }
 
 // Health 是健康检查（docs/jobs-sandbox.md 第 6 节）。通过后记下 SID 和密码，建好窗口站。
@@ -285,8 +287,12 @@ func (p *winPlatform) Health() error {
 	if s, _ := sid.String(); s != sec.SID {
 		return fmt.Errorf("账户 %s 的 SID 是 %s，密码文件里记的是 %s", JobUser, s, sec.SID)
 	}
-	if admin, err := inAdministrators(JobUser); err != nil || admin {
-		return fmt.Errorf("账户 %s 在管理员组里（或者查不了: %v）", JobUser, err)
+	groups, err := localGroups(JobUser)
+	if err != nil {
+		return err
+	}
+	if err := groupsOK(groups); err != nil {
+		return err
 	}
 	p.mu.Lock()
 	p.jobSID, p.jobSIDp, p.password = sec.SID, sid, string(pw)
@@ -295,6 +301,7 @@ func (p *winPlatform) Health() error {
 }
 
 // ensureDesktop 建一次窗口站 epsilon-job 和桌面 Default，句柄攥到探针退出。
+// CWF_CREATE_ONLY：同名窗口站已经存在（有人抢先建了，或者上一个探针的残留进程还攥着）就失败，不用别人的。
 // CreateDesktop 建在进程当前的窗口站上，所以要先 SetProcessWindowStation（整个进程生效），建完马上切回。
 func (p *winPlatform) ensureDesktop(jobSID string) error {
 	p.mu.Lock()
@@ -302,24 +309,38 @@ func (p *winPlatform) ensureDesktop(jobSID string) error {
 	if p.desktop != 0 {
 		return nil
 	}
-	sd, err := securityDescriptor(DesktopSD(p.probeSID, jobSID))
+	attrs := func(sddl string) (*syscall.SecurityAttributes, func(), error) {
+		sd, err := securityDescriptor(sddl)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &syscall.SecurityAttributes{Length: uint32(unsafe.Sizeof(syscall.SecurityAttributes{})), SecurityDescriptor: sd},
+			func() { procLocalFree.Call(sd) }, nil
+	}
+	wsa, free1, err := attrs(WinstaSD(p.probeSID, jobSID))
 	if err != nil {
 		return err
 	}
-	defer procLocalFree.Call(sd)
-	sa := syscall.SecurityAttributes{Length: uint32(unsafe.Sizeof(syscall.SecurityAttributes{})), SecurityDescriptor: sd}
+	defer free1()
+	dsa, free2, err := attrs(DesktopSD(p.probeSID, jobSID))
+	if err != nil {
+		return err
+	}
+	defer free2()
 	name, desk, _ := strings.Cut(Desktop, `\`)
-	ws, _, err := procCreateWindowStationW.Call(uintptr(unsafe.Pointer(utf16p(name))), 0, winstaAllAccess, uintptr(unsafe.Pointer(&sa)))
+	ws, _, err := procCreateWindowStationW.Call(uintptr(unsafe.Pointer(utf16p(name))), cwfCreateOnly, winstaAllAccess, uintptr(unsafe.Pointer(wsa)))
 	if ws == 0 {
-		return fmt.Errorf("建窗口站 %s: %v", name, err)
+		return fmt.Errorf("建窗口站 %s（已经存在也算失败）: %v", name, err)
 	}
 	orig, _, _ := procGetProcessWindowStation.Call()
 	if r, _, err := procSetProcessWindowStation.Call(ws); r == 0 {
+		procCloseWindowStation.Call(ws)
 		return fmt.Errorf("切到窗口站 %s: %v", name, err)
 	}
-	d, _, derr := procCreateDesktopW.Call(uintptr(unsafe.Pointer(utf16p(desk))), 0, 0, 0, genericAll, uintptr(unsafe.Pointer(&sa)))
+	d, _, derr := procCreateDesktopW.Call(uintptr(unsafe.Pointer(utf16p(desk))), 0, 0, 0, genericAll, uintptr(unsafe.Pointer(dsa)))
 	procSetProcessWindowStation.Call(orig)
 	if d == 0 {
+		procCloseWindowStation.Call(ws)
 		return fmt.Errorf("建桌面 %s: %v", Desktop, derr)
 	}
 	p.winsta, p.desktop = ws, d
@@ -357,13 +378,13 @@ func (w *winProc) Close() {
 func (p *winPlatform) Start(l jobrun.Launch) (jobrun.Proc, error) {
 	_, _, password, err := p.job()
 	if err != nil {
-		return nil, err
+		return nil, &MachineError{Err: err}
 	}
 	p.mu.Lock()
 	haveDesktop := p.desktop != 0
 	p.mu.Unlock()
 	if !haveDesktop {
-		return nil, errors.New("独立桌面没建好")
+		return nil, &MachineError{Err: errors.New("独立桌面没建好")}
 	}
 	env := envBlock(l.Env)
 	if env == nil {
@@ -372,7 +393,7 @@ func (p *winPlatform) Start(l jobrun.Launch) (jobrun.Proc, error) {
 	cur, _ := syscall.GetCurrentProcess()
 	var logh syscall.Handle
 	if err := syscall.DuplicateHandle(cur, syscall.Handle(l.Log.Fd()), cur, &logh, 0, true, syscall.DUPLICATE_SAME_ACCESS); err != nil {
-		return nil, fmt.Errorf("复制日志句柄: %v", err)
+		return nil, &MachineError{Err: fmt.Errorf("复制日志句柄: %v", err)}
 	}
 	defer syscall.CloseHandle(logh)
 	cmd, err := syscall.UTF16FromString(CmdLine(l.Path, l.Args)) // lpCommandLine 必须可写；长度 Box 已经查过
@@ -390,16 +411,16 @@ func (p *winPlatform) Start(l jobrun.Launch) (jobrun.Proc, error) {
 		createSuspended|createUnicodeEnvironment, uintptr(unsafe.Pointer(&env[0])), uintptr(unsafe.Pointer(utf16p(l.Dir))),
 		uintptr(unsafe.Pointer(&si)), uintptr(unsafe.Pointer(&pi)))
 	if r == 0 {
-		if errno, ok := cerr.(syscall.Errno); ok && isLogonCode(uint32(errno)) {
-			return nil, &LogonError{Code: uint32(errno), Msg: errno.Error()}
+		if errno, ok := cerr.(syscall.Errno); ok {
+			return nil, startError(uint32(errno), errno.Error())
 		}
-		return nil, fmt.Errorf("CreateProcessWithLogonW: %v", cerr)
+		return nil, &MachineError{Err: fmt.Errorf("CreateProcessWithLogonW: %v", cerr)}
 	}
 	tree, err := winproc.AdoptSuspended(pi.Process, pi.Thread, winproc.SandboxLimits)
 	syscall.CloseHandle(pi.Thread)
-	if err != nil {
+	if err != nil { // 进程已经被 seclogon 放进别的作业之类：本机的问题
 		syscall.CloseHandle(pi.Process)
-		return nil, err
+		return nil, &MachineError{Err: err}
 	}
 	return &winProc{h: pi.Process, pid: int(pi.ProcessId), tree: tree}, nil
 }
@@ -529,43 +550,80 @@ type wtsProcessInfoEx struct {
 	UserTime, KernelTime int64
 }
 
-// Sweep 用 WTSEnumerateProcessesExW 查所有会话里任务账户的进程，查到就 TerminateProcess。
-func (p *winPlatform) Sweep() (int, error) {
+// jobSIDForSweep 是清场用的任务账户 SID：健康检查过了用记下的；还没过（启动时先清场）就自己查，不需要密码文件。
+// 账户不存在（C: 被还原）返回 nil：也就不可能有它的进程。
+func (p *winPlatform) jobSIDForSweep() (*syscall.SID, error) {
 	p.mu.Lock()
 	sid := p.jobSIDp
 	p.mu.Unlock()
-	if sid == nil {
-		return 0, nil // 还没通过健康检查：账户不存在，任务也没跑过
+	if sid != nil {
+		return sid, nil
+	}
+	sid, _, _, err := syscall.LookupSID("", JobUser)
+	if errno, ok := err.(syscall.Errno); ok && errno == errorNoneMapped {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("查账户 %s: %v", JobUser, err)
+	}
+	return sid, nil
+}
+
+// jobProcs 用 WTSEnumerateProcessesExW 列所有会话里任务账户的进程。
+// 查不了 SID 的进程（pUserSid 为空）跳过：探针看不看得见任务账户的进程由 Box.mustSee 每个任务核对一次。
+func (p *winPlatform) jobProcs() ([]uint32, error) {
+	sid, err := p.jobSIDForSweep()
+	if err != nil || sid == nil {
+		return nil, err
 	}
 	level := uint32(1)
 	var info unsafe.Pointer
 	var count uint32
 	if r, _, err := procWTSEnumerateProcessesEx.Call(0, uintptr(unsafe.Pointer(&level)), wtsAnySession,
 		uintptr(unsafe.Pointer(&info)), uintptr(unsafe.Pointer(&count))); r == 0 {
-		return 0, fmt.Errorf("WTSEnumerateProcessesExW: %v", err)
+		return nil, fmt.Errorf("WTSEnumerateProcessesExW: %v", err)
 	}
 	defer procWTSFreeMemoryEx.Call(wtsTypeProcessInfoL1, uintptr(info), uintptr(count))
-	n := 0
-	var failed []string
+	var pids []uint32
 	for _, pr := range unsafe.Slice((*wtsProcessInfoEx)(info), count) {
 		if pr.UserSid == nil {
 			continue
 		}
-		if eq, _, _ := procEqualSid.Call(uintptr(unsafe.Pointer(pr.UserSid)), uintptr(unsafe.Pointer(sid))); eq == 0 {
-			continue
+		if eq, _, _ := procEqualSid.Call(uintptr(unsafe.Pointer(pr.UserSid)), uintptr(unsafe.Pointer(sid))); eq != 0 {
+			pids = append(pids, pr.ProcessID)
 		}
-		n++
-		h, err := syscall.OpenProcess(processTerminate, false, pr.ProcessID)
+	}
+	return pids, nil
+}
+
+func (p *winPlatform) Procs() ([]int, error) {
+	pids, err := p.jobProcs()
+	out := make([]int, len(pids))
+	for i, pid := range pids {
+		out[i] = int(pid)
+	}
+	return out, err
+}
+
+// Sweep 结束任务账户还活着的进程（TerminateProcess），返回找到几个。
+func (p *winPlatform) Sweep() (int, error) {
+	pids, err := p.jobProcs()
+	if err != nil {
+		return 0, err
+	}
+	var failed []string
+	for _, pid := range pids {
+		h, err := syscall.OpenProcess(processTerminate, false, pid)
 		if err == nil {
 			err = syscall.TerminateProcess(h, 1)
 			syscall.CloseHandle(h)
 		}
 		if err != nil {
-			failed = append(failed, fmt.Sprintf("%d: %v", pr.ProcessID, err))
+			failed = append(failed, fmt.Sprintf("%d: %v", pid, err))
 		}
 	}
 	if len(failed) > 0 {
-		return n, fmt.Errorf("结束不了: %s", strings.Join(failed, "；"))
+		return len(pids), fmt.Errorf("结束不了: %s", strings.Join(failed, "；"))
 	}
-	return n, nil
+	return len(pids), nil
 }

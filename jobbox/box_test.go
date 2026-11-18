@@ -85,6 +85,45 @@ type plat struct {
 	audit     *fakeAudit
 	revoked   []string
 	launches  []jobrun.Launch
+	alive     map[int]bool // 还活着的任务账户进程（Procs 报这些）
+	hidden    bool         // Procs 看不到别的账户的进程（非管理员枚举不出 SID）
+	leftover  int          // 任务结束后还要报几次"有进程"（conhost、正在退出的）；-1 = 一直有（逃出作业）
+	procsErr  error
+}
+
+func (f *plat) setAlive(pid int, on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.alive == nil {
+		f.alive = map[int]bool{}
+	}
+	if on {
+		f.alive[pid] = true
+	} else {
+		delete(f.alive, pid)
+	}
+}
+
+func (f *plat) Procs() ([]int, error) {
+	f.call("procs")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.procsErr != nil {
+		return nil, f.procsErr
+	}
+	var out []int
+	if !f.hidden {
+		for pid := range f.alive {
+			out = append(out, pid)
+		}
+	}
+	if f.leftover != 0 && f.alive[200] == false && len(f.launches) == 3 {
+		out = append(out, 999)
+		if f.leftover > 0 {
+			f.leftover--
+		}
+	}
+	return out, nil
 }
 
 func (f *plat) call(s string) {
@@ -141,7 +180,8 @@ func (f *plat) Start(l jobrun.Launch) (jobrun.Proc, error) {
 		p := newProc(100)
 		io.WriteString(l.Log, f.sysOut)
 		os.WriteFile(filepath.Join(filepath.Dir(l.Dir), "tmp", "canary.exe"), []byte("MZ"), 0o644) // 金丝雀留下的
-		p.exit(0)
+		f.setAlive(100, true)
+		go func() { time.Sleep(20 * time.Millisecond); f.setAlive(100, false); p.exit(0) }()
 		return p, nil
 	case "hook":
 		p := newProc(110)
@@ -170,7 +210,8 @@ func (f *plat) Start(l jobrun.Launch) (jobrun.Proc, error) {
 	}
 	f.mu.Unlock()
 	p := newProc(200)
-	go f.job(l, f.audit, p)
+	f.setAlive(200, true)
+	go func() { f.job(l, f.audit, p); <-p.done; f.setAlive(200, false) }()
 	return p, nil
 }
 
@@ -213,7 +254,7 @@ func newRig(t *testing.T, mod func(*plat)) *rig {
 		mod(p)
 	}
 	b := NewBox(p, Config{Root: root, Controller: "ctl.example:8090", ReadyTimeout: 200 * time.Millisecond,
-		Grace: 100 * time.Millisecond, CanaryTimeout: 2 * time.Second, SysEnv: []string{`SystemRoot=C:\Windows`, "EPS_KEY=sk-x"}})
+		Grace: 100 * time.Millisecond, CanaryTimeout: 2 * time.Second, SweepGrace: 300 * time.Millisecond, SysEnv: []string{`SystemRoot=C:\Windows`, "EPS_KEY=sk-x"}})
 	r := &rig{t: t, b: b, p: p, job: Job{Dir: dir, EnvDir: env, Interp: env + `\python.exe`, Entry: []string{"python", "main.py"},
 		Timeout: time.Minute, CheckEvery: 20 * time.Millisecond}}
 	if err := b.Check(); err != nil && p.healthErr == nil {
@@ -249,7 +290,7 @@ func TestRunHappyPathOrder(t *testing.T) {
 	if err != nil || res.ExitCode != 0 || res.Killed != "" {
 		t.Fatalf("%+v %v", res, err)
 	}
-	want := "grant start-sys audit start-hook audit start-job sweep revoke"
+	want := "grant start-sys procs audit start-hook audit start-job procs revoke"
 	if got := r.calls(); got != want {
 		t.Fatalf("顺序:\n got %s\nwant %s", got, want)
 	}
@@ -305,6 +346,10 @@ func TestGrantFailureRejectsAndRemovesDir(t *testing.T) {
 	if strings.Contains(r.calls(), "start") || r.b.Halted() != "" {
 		t.Fatalf("不起进程、不停接任务: %s %q", r.calls(), r.b.Halted())
 	}
+	if r.calls() != "grant revoke" {
+		t.Fatalf("设了一半的根 ACE 也要收回: %s", r.calls())
+	}
+	expectRetry(t, err, true)
 }
 
 func TestSysCanaryMismatchHalts(t *testing.T) {
@@ -319,11 +364,15 @@ func TestSysCanaryMismatchHalts(t *testing.T) {
 		if strings.Contains(r.calls(), "start-job") || strings.Contains(r.calls(), "start-hook") {
 			t.Fatalf("%s 不符就不再往下: %s", name, r.calls())
 		}
-		if !strings.HasSuffix(r.calls(), "sweep revoke") {
+		if !strings.HasSuffix(r.calls(), "procs revoke") {
 			t.Fatalf("拒了也要清场、收回权限: %s", r.calls())
 		}
 		if !strings.Contains(r.b.Halted(), "配置漂移") {
 			t.Fatalf("系统控制不符是本机的问题，要停接任务: %q", r.b.Halted())
+		}
+		expectRetry(t, err, true) // 本机的问题：主控换一台重跑，不算这个任务失败
+		if r.b.Check(); r.b.Halted() == "" {
+			t.Fatal("健康检查不查防火墙、ACL：只靠它不能恢复，重跑 install.ps1（会重启探针）才恢复")
 		}
 	}
 }
@@ -348,6 +397,7 @@ func TestHookCanaryMismatchRejectsWithoutHalting(t *testing.T) {
 		if r.b.Halted() != "" {
 			t.Fatalf("%s: 钩子不对是层的问题，不停接任务: %q", want, r.b.Halted())
 		}
+		expectRetry(t, err, false) // 换哪台都一样
 	}
 }
 
@@ -362,8 +412,9 @@ func TestLogonErrorHaltsOtherStartErrorDoesNot(t *testing.T) {
 	if !strings.Contains(r.b.Halted(), "登录") {
 		t.Fatalf("登录失败是本机配置问题，要停接任务: %q", r.b.Halted())
 	}
-	if err := r.b.Check(); err != nil || r.b.Halted() != "" {
-		t.Fatal("下一次健康检查通过就恢复")
+	expectRetry(t, err, true)
+	if r.b.Check(); r.b.Halted() == "" {
+		t.Fatal("健康检查不试登录：通过了也不算恢复（重跑 install.ps1 会重启探针）")
 	}
 
 	r = newRig(t, func(p *plat) { p.startErr["job"] = fmt.Errorf("包了一层: %w", &LogonError{Code: 1385}) })
@@ -373,18 +424,97 @@ func TestLogonErrorHaltsOtherStartErrorDoesNot(t *testing.T) {
 		t.Fatal("起任务时的登录错误也要停")
 	}
 
-	r = newRig(t, func(p *plat) { p.startErr["job"] = errors.New("AssignProcessToJobObject: 拒绝访问") })
+	r = newRig(t, func(p *plat) {
+		p.startErr["job"] = errors.New("CreateProcessWithLogonW: 系统找不到指定的文件")
+	})
+	_, err = r.run()
+	expectReject(t, err, "找不到")
+	if r.b.Halted() != "" {
+		t.Fatalf("这个任务的启动错误只拒这一个: %q", r.b.Halted())
+	}
+	expectRetry(t, err, false)
+
+	// 指派作业对象、恢复线程失败：本机的问题（seclogon 自己的作业对象之类），停接、换一台
+	r = newRig(t, func(p *plat) {
+		p.startErr["job"] = &MachineError{Err: errors.New("AssignProcessToJobObject: 拒绝访问")}
+	})
 	_, err = r.run()
 	expectReject(t, err, "AssignProcessToJobObject")
-	if r.b.Halted() != "" {
-		t.Fatalf("别的启动错误只拒这一个: %q", r.b.Halted())
+	if !strings.Contains(r.b.Halted(), "AssignProcessToJobObject") {
+		t.Fatalf("本机的启动错误要停接任务: %q", r.b.Halted())
 	}
+	expectRetry(t, err, true)
 }
 
 func TestAuditPipeFailureRejects(t *testing.T) {
 	r := newRig(t, func(p *plat) { p.auditErr = errors.New("管道已存在（被抢注）") })
 	_, err := r.run()
 	expectReject(t, err, "抢注")
+	if !strings.Contains(r.b.Halted(), "审计管道") {
+		t.Fatalf("管道建不出来是本机的问题，要停接任务: %q", r.b.Halted())
+	}
+	expectRetry(t, err, true)
+}
+
+func TestSweepMustSeeJobAccountProcesses(t *testing.T) {
+	// 非管理员的探针可能枚举不出别的账户进程的 SID：清场就是瞎的，查不到也会报"没有"。系统金丝雀活着时核对一次
+	r := newRig(t, func(p *plat) { p.hidden = true })
+	_, err := r.run()
+	expectReject(t, err, "看不到")
+	if !strings.Contains(r.b.Halted(), "看不到") || strings.Contains(r.calls(), "start-hook") {
+		t.Fatalf("看不到就停接、不往下: %q %s", r.b.Halted(), r.calls())
+	}
+	expectRetry(t, err, true)
+}
+
+func TestExitingProcessesWithinGraceDoNotHalt(t *testing.T) {
+	// TerminateJobObject 是异步的，conhost 也在收尾：结束后马上列一次会看到它们。宽限内消失的不算逃出
+	r := newRig(t, func(p *plat) { p.leftover = 2 })
+	if _, err := r.run(); err != nil {
+		t.Fatal(err)
+	}
+	if r.b.Halted() != "" || strings.Contains(r.calls(), "sweep") {
+		t.Fatalf("宽限内退出的不停接、不用杀: %q %s", r.b.Halted(), r.calls())
+	}
+}
+
+func TestStopDoesNotHangWhenAcceptIgnoresClose(t *testing.T) {
+	old := acceptWait
+	acceptWait = 100 * time.Millisecond
+	defer func() { acceptWait = old }()
+	srv := &stuckAudit{block: make(chan struct{})}
+	defer close(srv.block)
+	w := newWatcher(NewLog(1<<20), time.Second, time.Second, "x")
+	stop := serveAudit(srv, w)
+	done := make(chan struct{})
+	go func() { stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ConnectNamedPipe 叫不醒时 stop 不能一直等（节点会卡在 running）")
+	}
+}
+
+// stuckAudit 是 Close 叫不醒的 Accept（自连 5 次都没连上）。
+type stuckAudit struct{ block chan struct{} }
+
+func (s *stuckAudit) Accept() (io.ReadCloser, error) { <-s.block; return nil, errors.New("closed") }
+func (s *stuckAudit) Close() error                   { return nil }
+
+func TestLiveBlockedCount(t *testing.T) {
+	// 心跳里的 audit_blocked 要在运行中就涨，不是跑完才有（跑几个小时的任务）
+	r := newRig(t, nil)
+	var mu sync.Mutex
+	var got []int
+	r.job.OnBlocked = func(n int) { mu.Lock(); got = append(got, n); mu.Unlock() }
+	if _, err := r.run(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0] != 1 {
+		t.Fatalf("拦一次就报一次累计数: %v", got)
+	}
 }
 
 func TestJobWithoutReadyIsRejected(t *testing.T) {
@@ -422,14 +552,14 @@ func TestJobAuditDisconnectIsFailedNotRejected(t *testing.T) {
 }
 
 func TestLeftoverProcessesHaltUntilRestart(t *testing.T) {
-	r := newRig(t, nil)
-	r.p.sweepN = 2
+	r := newRig(t, func(p *plat) { p.leftover = -1 })
+	r.p.sweepN = 1
 	res, err := r.run()
 	if err != nil || res.ExitCode != 0 {
 		t.Fatalf("%+v %v", res, err)
 	}
-	if !strings.Contains(r.b.Halted(), "逃出") || len(res.Notes) == 0 {
-		t.Fatalf("要停接任务并发事件: %q %v", r.b.Halted(), res.Notes)
+	if !strings.Contains(r.b.Halted(), "逃出") || len(res.Notes) == 0 || !strings.HasSuffix(r.calls(), "sweep revoke") {
+		t.Fatalf("宽限过了还在：杀掉、停接任务并发事件: %q %v %s", r.b.Halted(), res.Notes, r.calls())
 	}
 	r.p.sweepN = 0
 	if r.b.Check(); r.b.Halted() == "" {
@@ -437,15 +567,61 @@ func TestLeftoverProcessesHaltUntilRestart(t *testing.T) {
 	}
 }
 
-func TestRevokeFailureHalts(t *testing.T) {
+func TestRevokeFailureQuarantinesDir(t *testing.T) {
+	// 收不回权限（任务建了把探针排除在外的受保护 DACL）：改名成猜不到的名字（jobs\ 对任务账户不可列），不停接
 	r := newRig(t, nil)
 	r.p.revokeErr = errors.New("拒绝访问")
 	res, err := r.run()
 	if err != nil {
 		t.Fatal(err) // 照常回传
 	}
-	if !strings.Contains(r.b.Halted(), "收回") || len(res.Notes) == 0 {
-		t.Fatalf("收不回权限，下一个任务能读这一份输出：要停: %q", r.b.Halted())
+	if r.b.Halted() != "" {
+		t.Fatalf("改名成功就不停接: %q", r.b.Halted())
+	}
+	if _, err := os.Stat(r.job.Dir); err == nil {
+		t.Fatal("原路径不能留着（任务号猜得到）")
+	}
+	if q := quarantined(t, r.b.Root); len(q) != 1 || len(res.Notes) == 0 {
+		t.Fatalf("要隔离一个目录并发事件: %v %v", q, res.Notes)
+	}
+	if res.Dir == "" || filepath.Dir(res.Dir) != filepath.Join(r.b.Root, "jobs") {
+		t.Fatalf("要告诉探针输出挪到哪了: %q", res.Dir)
+	}
+
+	// 改名也失败：重启前不接任务
+	r = newRig(t, nil)
+	r.p.revokeErr = errors.New("拒绝访问")
+	jobs := filepath.Join(r.b.Root, "jobs")
+	os.Chmod(jobs, 0o555)
+	defer os.Chmod(jobs, 0o755)
+	if _, err := r.run(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(r.b.Halted(), "收回") {
+		t.Fatalf("收不回也挪不走：要停: %q", r.b.Halted())
+	}
+}
+
+func quarantined(t *testing.T, root string) []string {
+	t.Helper()
+	ents, _ := os.ReadDir(filepath.Join(root, "jobs"))
+	var q []string
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), quarantinePrefix) {
+			if len(e.Name()) < len(quarantinePrefix)+32 {
+				t.Fatalf("隔离名要猜不到: %s", e.Name())
+			}
+			q = append(q, e.Name())
+		}
+	}
+	return q
+}
+
+func expectRetry(t *testing.T, err error, want bool) {
+	t.Helper()
+	var rj *RejectError
+	if !errors.As(err, &rj) || rj.Retry != want {
+		t.Fatalf("Retry 要是 %v: %#v", want, err)
 	}
 }
 
@@ -460,20 +636,32 @@ func TestFirstCheckRevokesLeftoverJobDirs(t *testing.T) {
 	if err := b.Check(); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(p.revoked, ",") != "a-1,b-2" || !strings.Contains(strings.Join(p.calls, " "), "sweep") {
-		t.Fatalf("探针启动时把 jobs\\* 收回一遍、清场: %v %v", p.revoked, p.calls)
+	if strings.Join(p.revoked, ",") != "a-1,b-2" || strings.Join(p.calls, " ") != "revoke revoke sweep health" {
+		t.Fatalf("探针启动时先把 jobs\\* 收回一遍、清场，再健康检查（建桌面）: %v %v", p.revoked, p.calls)
 	}
 	b.Check()
 	if len(p.revoked) != 2 {
 		t.Fatal("只在第一次做")
 	}
 
+	// 启动时收不回：隔离，不停接（以前是每次重启都再失败一次，永远停接）
 	p = goodPlat("x")
 	p.revokeErr = errors.New("拒绝访问")
 	b = NewBox(p, Config{Root: root, Controller: "c:1"})
 	b.Check()
-	if !strings.Contains(b.Halted(), "收回") {
-		t.Fatalf("启动时收不回也要停: %q", b.Halted())
+	if b.Halted() != "" || len(quarantined(t, root)) != 2 {
+		t.Fatalf("启动时收不回的隔离掉: %q %v", b.Halted(), quarantined(t, root))
+	}
+
+	// 第一次健康检查不过（还没有 SID）也照样清场；以后不再重做
+	p = goodPlat("x")
+	p.healthErr = errors.New("找不到账户")
+	b = NewBox(p, Config{Root: t.TempDir(), Controller: "c:1"})
+	b.Check()
+	p.healthErr = nil
+	b.Check()
+	if n := strings.Count(strings.Join(p.calls, " "), "sweep"); n != 1 {
+		t.Fatalf("启动清场做且只做一次: %v", p.calls)
 	}
 }
 
@@ -504,6 +692,26 @@ func TestNewOffWindowsIsUnavailable(t *testing.T) {
 	}
 	if s.Halted() == "" {
 		t.Fatal("非 Windows 构建没有真实现")
+	}
+}
+
+func TestSelfTestCountsSweepAndRevoke(t *testing.T) {
+	r := newRig(t, nil)
+	r.p.revokeErr = errors.New("拒绝访问")
+	var out strings.Builder
+	if err := r.b.SelfTest(context.Background(), r.job.EnvDir, &out); err == nil || !strings.Contains(out.String(), "revoke") {
+		t.Fatalf("收不回权限也算自检没过: %v\n%s", err, out.String())
+	}
+}
+
+func TestSelfTestRefusesWhileJobRunning(t *testing.T) {
+	// 自检最后清场会杀掉任务账户的所有进程：探针正在跑任务时不许跑
+	r := newRig(t, nil)
+	r.p.setAlive(4242, true)
+	var out strings.Builder
+	err := r.b.SelfTest(context.Background(), r.job.EnvDir, &out)
+	if err == nil || !strings.Contains(err.Error(), "先停") || strings.Contains(r.calls(), "sweep") {
+		t.Fatalf("有任务账户的进程在跑就不自检: %v %s", err, r.calls())
 	}
 }
 

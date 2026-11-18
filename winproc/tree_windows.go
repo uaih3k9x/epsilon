@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -12,6 +13,7 @@ var (
 	ntdll              = syscall.NewLazyDLL("ntdll.dll")
 	ntResumeProcess    = ntdll.NewProc("NtResumeProcess")
 	terminateJobObject = kernel32job.NewProc("TerminateJobObject")
+	queryJobObject     = kernel32job.NewProc("QueryInformationJobObject")
 	getExitCodeProcess = kernel32job.NewProc("GetExitCodeProcess")
 )
 
@@ -79,13 +81,34 @@ func (t *Tree) Kill() {
 	}
 }
 
-// Close 在主进程结束后调：杀掉树里剩下的进程，释放作业对象。
+// Close 在主进程结束后调：杀掉树里剩下的进程，等它们真的退出（TerminateJobObject 是异步的，最多 5 秒），释放作业对象。
+// 不等的话紧接着的清场会把正在退出的进程当成逃出作业的。
 func (t *Tree) Close() {
 	if t.job != 0 {
 		t.Kill()
+		for deadline := time.Now().Add(5 * time.Second); t.active() > 0 && time.Now().Before(deadline); {
+			time.Sleep(20 * time.Millisecond)
+		}
 		syscall.CloseHandle(t.job)
 		t.job = 0
 	}
+}
+
+// jobAccounting 是 JOBOBJECT_BASIC_ACCOUNTING_INFORMATION。
+type jobAccounting struct {
+	TotalUserTime, TotalKernelTime                     int64
+	ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime int64
+	TotalPageFaultCount, TotalProcesses                uint32
+	ActiveProcesses, TotalTerminatedProcesses          uint32
+}
+
+// active 是作业里还活着的进程数；查不了按 0 算（不卡住 Close）。
+func (t *Tree) active() uint32 {
+	var info jobAccounting
+	if r, _, _ := queryJobObject.Call(uintptr(t.job), 1, uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info), 0); r == 0 { // JobObjectBasicAccountingInformation
+		return 0
+	}
+	return info.ActiveProcesses
 }
 
 // Alive 判断进程还在不在（测试用）。

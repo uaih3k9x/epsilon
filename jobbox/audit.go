@@ -61,6 +61,8 @@ type Log struct {
 	blocked   map[string]int
 	logged    map[string]int
 	counts    map[string]map[int]int // 事件 → pid → 最大累计次数
+	nBlocked  int
+	onBlock   func(total int) // 每拦一次调一次（锁外）；nil = 不报
 }
 
 func NewLog(max int) *Log {
@@ -94,7 +96,16 @@ func (l *Log) Add(line []byte) (Record, error) {
 		return r, err
 	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
+	total, cb := l.add(line, r), l.onBlock
+	l.mu.Unlock()
+	if r.Act == "block" && cb != nil {
+		cb(total)
+	}
+	return r, nil
+}
+
+// add 在锁里记一条，返回累计拦截次数。
+func (l *Log) add(line []byte, r Record) int {
 	if !l.truncated && l.buf.Len()+len(line)+1 <= l.max {
 		l.buf.Write(line)
 		l.buf.WriteByte('\n')
@@ -106,6 +117,7 @@ func (l *Log) Add(line []byte) (Record, error) {
 		l.ready[r.Pid] = r
 	case "block":
 		l.blocked[r.Ev]++
+		l.nBlocked++
 	case "log":
 		l.logged[r.Ev]++
 	case "count":
@@ -116,7 +128,7 @@ func (l *Log) Add(line []byte) (Record, error) {
 		}
 		m[r.Pid] = max(m[r.Pid], r.N)
 	}
-	return r, nil
+	return l.nBlocked
 }
 
 // Summary 按主进程 pid 汇总。

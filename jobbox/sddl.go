@@ -10,6 +10,9 @@ const (
 	maskExecute = "0x20"
 	// maskReadControl 是 OWNER RIGHTS 那条：所有者的隐含权限只剩 READ_CONTROL，改不了自己文件的 DACL。
 	maskReadControl = "0x20000"
+	// maskTraverse 是目录上的 FILE_TRAVERSE（和文件上的 FILE_EXECUTE 同一位）。只用 CI 给目录：
+	// SetCurrentDirectory（lpCurrentDirectory、os.chdir）以它打开目标目录本身，SeChangeNotify 只免中间各级。
+	maskTraverse = "0x20"
 )
 
 // PathSD 是任务目录里一处要设的安全描述符（SDDL）。按切片顺序设：根在最前。
@@ -26,7 +29,7 @@ var Writable = []string{"output", "tmp"}
 func rootSD(probeSID, jobSID string) string {
 	s := "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;" + probeSID + ")"
 	if jobSID != "" {
-		s += "(A;OICI;FR;;;" + jobSID + ")"
+		s += "(A;OICI;FR;;;" + jobSID + ")(A;CI;" + maskTraverse + ";;;" + jobSID + ")"
 	}
 	return s + "(A;OICI;" + maskReadControl + ";;;OW)"
 }
