@@ -36,6 +36,10 @@ type Config struct {
 	ChunkDir     string `json:"chunk_dir"`      // 块缓存；默认 <artifact_root>/chunks，相对路径按 artifact_root 算
 	ChunkQuotaGB int64  `json:"chunk_quota_gb"` // 块缓存配额；默认 100
 	P2PPort      int    `json:"p2p_port"`       // 分块服务端口；没写 = 47100，写 0 = 不开
+
+	// 批任务（docs/jobs.md）
+	Jobs       bool  `json:"jobs"`        // 能力 32：执行签名任务包。默认关；上线前必须先做专用账户和出站防火墙（issue #1 第 4 步）
+	JobKeyring *bool `json:"job_keyring"` // 能力 33：拉任务钥匙环、记住最高版本号。默认开
 }
 
 // LoadConfig 读本机配置；extra 是引导器槽里随本体发布的工作负载表，同名的覆盖本机配置，文件不存在就跳过。

@@ -110,6 +110,8 @@ type Agent struct {
 
 	hmu              sync.Mutex // /v1/have 一次一个，没报出去的攒着
 	haveAdd, haveDel []string
+
+	jobState // 批任务（jobs.go）
 }
 
 func NewAgent(cfg Config, sys System, version string) *Agent {
@@ -165,6 +167,9 @@ func (a *Agent) Step(now time.Time) {
 	}
 	if !a.artifactsReady(now) && mode != Stop { // 不跑的时候也要拉：趁没人用、在时段外先备好
 		mode, why = Stop, "fetching"
+	}
+	if a.stepJob(now) { // 派了批任务先停推理，不跟自己抢显卡
+		mode, why = Stop, "batch_job"
 	}
 	if why == "foreign_vram" {
 		a.vram.waiting = true // 卸载之后要等显存空出来才装回去
@@ -321,7 +326,8 @@ func (a *Agent) register() {
 		names = append(names, n)
 	}
 	req := proto.Register{Node: a.cfg.Node, Version: a.version, Boot: a.Boot, Hostname: host,
-		GPUs: a.sys.GPUs(), MemoryMB: a.sys.MemFreeMB(), Workload: names, P2PPort: a.p2pPort}
+		GPUs: a.sys.GPUs(), MemoryMB: a.sys.MemFreeMB(), Workload: names, P2PPort: a.p2pPort,
+		Jobs: a.cfg.Jobs, Job: a.jobStatus()}
 	if a.Chunks != nil {
 		req.Chunks = a.Chunks.List() // 主控以此重置这台的块表，之后靠 /v1/have 增量
 	}
@@ -337,7 +343,7 @@ func (a *Agent) heartbeat(obs Observed) bool {
 	st := a.sup.Status()
 	hb := proto.Heartbeat{Node: a.cfg.Node, Version: a.version, Boot: a.Boot, IdleSeconds: obs.IdleSeconds,
 		ForeignGPU: obs.ForeignGPU, GPUs: a.gpus, MemFreeMB: a.sys.MemFreeMB(),
-		Running: st.Name, Reason: a.reason, Disk: a.disk()}
+		Running: st.Name, Reason: a.reason, Disk: a.disk(), Jobs: a.cfg.Jobs, Job: a.jobStatus()}
 	if st.Healthy && a.mode == Run { // 保温档：模型在显存里，但不接新请求
 		hb.Serving = &proto.Serving{Model: st.Model, Port: st.Port}
 	}
@@ -381,6 +387,7 @@ func (a *Agent) post(path string, body, out any) error {
 		return err
 	}
 	defer r.Body.Close()
+	a.noteDate(r.Header.Get("Date"))
 	if r.StatusCode == http.StatusConflict {
 		return errUnknownNode
 	}
@@ -397,6 +404,7 @@ func (a *Agent) post(path string, body, out any) error {
 
 // Shutdown 退出前停掉工作负载、后台拉取和分块服务。
 func (a *Agent) Shutdown() {
+	a.stopJob()
 	a.stopFetch()
 	if a.p2pSrv != nil {
 		a.p2pSrv.Close()

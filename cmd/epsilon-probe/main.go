@@ -69,6 +69,10 @@ func main() {
 	a := probe.NewAgent(cfg, probe.RealSystem{}, version)
 	a.Boot = *bootArg
 	a.LogPath = *logPath
+	a.JobRoots = l.Keys // 任务钥匙环和本体发布同一套根公钥（docs/jobs.md）
+	if cfg.Jobs {
+		log.Printf("批任务执行已开（能力 32）。上线前必须先做专用低权限账户和出站防火墙（issue #1 第 4 步）")
+	}
 	if *confirm != "" {
 		a.OnOnline = func() {
 			if err := os.WriteFile(*confirm, []byte(version), 0o644); err != nil {
