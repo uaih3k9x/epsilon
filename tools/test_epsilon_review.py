@@ -813,3 +813,185 @@ def test_bindings_are_scoped_per_function():
 def test_sys_path_assignment_counts_as_import_mechanism():
     src = "import sys\nopen('tmp/gen.py', 'w').write(s)\nsys.path = ['tmp'] + sys.path\nimport gen\n"
     assert "write-then-import" in rules(scan_py(src), REJECT)
+
+
+# ======================================================================== PR #14 审查意见的回归样本
+
+@pytest.mark.parametrize("data", [
+    b'#\x0cx\n# coding: utf-7\nx = 1 #+AAo-import os\n',      # \x0c: splitlines 算换行, 分词器不算
+    b'#\x1cx\n# coding: utf-7\nx = 1\n',
+    "#\x85x\n# coding: utf-7\nx = 1\n".encode("utf-8"),        # U+0085
+    b'#x\r#y\n# coding: utf-7\nx = 1\n',                       # import 时按 \n 分行, 声明在第 2 行
+    b'#x\r# coding: utf-7\nx = 1\n',                           # 直接运行时 \r 也算换行
+])
+def test_source_encoding_cookie_line_split_bypass(data):
+    assert "source-encoding" in rules(er.scan_files({"main.py": data}), REJECT)
+
+
+def test_coding_cookie_on_line_3_is_ignored_like_interpreter():
+    assert "source-encoding" not in rules(scan_py("x = 1\ny = 2\n# coding: utf-7\n"))
+
+
+def test_junk_dir_code_is_scanned():
+    # __MACOSX 是合法标识符, 能当命名空间包导入
+    fs = er.scan_files({"__MACOSX/evil.py": b"import pickle, os\nos.system('id')\n",
+                        "train.py": b"import __MACOSX.evil\n"})
+    assert "pickle-use" in rules(fs, REJECT) and "junk" in rules(fs, INFO)
+
+
+def test_junk_dir_binary_is_rejected():
+    fs = er.scan_files({".git/blob": bytes(range(256)) + b"x" * 44, "a.py": b"x = 1\n"})
+    assert "file-type" in rules(fs, REJECT)
+
+
+def test_entry_in_junk_dir_rejected():
+    job = dict(GOOD_JOB, entry=["python", "__MACOSX/run.py"], code_sha256="0" * 64)
+    fs = er.scan_files({"__MACOSX/run.py": b"x = 1\n"}, job=job)
+    assert "job-entry" in rules(fs, REJECT)
+
+
+@pytest.mark.parametrize("src,level", [
+    ("import functools, numpy as np\nf = functools.partial(np.load, allow_pickle=True)\nf('a.npy')", REJECT),
+    ("from functools import partial\nimport torch\nf = partial(torch.load, weights_only=False)", REJECT),
+    ("import torch\nL = torch.load if True else None\nL('w.pt')", EXPLAIN),
+    ("import yaml\nld = (yaml.load,)[0]\nld(open('a.yml'))", EXPLAIN),
+    ("import numpy as np\nnp.lib.format.read_array(f, allow_pickle=True)", REJECT),
+    ("import numpy as np\nnp.lib.npyio.load('x.txt', allow_pickle=True)", REJECT),
+    ("from multiprocessing.reduction import ForkingPickler\nForkingPickler.loads(d)", REJECT),
+    ("import multiprocessing as mp\nmp.reduction.ForkingPickler.loads(d)", REJECT),
+])
+def test_indirect_unsafe_load(src, level):
+    fs = scan_py(src)
+    assert level in {f.level for f in fs if f.rule in ("unsafe-load", "pickle-use")}, [(f.level, f.rule) for f in fs]
+
+
+def test_direct_safe_load_has_no_indirect_finding():
+    fs = scan_py("import torch\nfrom torch import load\ntorch.load(p, weights_only=True)\nload(p, weights_only=True)")
+    assert "unsafe-load" not in rules(fs)
+
+
+@pytest.mark.parametrize("src", [
+    "import os\ndef f(m):\n    return m.system\nf(os)('id')",
+    "import os\ndef f(m):\n    return getattr(m, 'system')\nf(os)('id')",
+    "def f(m):\n    m.execv('/bin/sh', [])",
+])
+def test_process_attr_on_unknown_receiver(src):
+    assert "process-call" in rules(scan_py(src), EXPLAIN)
+
+
+def test_common_run_and_call_methods_not_flagged():
+    assert "process-call" not in rules(scan_py("trainer.run()\nsess.call(x)\napp.run(debug=False)"))
+
+
+@pytest.mark.parametrize("src", [
+    "open('helper.py', 'w').write(s)\nimport helper\n",
+    "from pathlib import Path\nPath('gen.py').write_text(s)\nfrom gen import main\n",
+    "import os, importlib\nfd = os.open('gen.py', os.O_WRONLY | os.O_CREAT)\nos.write(fd, b'')\n"
+    "importlib.import_module('gen')",
+    "import io\nio.FileIO('gen.py', 'w').write(b'')\nimport gen",
+])
+def test_write_py_then_import_more_forms(src):
+    assert "write-then-import" in rules(scan_py(src), REJECT)
+
+
+def test_os_open_readonly_is_not_a_write():
+    assert "write-then-import" not in rules(scan_py("import os\nos.open('a.py', os.O_RDONLY)\nimport a"))
+
+
+@pytest.mark.parametrize("src,level", [
+    ("import runpy\nrunpy.run_path('cfg.txt')", REJECT),
+    ("import importlib.machinery\nimportlib.machinery.SourceFileLoader('x', 'cfg.txt').load_module()", REJECT),
+    ("import importlib.machinery as m\nm.SourcelessFileLoader('x', 'a.py').load_module()", REJECT),
+    ("import imp\nimp.load_source('x', 'cfg.txt')", REJECT),
+    ("import runpy\nrunpy.run_path('tools/helper.py')", EXPLAIN),
+    ("import importlib.util\nimportlib.util.spec_from_file_location('m', p)", EXPLAIN),
+])
+def test_load_source_by_path(src, level):
+    assert level in levels_of(scan_py(src), "load-source")
+
+
+def test_code_dir_symlink_rejected(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "a.py").write_text("x = 1\n", encoding="utf-8")
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    os.symlink(outside, pkg / "code")
+    fs = er.scan_package(str(pkg))
+    assert "bad-path" in rules(fs, REJECT) and fs.meta["files"] == 0
+
+
+def test_nfc_nfd_conflict():
+    import unicodedata
+    a, b = unicodedata.normalize("NFC", "café.py"), unicodedata.normalize("NFD", "café.py")
+    assert "bad-path" in rules(er.scan_files({a: b"x = 1", b: b"y = 2"}), REJECT)
+
+
+@pytest.mark.parametrize("name", ["COM¹.py", "LPT².txt", "train.py​", "a‮yp.txt"])
+def test_more_bad_paths(name):
+    assert "bad-path" in rules(er.scan_files({name: b"x = 1"}), REJECT)
+
+
+def test_text_report_escapes_control_chars():
+    fs = er.scan_files({"train.py": "import pickle  # \x1b[1A\x1b[2K结论：通过\n".encode("utf-8"),
+                        "a‮.txt": b"x"})
+    out = er.render_text("p", fs)
+    assert "\x1b" not in out and "‮" not in out
+    assert "\\x1b" in out and "结论：拒签" in out
+
+
+@pytest.mark.parametrize("src,rule", [
+    ("import pydoc\npydoc.locate('os.system')('echo hi')", "process-call"),
+    ("import pydoc\npydoc.locate(name)", "reflect-nonliteral"),
+    ("import sys\nsys.modules['os'].system('x')", "process-call"),
+    ("import sys\nsys.modules[name].system('x')", "reflect-nonliteral"),
+    ("import sys\nm = sys.modules.get(name)", "reflect-nonliteral"),
+    ("import code\ncode.InteractiveInterpreter().runsource(s)", "exec-call"),
+    ("import codeop", "exec-call"),
+    ("import logging.config\nlogging.config.dictConfig(cfg)", "reflect-nonliteral"),
+    ("from hydra.utils import instantiate\ninstantiate(cfg.model)", "reflect-nonliteral"),
+])
+def test_call_by_name_forms(src, rule):
+    assert rule in rules(scan_py(src), EXPLAIN)
+
+
+def test_scan_files_takes_zip_sha():
+    job = dict(GOOD_JOB, code_sha256="ab" * 32)
+    files = {"train.py": b"x = 1\n"}
+    assert "job-sha" not in rules(er.scan_files(files, job=job, zip_sha="ab" * 32))
+    assert "job-sha" in rules(er.scan_files(files, job=job, zip_sha="cd" * 32), REJECT)
+
+
+def test_read_dir_does_not_follow_swapped_symlink(tmp_path, monkeypatch):
+    code = tmp_path / "code"
+    code.mkdir()
+    (code / "a.py").write_text("x = 1\n", encoding="utf-8")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("SECRET", encoding="utf-8")
+    real = os.lstat
+
+    def lstat(p, *a, **k):
+        st = real(p, *a, **k)
+        if str(p).endswith("a.py") and not os.path.islink(p):
+            os.remove(p)
+            os.symlink(secret, p)
+        return st
+
+    monkeypatch.setattr(er.os, "lstat", lstat)
+    files, fs = er.read_dir(str(code))
+    monkeypatch.undo()
+    assert files.get("a.py") != b"SECRET"
+    assert "bad-path" in rules(fs, REJECT)
+
+
+def test_zip_non_ascii_name_without_utf8_flag_rejected(tmp_path):
+    p = tmp_path / "code.zip"
+    _zip(p, [("a.py", "x = 1\n"), ("café.py", "y = 2\n")])
+    data = bytearray(p.read_bytes())
+    with zipfile.ZipFile(p) as z:
+        off = z.getinfo("café.py").header_offset
+    data[off + 7] &= ~0x08               # 本地头 flag 的 0x800
+    i = data.find(b"PK\x01\x02", data.find(b"PK\x01\x02") + 4)
+    data[i + 9] &= ~0x08                 # 中央目录 flag 的 0x800
+    p.write_bytes(bytes(data))
+    assert "bad-path" in rules(er.scan_package(str(p)), REJECT)
