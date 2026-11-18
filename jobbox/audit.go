@@ -249,9 +249,7 @@ func (w *watcher) Serve(r io.Reader) {
 			return
 		case pid == 0:
 			pid = rec.Pid
-			if !w.send(auditEvent{kind: evReady, pid: pid}) {
-				return
-			}
+			w.send(auditEvent{kind: evReady, pid: pid}) // watcher 停了也接着读，记录照样进 Log
 		}
 	}
 }
