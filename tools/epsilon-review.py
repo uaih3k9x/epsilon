@@ -795,9 +795,18 @@ class _PyScan:
 
     def _check_call(self, node, parent, writes_py):
         fq = self.resolve(node.func)
-        import_mech = False
-        term = node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id if isinstance(node.func, ast.Name) else ""
+        f = node.func
+        term = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
+        import_mech = self._check_reflect(node, fq)
+        self._check_namespace(node, fq, parent)
+        self._check_deserialize(node, fq, term)
+        self._check_decode(node, fq, term)
+        self._check_writes(node, fq, term, writes_py)
+        self._check_download_kw(node, fq, term)
+        return self._check_mutation(node, fq) or import_mech
 
+    def _check_reflect(self, node, fq):
+        import_mech = False
         for q in fq & set(_REFLECT):
             arg = self._arg(node, _REFLECT[q])
             s = _const_str(arg)
@@ -821,15 +830,18 @@ class _PyScan:
                 else:
                     self.add(INFO, "reflect-literal", node, f"{q}({_const_str(arg)!r})", "能直接 import 就直接写")
                 import_mech = True
+        return import_mech
 
-        # globals() / locals() / vars() 被下标访问、取属性或传给别的函数
+    def _check_namespace(self, node, fq, parent):
+        """globals() / locals() / vars() 被下标访问、取属性或传给别的函数"""
         if fq & {"builtins.globals", "builtins.locals", "builtins.vars"}:
             if (isinstance(parent, (ast.Subscript, ast.Attribute)) and parent.value is node) or \
                     (isinstance(parent, ast.Call) and node is not parent.func) or isinstance(parent, ast.keyword):
                 self.add(EXPLAIN, "namespace-access", node, "按名字访问命名空间（globals/locals/vars）",
                          "写死的字典分派，别按名字取全局对象")
 
-        # 反序列化
+    def _check_deserialize(self, node, fq, term):
+        """反序列化"""
         if fq & {"torch.load", "torch.serialization.load"}:
             wo = self._kw(node, "weights_only")
             if isinstance(wo, ast.Constant) and wo.value is True:
@@ -869,7 +881,8 @@ class _PyScan:
         if term in ("to_pickle", "read_pickle") and isinstance(node.func, ast.Attribute) and not fq & {"pandas.read_pickle"}:
             self.add(REJECT, "pickle-use", node, f".{term}() 是 pickle 读写", _PICKLE_HINT)
 
-        # 字符串还原：.decode("rot13") 之类，"".join(chr(...) ...)，bytes([..很多整数..])
+    def _check_decode(self, node, fq, term):
+        """字符串还原：.decode("rot13") 之类，"".join(chr(...) ...)，bytes([..很多整数..])"""
         if term == "decode" and isinstance(node.func, ast.Attribute):
             codec = _const_str(self._arg(node, 0, "encoding"))
             if codec and codec.lower().replace("-", "_") in _DECODE_CODECS:
@@ -882,7 +895,8 @@ class _PyScan:
             if sum(isinstance(e, ast.Constant) and isinstance(e.value, int) for e in node.args[0].elts) >= 8:
                 self.add(EXPLAIN, "string-decode", node, "用整数列表拼字节串", _DECODE_HINT)
 
-        # 写文件：写到任务目录以外、写 .py
+    def _check_writes(self, node, fq, term, writes_py):
+        """写文件：写到任务目录以外、写 .py"""
         path = mode = None
         unknown_mode_writes = False
         if fq & _OPENERS:
@@ -914,7 +928,8 @@ class _PyScan:
                     self.add(EXPLAIN, "write-outside", node, f"{q} 没给 dir：会写到系统临时目录 %TEMP%",
                              "加 dir=TMP（ROOT / \"tmp\"）")
 
-        # 框架下载
+    def _check_download_kw(self, node, fq, term):
+        """框架下载"""
         if term in _DOWNLOADERS or fq & {"torch.hub.load"}:
             self._check_download(node, term, fq)
         for k in node.keywords:
@@ -924,7 +939,9 @@ class _PyScan:
                 self.add(EXPLAIN, "download", node, "trust_remote_code：会执行模型目录里带的 Python 代码，审核人没读过",
                          "去掉 trust_remote_code")
 
-        # 改导入路径和环境变量：sys.path.insert(...)、os.environ.update(PATH=...)、os.putenv("PATH", ...)
+    def _check_mutation(self, node, fq):
+        """改导入路径和环境变量：sys.path.insert(...)、os.environ.update(PATH=...)、os.putenv("PATH", ...)"""
+        import_mech = False
         if isinstance(node.func, ast.Attribute) and node.func.attr in _MUTATORS:
             for q in self.resolve(node.func.value):
                 if q in _IMPORT_STATE:
@@ -1009,8 +1026,9 @@ def _param_uses(scan, tree):
         key = None
         if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id in loads:
             key = _const_str(node.slice)
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("get", "pop", "setdefault") \
-                and isinstance(node.func.value, ast.Name) and node.func.value.id in loads and node.args:
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.args \
+                and node.func.attr in ("get", "pop", "setdefault") \
+                and isinstance(node.func.value, ast.Name) and node.func.value.id in loads:
             key = _const_str(node.args[0])
         if key is not None:
             line = node.lineno
