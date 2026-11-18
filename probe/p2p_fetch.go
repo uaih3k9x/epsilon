@@ -316,6 +316,12 @@ func (a *Agent) reportHave(add, del []string) {
 	// 同一块先加后删只报删、先删后加只报加：主控收到时不用管先后
 	a.haveAdd = without(merge(a.haveAdd, add), del)
 	a.haveDel = without(merge(a.haveDel, del), add)
+	// 持着 hmu 再看一眼缓存：add 由后台合并上报，可能晚于同一块被淘汰时报的 del。
+	// 已经不在的不报 add；淘汰发生在这之后的话，它的 del 要等 hmu，一定排在这次后面。
+	a.haveAdd = slices.DeleteFunc(a.haveAdd, func(h string) bool { return !a.Chunks.Has(h) })
+	if len(a.haveAdd) == 0 && len(a.haveDel) == 0 {
+		return
+	}
 	err := a.post("/v1/have", proto.Have{Node: a.cfg.Node, Add: a.haveAdd, Del: a.haveDel}, nil)
 	switch {
 	case err == errUnknownNode:

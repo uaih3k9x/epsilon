@@ -290,6 +290,9 @@ func TestReportHave(t *testing.T) {
 	e := newFetchEnv(t, 0)
 	a := e.a
 	a.registered.Store(true)
+	for _, h := range []string{"aa", "bb", "cc", "dd"} { // 报 add 时块得还在缓存里
+		e.store.data[h] = []byte(h)
+	}
 
 	e.fc.haveCode = http.StatusInternalServerError
 	a.reportHave([]string{"aa"}, nil)

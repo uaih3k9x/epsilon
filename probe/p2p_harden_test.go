@@ -96,7 +96,7 @@ func TestFetchNeighborSendsOtherChunk(t *testing.T) {
 	e.checkStore(t)
 }
 
-// 疑点 3：邻居一直灌数据（或报一个超大的 Content-Length），不能等到 sourceTimeout，
+// 邻居一直灌数据（或报一个超大的 Content-Length），不能等到 sourceTimeout，
 // 也不能把临时文件写满磁盘：超过清单块大小就断。用真的 chunk.Store 看磁盘。
 func TestFetchRejectsOversizedBody(t *testing.T) {
 	cases := map[string]func(w http.ResponseWriter, stop <-chan struct{}){
@@ -281,7 +281,7 @@ func TestBlacklistConcurrent(t *testing.T) {
 	}
 }
 
-// 疑点 2：本地有一块坏了（大小不变，内容不对）。Has 说有，所以不会去取；
+// 本地有一块坏了（大小不变，内容不对）。Has 说有，所以不会去取；
 // 拼装发现整文件不对。要在这次拉取里把坏块删掉、经 have.del 报给主控、重新取、拼成。
 func TestFetchHealsCorruptLocalChunk(t *testing.T) {
 	src, master := t.TempDir(), t.TempDir()
@@ -352,7 +352,7 @@ func TestCapReaderBoundary(t *testing.T) {
 	}
 }
 
-// 疑点 5：主控的 /v1/have 卡住时，并发取块不能跟着停（以前每个 worker 取到一块就排队等同一把锁里的 HTTP）。
+// 主控的 /v1/have 卡住时，并发取块不能跟着停（以前每个 worker 取到一块就排队等同一把锁里的 HTTP）。
 // 卡住期间取到的块攒着，主控恢复后一起报。
 func TestPullNotBlockedBySlowHave(t *testing.T) {
 	e := newFetchEnv(t, 8)
@@ -389,5 +389,19 @@ func TestPullNotBlockedBySlowHave(t *testing.T) {
 	}
 	if got, want := e.haveAdds(), sorted(e.hashes()); fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("恢复后 have 应该补齐全部块: %v", got)
+	}
+}
+
+// 报 have 的 add 交给后台合并上报后，可能晚于同一块的 del（取到后马上被另一个拉取淘汰）。
+// 报的时候块已经不在缓存里就不报 add，不然主控会把这台排成一块它没有的来源。
+func TestReportHaveSkipsAddForEvictedChunk(t *testing.T) {
+	e := newFetchEnv(t, 2)
+	gone, kept := e.hashes()[0], e.hashes()[1]
+	if err := e.store.Put(kept, bytes.NewReader(e.data[kept])); err != nil {
+		t.Fatal(err)
+	}
+	e.a.reportHave([]string{gone, kept}, nil)
+	if got := e.haveAdds(); fmt.Sprint(got) != fmt.Sprint([]string{kept}) {
+		t.Fatalf("只该报缓存里还在的块: %v", got)
 	}
 }

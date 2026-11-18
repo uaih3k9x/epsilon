@@ -15,7 +15,7 @@ import (
 )
 
 // BenchmarkPullRound: 一个快邻居给 32 块（每块 256 KiB），4 个并发 worker；/v1/have 人为放慢，
-// 量"报 have 持锁做 HTTP"会不会把并发取块拖成串行（疑点 5）。
+// 量"报 have 持锁做 HTTP"会不会把并发取块拖成串行。
 func BenchmarkPullRound(b *testing.B) {
 	log.SetOutput(io.Discard)
 	defer log.SetOutput(os.Stderr)
