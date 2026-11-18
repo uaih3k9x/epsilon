@@ -38,7 +38,7 @@ type Config struct {
 	P2PPort      int    `json:"p2p_port"`       // 分块服务端口；没写 = 47100，写 0 = 不开
 
 	// 批任务（docs/jobs.md）
-	Jobs       bool  `json:"jobs"`        // 能力 32：执行签名任务包。默认关；上线前必须先做专用账户和出站防火墙（issue #1 第 4 步）
+	Jobs       bool  `json:"jobs"`        // 能力 32：执行签名任务包（一律经沙箱）。默认关；真机验证 docs/jobs-sandbox.md 第 7 节之前不要开
 	JobKeyring *bool `json:"job_keyring"` // 能力 33：拉任务钥匙环、记住最高版本号。默认开
 }
 
