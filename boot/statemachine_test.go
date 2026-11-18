@@ -246,16 +246,28 @@ func (w *smWorker) step(k smKey) (succ []smKey, errs []string) {
 	// 1. 消费 staged.json
 	accepted := b.consumeStaged()
 	k1, _ := w.read(b, k)
-	want := false
+	want, exp := false, k // exp：模型算出的消费后状态（整个 state 逐字段比，tries 也在内）
+	exp.Staged = ""
 	if s := k.Staged; s == "A" || s == "B" {
 		v := signedVersion(s, k.content(s))
 		want = s != k.Cur && v != "" && v != k.Bad
-		if accepted && (k1.Pend != s || k1.version(s) != v) {
-			fail("接受了 staged %s 但 state 没指向它: %v", s, k1)
+		if want && (k.Pend != s || k.version(s) != v) { // 同槽同版本是断电后的重放：tries 不能清零
+			exp.Pend, exp.Tries = s, 0
+			if s == "A" {
+				exp.VA = v
+			} else {
+				exp.VB = v
+			}
+			if exp.Good == s {
+				exp.Good = ""
+			}
 		}
 	}
 	if accepted != want {
 		fail("consumeStaged 返回 %v，模型认为 %v", accepted, want)
+	}
+	if k1 != exp {
+		fail("消费 staged 后 state 是 %v，模型认为 %v", k1, exp)
 	}
 	if _, err := os.Stat(filepath.Join(b.Root, StagedFile)); err == nil {
 		fail("I5: staged.json 没被消费")
