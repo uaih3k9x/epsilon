@@ -1,0 +1,3 @@
+go test fuzz v1
+[]byte("{\"manifest\":\"{\\n  \\\"version\\\": \\\"1.0\\\",\\n  \\\"min_boot\\\": 1,\\n  \\\"files\\\": null\\n}\",\"sig\":\"6MFQdfSVmnYAjAA37/6y14UHJ50FlkmOkGt/c8cwP5XI0YnxldFSQMj8wpr0/rEfLnzFaV3+1eAhBfzoMrt4Dw==\"}")
+[]byte("probe 1.0")

@@ -1,0 +1,3 @@
+go test fuzz v1
+[]byte("{\"manifest\":\"{\\n  \\\"version\\\": \\\"1.0\\\",\\n  \\\"min_boot\\\": 0,\\n  \\\"files\\\": [\\n    {\\n      \\\"path\\\": \\\"..\\\\\\\\epsilon-probe.exe\\\",\\n      \\\"size\\\": 9,\\n      \\\"sha256\\\": \\\"7bf869a3bcb22e15e1699a8979694e9f9d9639876ca0c8cec72441c70656e2a8\\\"\\n    }\\n  ]\\n}\",\"sig\":\"Ef/ezXv4NTqBViu3D09aVJx2Jrx6OLmC9BGik0YVj+yC0JW2r8KSemz9RewR06a2pMXY9CUq68qQKvbutaY1AA==\"}")
+[]byte("probe 1.0")
