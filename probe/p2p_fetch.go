@@ -3,6 +3,7 @@ package probe
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -52,19 +53,43 @@ func (a *Agent) fetchAs(ctx context.Context, id string, preload bool) error {
 	}
 	a.evict(keep) // 先腾地方
 	a.sendEvent(proto.Event{Kind: "fetch", Detail: fmt.Sprintf("%s %s: 缺 %d/%d 块", what, id, miss, len(chunkSet(m)))})
-	if err := a.pull(ctx, m); err != nil {
-		return err
-	}
-	a.evict(a.keepFor(m))
-	if preload {
-		a.sendEvent(proto.Event{Kind: "fetch", Detail: "预热完成 " + id})
-		return nil
-	}
-	if err := a.Assemble(m, a.cfg.ArtifactRoot); err != nil {
-		return fmt.Errorf("拼装 %s: %w", id, err)
+	for healed := false; ; healed = true {
+		if err := a.pull(ctx, m); err != nil {
+			return err
+		}
+		a.evict(a.keepFor(m))
+		if preload {
+			a.sendEvent(proto.Event{Kind: "fetch", Detail: "预热完成 " + id})
+			return nil
+		}
+		err := a.Assemble(m, a.cfg.ArtifactRoot)
+		if err == nil {
+			break
+		}
+		// 拼装时发现本地坏块会删掉（chunk.Assemble）：报给主控别再把这台排成来源，重取一次再拼。
+		// 只重来一次：再坏就是别的问题（清单写错、磁盘坏），按失败交给 fetchRetry。
+		lost := a.missing(m)
+		if len(lost) > 0 {
+			a.reportHave(nil, lost)
+		}
+		if len(lost) == 0 || healed {
+			return fmt.Errorf("拼装 %s: %w", id, err)
+		}
+		log.Printf("制品 %s 本地有 %d 块坏了，已删，重新取: %v", id, len(lost), err)
 	}
 	a.sendEvent(proto.Event{Kind: "fetch", Detail: "备齐 " + id})
 	return nil
+}
+
+// defaultChunkSize 和 chunk.DefaultChunkSize 一样：清单没写块大小时按它限回包长度。
+const defaultChunkSize = 64 << 20
+
+// chunkLimit: 清单里一块最多多大，邻居回包超过就断（坏邻居不能一直灌、写满磁盘）。
+func chunkLimit(m proto.Manifest) int64 {
+	if m.ChunkSize > 0 {
+		return m.ChunkSize
+	}
+	return defaultChunkSize
 }
 
 // checkManifest: 块 ID 会拼进 URL 和文件路径，不合法的整份不认。
@@ -118,7 +143,7 @@ func (a *Agent) pull(ctx context.Context, m proto.Manifest) error {
 		if err := a.get(ctx, "/v1/peers?"+q.Encode(), &p); err != nil {
 			return fmt.Errorf("问 peers: %w", err)
 		}
-		got, offered := a.pullRound(ctx, miss, p.Sources, bad)
+		got, offered := a.pullRound(ctx, miss, p.Sources, bad, chunkLimit(m))
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -145,10 +170,13 @@ func (a *Agent) pull(ctx context.Context, m proto.Manifest) error {
 	}
 }
 
-// pullRound 并发取一轮；每块按来源顺序试，取到一块就报 have。返回取到几块、有没有块给了来源。
-func (a *Agent) pullRound(ctx context.Context, miss []string, sources map[string][]string, bad *blacklist) (int, bool) {
+// pullRound 并发取一轮；每块按来源顺序试，取到一块就报 have（交给 haveBatcher，不等 HTTP）。
+// 返回取到几块、有没有块给了来源。
+func (a *Agent) pullRound(ctx context.Context, miss []string, sources map[string][]string, bad *blacklist, limit int64) (int, bool) {
 	var got atomic.Int32
 	var offered atomic.Bool
+	hb := a.startHaveBatcher()
+	defer hb.close()
 	work := make(chan string)
 	var wg sync.WaitGroup
 	for i := 0; i < a.fetchParallel; i++ {
@@ -163,11 +191,11 @@ func (a *Agent) pullRound(ctx context.Context, miss []string, sources map[string
 					if bad.blocked(src) || ctx.Err() != nil {
 						continue
 					}
-					err := a.pullChunk(ctx, src, h)
+					err := a.pullChunk(ctx, src, h, limit)
 					bad.record(src, err)
 					if err == nil {
 						got.Add(1)
-						a.reportHave([]string{h}, nil)
+						hb.add(h)
 						break
 					}
 					if ctx.Err() == nil {
@@ -190,8 +218,11 @@ feed:
 	return int(got.Load()), offered.Load()
 }
 
-// pullChunk 从一个来源取一块存进缓存（Put 边收边校验）。"" 是主控。
-func (a *Agent) pullChunk(ctx context.Context, src, h string) error {
+// errTooLong: 回包比清单的块大小还长。
+var errTooLong = errors.New("回包超过块大小上限")
+
+// pullChunk 从一个来源取一块存进缓存（Put 边收边校验）。"" 是主控。回包超过 limit 字节就断。
+func (a *Agent) pullChunk(ctx context.Context, src, h string, limit int64) error {
 	ctx, cancel := context.WithTimeout(ctx, a.sourceTimeout) // 卡住的邻居不能拖住这一块
 	defer cancel()
 	base := strings.TrimRight(src, "/")
@@ -211,7 +242,30 @@ func (a *Agent) pullChunk(ctx context.Context, src, h string) error {
 	if r.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", r.StatusCode)
 	}
-	return a.Chunks.Put(h, r.Body)
+	if r.ContentLength > limit {
+		return fmt.Errorf("Content-Length %d: %w", r.ContentLength, errTooLong)
+	}
+	return a.Chunks.Put(h, &capReader{r: r.Body, left: limit})
+}
+
+// capReader 读到超过 left 字节就报 errTooLong（多读 1 字节来判断）。
+type capReader struct {
+	r    io.Reader
+	left int64
+}
+
+func (c *capReader) Read(p []byte) (int, error) {
+	if c.left < 0 {
+		return 0, errTooLong
+	}
+	if int64(len(p)) > c.left+1 {
+		p = p[:c.left+1]
+	}
+	n, err := c.r.Read(p)
+	if c.left -= int64(n); c.left < 0 {
+		return n, errTooLong
+	}
+	return n, err
 }
 
 // blacklist: 同一来源连续失败 3 次（校验不过、超时、连不上都算），本次拉取就不再找它。
@@ -271,6 +325,52 @@ func (a *Agent) reportHave(add, del []string) {
 		return
 	}
 	a.haveAdd, a.haveDel = nil, nil
+}
+
+// haveBatcher 在后台替 worker 报新块：worker 只记下块名就回去接着取。上一次 POST 还没回来时
+// 取到的块攒着，和下一次一起报；主控不慢时和以前一样一块一报，主控慢或卡住时取块不跟着停。
+type haveBatcher struct {
+	mu      sync.Mutex
+	pending []string
+	kick    chan struct{} // 容量 1：有没报的块
+	done    chan struct{}
+}
+
+func (a *Agent) startHaveBatcher() *haveBatcher {
+	b := &haveBatcher{kick: make(chan struct{}, 1), done: make(chan struct{})}
+	go func() {
+		defer close(b.done)
+		flush := func() {
+			b.mu.Lock()
+			p := b.pending
+			b.pending = nil
+			b.mu.Unlock()
+			if len(p) > 0 {
+				a.reportHave(p, nil)
+			}
+		}
+		for range b.kick {
+			flush()
+		}
+		flush()
+	}()
+	return b
+}
+
+func (b *haveBatcher) add(h string) {
+	b.mu.Lock()
+	b.pending = append(b.pending, h)
+	b.mu.Unlock()
+	select {
+	case b.kick <- struct{}{}:
+	default: // 已经有一次在排队，会一起带走
+	}
+}
+
+// close 报完剩下的再返回。所有 add 都要在 close 之前。
+func (b *haveBatcher) close() {
+	close(b.kick)
+	<-b.done
 }
 
 // merge 把 more 加进 list（去重）。
