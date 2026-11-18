@@ -350,3 +350,18 @@ func FuzzAssembleManifest(f *testing.F) {
 		})
 	})
 }
+
+// 和块内容无关的失败（比如块拼到一半被外面删了）不该去逐块重算、更不该删好块。
+func TestAssembleOtherErrorKeepsChunks(t *testing.T) {
+	m, s, _ := buildFixture(t)
+	h := m.Files[0].Chunks[3]
+	os.Remove(chunkPath(s.dir, h)) // 表里还有，文件没了
+	if err := Assemble(m, s, t.TempDir()); err == nil || errors.Is(err, ErrHashMismatch) {
+		t.Fatalf("应报打不开块，不是哈希不符: %v", err)
+	}
+	for _, x := range m.Files[0].Chunks {
+		if x != h && !s.Has(x) {
+			t.Fatalf("好块 %s 被删了", x[:12])
+		}
+	}
+}

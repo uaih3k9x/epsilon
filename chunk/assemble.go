@@ -85,6 +85,9 @@ func lockDest(path string) *sync.Mutex {
 	return mu
 }
 
+// errSize: 拼出来的大小和清单不符。
+var errSize = errors.New("大小对不上")
+
 // testHookRenamed 不为 nil 时在成品改名就位之后调用（测试用来拉长并发窗口）。
 var testHookRenamed func(path string)
 
@@ -122,8 +125,8 @@ func assembleFile(f proto.ManifestFile, s *Store, path string) error {
 		return nil
 	}
 	err := writeFileFromChunks(f, s, path)
-	if err == nil {
-		return nil
+	if !errors.Is(err, ErrHashMismatch) && !errors.Is(err, errSize) {
+		return err // 成功，或者和块内容无关的错（缺块、磁盘满）：不用逐块重算
 	}
 	var bad []string
 	for _, h := range f.Chunks {
@@ -192,7 +195,7 @@ func copyChunks(w io.Writer, chunks []string, s *Store, size int64, sum string) 
 		}
 	}
 	if n != size {
-		return fmt.Errorf("大小 %d，清单说 %d", n, size)
+		return fmt.Errorf("大小 %d，清单说 %d: %w", n, size, errSize)
 	}
 	if hex.EncodeToString(hs.Sum(nil)) != sum {
 		return fmt.Errorf("整文件: %w", ErrHashMismatch)
