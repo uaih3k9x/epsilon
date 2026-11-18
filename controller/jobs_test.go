@@ -727,3 +727,20 @@ func TestJobMaxNodesZeroSubmitAccepted(t *testing.T) {
 		t.Fatalf("max_nodes 0 = 不限制，提交该收: %d %s", code, raw)
 	}
 }
+
+func TestJobNotAssignedWhenHeartbeatStopsAccepting(t *testing.T) {
+	// 探针登记时 jobs:true，之后沙箱停接任务（C: 被还原、金丝雀不符），心跳报 jobs:false：以心跳为准，不再派
+	r := newJobRig(t, nil)
+	r.register("pc-01", true, nil)
+	r.beat("pc-01", false, nil)
+	id := r.mustSubmit(map[string]any{"package": r.pkg(nil)})[0]
+	if d := r.beat("pc-01", false, nil); d.Job != nil {
+		t.Fatalf("心跳说停接任务就不能派: %+v", d.Job)
+	}
+	if v := r.job(id); v.State != "queued" {
+		t.Fatalf("要留在队列里: %+v", v)
+	}
+	if d := r.beat("pc-01", true, nil); d.Job == nil || d.Job.ID != id {
+		t.Fatalf("恢复后照常派: %+v", d.Job)
+	}
+}

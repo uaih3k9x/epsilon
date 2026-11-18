@@ -16,6 +16,7 @@ import (
 
 	"epsilon/boot"
 	"epsilon/chunk"
+	"epsilon/jobbox"
 	"epsilon/loader"
 	"epsilon/probe"
 	"epsilon/proto"
@@ -34,6 +35,7 @@ func main() {
 	bootArg := flag.String("boot", "", "引导器版本/槽位，原样上报；有它才在后台跑 loader")
 	root := flag.String("root", "", "引导器根目录（A/B 槽、boot-state.json）；默认 probe.json 所在目录")
 	seedOnly := flag.Bool("seed", false, "安装、救援用：跑一轮 loader 把版本放进槽就退出")
+	selftest := flag.String("sandbox-selftest", "", `只跑一遍批任务沙箱的健康检查和两次金丝雀，打印逐项结果就退出；参数是环境层目录（D:\epsilon\envs\<名字@版本>）`)
 	flag.Parse()
 	probe.RotateLog(*logPath, probe.ProbeLogMax) // 超了留一份 .1 再从头记；运行中由 Agent 每分钟再查
 	if f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
@@ -46,6 +48,9 @@ func main() {
 	}
 	if *ctl != "" {
 		cfg.Controller = strings.TrimRight(*ctl, "/")
+	}
+	if *selftest != "" {
+		os.Exit(sandboxSelftest(cfg, *selftest))
 	}
 	l, err := newLoader(cfg, *cfgPath, *root)
 	if err != nil {
@@ -71,7 +76,13 @@ func main() {
 	a.LogPath = *logPath
 	a.JobRoots = l.Keys // 任务钥匙环和本体发布同一套根公钥（docs/jobs.md）
 	if cfg.Jobs {
-		log.Printf("批任务执行已开（能力 32）。上线前必须先做专用低权限账户和出站防火墙（issue #1 第 4 步）")
+		// 任务一律经沙箱（docs/jobs-sandbox.md）；非 Windows 构建、或沙箱建不起来时是 Unavailable，心跳报 jobs:false
+		if bc, err := probe.SandboxConfig(cfg); err != nil {
+			a.JobBox = jobbox.Unavailable{Reason: err.Error()}
+		} else {
+			a.JobBox = jobbox.New(bc)
+		}
+		log.Printf("批任务执行已开（能力 32），经沙箱运行；上线前先在真机上过一遍 docs/jobs-sandbox.md 第 7 节")
 	}
 	if *confirm != "" {
 		a.OnOnline = func() {
@@ -146,5 +157,31 @@ func seed(ctx context.Context, l *loader.Loader, bootArg string, w io.Writer) in
 	} else {
 		fmt.Fprintln(w, "seed: 没有要放的（已备好、已是当前版本，或两个槽都占着）")
 	}
+	return 0
+}
+
+// sandboxSelftest 是 -sandbox-selftest：结果同时打印和写进 <artifact_root>\sandbox-selftest.txt（Windows 版没有控制台，方便截屏、OCR）。
+func sandboxSelftest(cfg probe.Config, envDir string) int {
+	var out strings.Builder
+	w := io.MultiWriter(os.Stdout, &out)
+	defer func() {
+		os.WriteFile(filepath.Join(cfg.ArtifactRoot, "sandbox-selftest.txt"), []byte(out.String()), 0o644)
+	}()
+	bc, err := probe.SandboxConfig(cfg)
+	if err != nil {
+		fmt.Fprintln(w, err)
+		return 1
+	}
+	b, ok := jobbox.New(bc).(*jobbox.Box)
+	if !ok {
+		fmt.Fprintln(w, "没有沙箱:", jobbox.New(bc).Halted())
+		return 1
+	}
+	fmt.Fprintf(w, "epsilon-probe %s 沙箱自检 %s 环境层 %s\n", version, time.Now().Format("2006-01-02 15:04:05"), envDir)
+	if err := b.SelfTest(context.Background(), envDir, w); err != nil {
+		fmt.Fprintln(w, err)
+		return 1
+	}
+	fmt.Fprintln(w, "全部通过")
 	return 0
 }

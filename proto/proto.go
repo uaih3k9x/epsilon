@@ -179,4 +179,6 @@ type JobStatus struct {
 	Seconds  float64 `json:"seconds,omitempty"` // 已经跑了多久 / 跑了多久
 	Signer   string  `json:"signer,omitempty"`  // 验签通过后填：签名钥匙名
 	Digest   string  `json:"digest,omitempty"`  // 任务包摘要（jobsign.JobDigest）
+	// AuditBlocked 是审计钩子拦下的次数（能力 35）；有拦截不自动判失败，交给人复查、吊销（设计书 22.6.1）
+	AuditBlocked int `json:"audit_blocked,omitempty"`
 }

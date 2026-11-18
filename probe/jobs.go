@@ -5,10 +5,9 @@ package probe
 // 主控不可信：它发来的任务包原文、参数、钥匙环、清单，这里全部自己再核一遍。
 // 时钟：过期判断用"本机时间、主控回包的 Date、钥匙环签发时间"里最晚的那个，只会多拒、不会多放。
 //
-// 上线前必须做（issue #1 第 4 步，这一版没有）：
-//   - 任务进程现在以探针的账户运行（教室机自动登录的是 Administrator），要换成专用低权限账户 epsilon-job；
-//   - code\ 只读、output\ tmp\ 可写不可执行（NTFS ACL），环境层审计钩子；
-//   - 出站防火墙：只许连主控和同教室，钥匙 network: true 才放开。
+// 任务进程一律经沙箱（JobBox，jobbox 包，docs/jobs-sandbox.md）：专用账户 epsilon-job、任务目录 ACL、独立桌面、
+// 作业对象、审计钩子、每个任务两次金丝雀。沙箱停接任务时心跳报 jobs:false。Windows 构建里没有不受限的路径；
+// 非 Windows 构建的沙箱是 Unavailable，Mac 上的测试注入假的。上线前还要在真机上过一遍（docs/jobs-sandbox.md 第 7 节）。
 
 import (
 	"context"
@@ -20,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"epsilon/envlayer"
+	"epsilon/jobbox"
 	"epsilon/joboutput"
 	"epsilon/jobrun"
 	"epsilon/jobsign"
@@ -41,7 +42,8 @@ import (
 const (
 	keyringVersionFile = "job-keyring.version"
 	keyringRefresh     = 10 * time.Minute
-	jobLogKeep         = 1 << 20 // job.log 末尾多少随输出回传
+	boxRefresh         = 10 * time.Minute // 沙箱健康检查
+	jobLogKeep         = 1 << 20          // job.log 末尾多少随输出回传
 )
 
 var jobIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$`)
@@ -50,6 +52,8 @@ var jobIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@-]{0,127}$`)
 type jobState struct {
 	// JobRoots 是验钥匙环的根公钥（main 里填 loader.PublicKeys）；为空时一个任务都不跑。
 	JobRoots []ed25519.PublicKey
+	// JobBox 是沙箱（main 里填 jobbox.New）；nil 或停接任务时一个任务都不跑，心跳报 jobs:false。
+	JobBox jobbox.Sandbox
 
 	jobInterp       func(envDir string) string // 解释器路径；nil = 环境层里的 python.exe。测试里换成替身
 	jobEnv          []string                   // 追加给任务进程的环境变量（测试用）
@@ -68,6 +72,11 @@ type jobState struct {
 	kr404   atomic.Bool // 主控没配批任务（钥匙环 404）已经记过一次日志
 	skewMu  sync.Mutex
 	ctlSkew time.Duration // 主控 Date 比本机快多少（只记正的）
+
+	boxAt   time.Time // 上次沙箱健康检查（只在 Step 里碰）
+	boxBusy atomic.Bool
+	haltMu  sync.Mutex
+	haltWas string // 上次记过的停接原因（变了才记日志、发事件）
 }
 
 type jobRun struct {
@@ -240,10 +249,64 @@ type httpError struct {
 
 func (e httpError) Error() string { return fmt.Sprintf("%s: HTTP %d", e.path, e.code) }
 
+// SandboxConfig 是 main 建沙箱（jobbox.New）用的配置：金丝雀要以任务账户连主控，测出站拦截。
+func SandboxConfig(cfg Config) (jobbox.Config, error) {
+	u, err := url.Parse(cfg.Controller)
+	if err != nil || u.Hostname() == "" {
+		return jobbox.Config{}, fmt.Errorf("主控地址 %q 不对: %v", cfg.Controller, err)
+	}
+	port := u.Port()
+	if port == "" {
+		port = map[string]string{"https": "443"}[u.Scheme]
+		if port == "" {
+			port = "80"
+		}
+	}
+	return jobbox.Config{Root: cfg.ArtifactRoot, Controller: net.JoinHostPort(u.Hostname(), port)}, nil
+}
+
+// jobsOK 是心跳里的 jobs（能力 32）：开了、有沙箱、沙箱没停接任务。
+func (a *Agent) jobsOK() bool {
+	return a.cfg.Jobs && a.JobBox != nil && a.JobBox.Halted() == ""
+}
+
+// refreshBox 每 10 分钟（第一次立刻）在后台做一次沙箱健康检查。
+func (a *Agent) refreshBox(now time.Time) {
+	if !a.cfg.Jobs || a.JobBox == nil || (!a.boxAt.IsZero() && now.Sub(a.boxAt) < boxRefresh) || !a.boxBusy.CompareAndSwap(false, true) {
+		return
+	}
+	a.boxAt = now
+	go func() {
+		defer a.boxBusy.Store(false)
+		a.JobBox.Check()
+		a.noteHalt()
+	}()
+}
+
+// noteHalt 停接原因变了才记一次日志、发一条事件（不每 10 分钟刷屏）。
+func (a *Agent) noteHalt() {
+	h := a.JobBox.Halted()
+	a.haltMu.Lock()
+	changed := h != a.haltWas
+	a.haltWas = h
+	a.haltMu.Unlock()
+	if !changed {
+		return
+	}
+	if h == "" {
+		log.Printf("批任务沙箱恢复，接任务")
+		a.sendEvent(proto.Event{Kind: "jobbox", Detail: "恢复接任务"})
+		return
+	}
+	log.Printf("批任务沙箱停接任务: %s", h)
+	a.sendEvent(proto.Event{Kind: "jobbox", Detail: "停接任务: " + h})
+}
+
 // stepJob 每个 Step 调：期望状态换了任务（或没了）就撤销手上的；手上空了、期望里有就开始。
 // 返回 true 表示这台机器现在归批任务，不起推理。
 func (a *Agent) stepJob(now time.Time) bool {
 	a.refreshKeyring(now)
+	a.refreshBox(now)
 	want := a.desired.Job
 	a.jmu.Lock()
 	cur := a.jobCur
@@ -282,6 +345,7 @@ func (a *Agent) startJob(as proto.JobAssign) {
 		if !j.started.IsZero() {
 			j.status.Seconds = st.Seconds
 		}
+		j.status.AuditBlocked = st.AuditBlocked
 		signer, digest := j.status.Signer, j.status.Digest
 		a.jmu.Unlock()
 		log.Printf("任务 %s 第 %d 次: %s %s", as.ID, as.Attempt, st.State, st.Detail)
@@ -289,7 +353,11 @@ func (a *Agent) startJob(as proto.JobAssign) {
 		if signer != "" {
 			who = fmt.Sprintf("签名 %s 摘要 %s", signer, digest[:min(12, len(digest))])
 		}
-		a.sendEvent(proto.Event{Kind: "job", Detail: fmt.Sprintf("结束 %s#%d %s %s %s", as.ID, as.Attempt, st.State, who, st.Detail)})
+		blocked := ""
+		if st.AuditBlocked > 0 {
+			blocked = fmt.Sprintf(" 有拦截 %d 次（复查 _runner/audit.log）", st.AuditBlocked)
+		}
+		a.sendEvent(proto.Event{Kind: "job", Detail: fmt.Sprintf("结束 %s#%d %s %s %s%s", as.ID, as.Attempt, st.State, who, st.Detail, blocked)})
 	}()
 }
 
@@ -320,6 +388,10 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 		if errors.As(err, &rj) {
 			return proto.JobStatus{State: proto.JobRejected, Detail: rj.msg}
 		}
+		var br *jobbox.RejectError
+		if errors.As(err, &br) {
+			return proto.JobStatus{State: proto.JobRejected, Detail: br.Msg}
+		}
 		if ctx.Err() != nil {
 			return proto.JobStatus{State: proto.JobKilled, Detail: "撤销"}
 		}
@@ -334,6 +406,12 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 	}
 	if !jobIDPattern.MatchString(as.ID) {
 		return fail(reject("任务号不合法: %q", as.ID))
+	}
+	if a.JobBox == nil {
+		return fail(reject("本机没有批任务沙箱"))
+	}
+	if h := a.JobBox.Halted(); h != "" { // 先查，免得白拉几个 GB 的环境层
+		return fail(reject("本机停接任务: %s", h))
 	}
 	fetchTimeout := a.jobFetchTimeout
 	if fetchTimeout <= 0 {
@@ -376,8 +454,8 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 	paramsJSON, _ := json.MarshalIndent(params, "", "  ")
 	a.sendEvent(proto.Event{Kind: "job", Detail: fmt.Sprintf("开始 %s#%d %s@%s 签名 %s 摘要 %s 参数 %s",
 		as.ID, as.Attempt, job.Name, job.Version, key.Name, digest[:12], compactJSON(params))})
-	if job.Network {
-		log.Printf("任务 %s 声明要联网；出站防火墙还没做（issue #1 第 4 步）", as.ID)
+	if job.Network { // 任务账户的出站全部拦掉（docs/jobs-sandbox.md 第 4 节）；有用例时再加 epsilon-jobnet
+		return fail(reject("联网任务这一版不跑（network: true）"))
 	}
 
 	var envDir, codeZip string
@@ -403,12 +481,17 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 	a.jmu.Lock()
 	j.started = time.Now()
 	a.jmu.Unlock()
-	res, err := jobrun.Run(ctx, jobrun.Spec{Dir: dir, Interp: interp, Entry: job.Entry,
+	res, err := a.JobBox.Run(ctx, jobbox.Job{Dir: dir, EnvDir: envDir, Interp: interp, Entry: job.Entry,
 		Timeout: time.Duration(job.MaxHours * float64(time.Hour)), DiskMaxMB: job.DiskMaxMB, Env: a.jobEnv, CheckEvery: a.jobCheckEvery})
+	for _, n := range res.Notes {
+		log.Printf("任务 %s: %s", as.ID, n)
+		a.sendEvent(proto.Event{Kind: "jobbox", Detail: as.ID + ": " + n})
+	}
+	a.noteHalt()
 	if err != nil {
 		return fail(err)
 	}
-	end := proto.JobStatus{Seconds: res.Seconds}
+	end := proto.JobStatus{Seconds: res.Seconds, AuditBlocked: res.Audit.Blocked}
 	switch res.Killed {
 	case "cancelled":
 		return proto.JobStatus{State: proto.JobKilled, Detail: "撤销", Seconds: res.Seconds} // 主控不要了，不回传
@@ -416,6 +499,8 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 		end.State, end.Detail = proto.JobKilled, fmt.Sprintf("超时（max_hours %g）", job.MaxHours)
 	case "disk":
 		end.State, end.Detail = proto.JobKilled, fmt.Sprintf("写盘超过 disk_max_mb %d", job.DiskMaxMB)
+	case jobbox.AbortAudit:
+		end.State, end.Detail = proto.JobFailed, "运行中审计管道断开或记录被篡改，整树杀（照常回传供复查）"
 	default:
 		code := res.ExitCode
 		end.ExitCode = &code
@@ -427,21 +512,21 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 	// output/_runner/ 只许平台写：任务进程树这时已经整棵杀掉，有东西就是任务自己写的（伪造摘要、绕过 output_max_mb）
 	if _, err := os.Lstat(filepath.Join(dir, "output", jobrun.Runner)); !os.IsNotExist(err) {
 		return proto.JobStatus{State: proto.JobFailed, Detail: "任务写了平台保留的 output/" + jobrun.Runner + "/，不回传",
-			ExitCode: end.ExitCode, Seconds: res.Seconds}
+			ExitCode: end.ExitCode, Seconds: res.Seconds, AuditBlocked: end.AuditBlocked}
 	}
 	if n := jobrun.OutputBytes(dir); n > int64(job.OutputMaxMB)<<20 {
 		return proto.JobStatus{State: proto.JobFailed, Detail: fmt.Sprintf("output 有 %d MB，超过 output_max_mb %d，不回传", n>>20, job.OutputMaxMB),
-			ExitCode: end.ExitCode, Seconds: res.Seconds}
+			ExitCode: end.ExitCode, Seconds: res.Seconds, AuditBlocked: end.AuditBlocked}
 	}
 	if err := a.writeSummary(dir, as, job, key.Name, digest, params, res); err != nil {
-		return proto.JobStatus{State: proto.JobFailed, Detail: "运行摘要写不进去，不回传: " + err.Error(), ExitCode: end.ExitCode, Seconds: res.Seconds}
+		return proto.JobStatus{State: proto.JobFailed, Detail: "运行摘要写不进去，不回传: " + err.Error(), ExitCode: end.ExitCode, Seconds: res.Seconds, AuditBlocked: end.AuditBlocked}
 	}
 	a.setJob(j, func(s *proto.JobStatus) { s.State = proto.JobUploading })
 	if err := a.uploadOutput(ctx, as, filepath.Join(dir, "output")); err != nil {
 		if ctx.Err() != nil {
 			return proto.JobStatus{State: proto.JobKilled, Detail: "撤销", Seconds: res.Seconds}
 		}
-		return proto.JobStatus{State: proto.JobFailed, Detail: "回传失败: " + err.Error(), ExitCode: end.ExitCode, Seconds: res.Seconds}
+		return proto.JobStatus{State: proto.JobFailed, Detail: "回传失败: " + err.Error(), ExitCode: end.ExitCode, Seconds: res.Seconds, AuditBlocked: end.AuditBlocked}
 	}
 	return end
 }
@@ -545,18 +630,21 @@ func fileSHA256(p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// writeSummary 写 output/_runner/：运行摘要和 job.log 末尾，随输出回传（失败时也能看到原因）。
+// writeSummary 写 output/_runner/：运行摘要（含审计汇总，能力 35）、audit.log 和 job.log 末尾，随输出回传（失败时也能看到原因）。
 // 摘要是审核人核对签名者、摘要、参数的依据，写不进去就报错，不回传没有摘要的输出。
-func (a *Agent) writeSummary(dir string, as proto.JobAssign, job jobsign.Job, signer, digest string, params map[string]json.RawMessage, res jobrun.Result) error {
+func (a *Agent) writeSummary(dir string, as proto.JobAssign, job jobsign.Job, signer, digest string, params map[string]json.RawMessage, res jobbox.Result) error {
 	rd := filepath.Join(dir, "output", jobrun.Runner)
 	if err := os.Mkdir(rd, 0o755); err != nil {
 		return err
 	}
 	sum := map[string]any{"id": as.ID, "attempt": as.Attempt, "node": a.cfg.Node, "package": job.Name + "@" + job.Version,
 		"signer": signer, "digest": digest, "params": params, "exit_code": res.ExitCode, "killed": res.Killed,
-		"seconds": res.Seconds, "probe": a.version}
+		"seconds": res.Seconds, "probe": a.version, "audit": res.Audit}
 	b, _ := json.MarshalIndent(sum, "", "  ")
 	if err := os.WriteFile(filepath.Join(rd, "summary.json"), b, 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(rd, "audit.log"), res.AuditLog, 0o644); err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(rd, "job.log"), []byte(tailFile(filepath.Join(dir, "job.log"), jobLogKeep)), 0o644)

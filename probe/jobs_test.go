@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"epsilon/jobrun"
+	"epsilon/jobbox"
 	"epsilon/jobsign"
 	"epsilon/proto"
 )
@@ -45,7 +45,7 @@ func TestWriteSummaryReportsErrors(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "output"), []byte("不是目录"), 0o644)
 	a := NewAgent(Config{}, &fakeSys{}, "t")
-	err := a.writeSummary(dir, proto.JobAssign{ID: "x-1", Attempt: 1}, jobsign.Job{}, "k", "d", nil, jobrun.Result{})
+	err := a.writeSummary(dir, proto.JobAssign{ID: "x-1", Attempt: 1}, jobsign.Job{}, "k", "d", nil, jobbox.Result{})
 	if err == nil {
 		t.Fatal("摘要写不进去要报错（不能悄悄回传没有摘要的输出）")
 	}

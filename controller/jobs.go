@@ -494,10 +494,10 @@ func (c *Controller) reconcile(node string, st *proto.JobStatus, restarted bool)
 	return changed
 }
 
-// nodeFree：开了能力 32、心跳没过期、探针手上没有没结束的任务（包括正在被杀的旧任务）。
-// 主控这边派给它的任务由调用方另查。调用方持 c.mu。
+// nodeFree：开了能力 32 且沙箱没停接任务（最近一次心跳或登记的 jobs）、心跳没过期、
+// 探针手上没有没结束的任务（包括正在被杀的旧任务）。主控这边派给它的任务由调用方另查。调用方持 c.mu。
 func (c *Controller) nodeFree(n *node, now time.Time) bool {
-	if !n.hb.Jobs && !n.reg.Jobs || now.Sub(n.seen) >= time.Duration(c.cfg.StaleSeconds)*time.Second {
+	if !n.hb.Jobs || now.Sub(n.seen) >= time.Duration(c.cfg.StaleSeconds)*time.Second { // 登记时已经把 jobs 抄进 hb
 		return false
 	}
 	return n.hb.Job == nil || proto.JobFinal(n.hb.Job.State)

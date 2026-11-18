@@ -327,7 +327,7 @@ func (a *Agent) register() {
 	}
 	req := proto.Register{Node: a.cfg.Node, Version: a.version, Boot: a.Boot, Hostname: host,
 		GPUs: a.sys.GPUs(), MemoryMB: a.sys.MemFreeMB(), Workload: names, P2PPort: a.p2pPort,
-		Jobs: a.cfg.Jobs, Job: a.jobStatus()}
+		Jobs: a.jobsOK(), Job: a.jobStatus()}
 	if a.Chunks != nil {
 		req.Chunks = a.Chunks.List() // 主控以此重置这台的块表，之后靠 /v1/have 增量
 	}
@@ -343,7 +343,7 @@ func (a *Agent) heartbeat(obs Observed) bool {
 	st := a.sup.Status()
 	hb := proto.Heartbeat{Node: a.cfg.Node, Version: a.version, Boot: a.Boot, IdleSeconds: obs.IdleSeconds,
 		ForeignGPU: obs.ForeignGPU, GPUs: a.gpus, MemFreeMB: a.sys.MemFreeMB(),
-		Running: st.Name, Reason: a.reason, Disk: a.disk(), Jobs: a.cfg.Jobs, Job: a.jobStatus()}
+		Running: st.Name, Reason: a.reason, Disk: a.disk(), Jobs: a.jobsOK(), Job: a.jobStatus()}
 	if st.Healthy && a.mode == Run { // 保温档：模型在显存里，但不接新请求
 		hb.Serving = &proto.Serving{Model: st.Model, Port: st.Port}
 	}

@@ -273,3 +273,25 @@ func TestDisabledWithoutJobsDir(t *testing.T) {
 		t.Fatalf("没配 jobs_dir 应该 404: %d", resp.StatusCode)
 	}
 }
+
+func TestLinksAndJunctionsNotFollowed(t *testing.T) {
+	// 任务在 output\ 里 mklink /J 指到别的任务目录或 probe.json 所在目录：Go 1.25 在 Windows 上把目录联接报成
+	// ModeIrregular、符号链接报成 ModeSymlink，都不是普通文件，整个回传拒掉，不跟过去读（docs/jobs-sandbox.md 第 0 节）。
+	// 这里用符号链接（指向目录和文件）模拟；钉住"不是普通文件就拒"。
+	secret := t.TempDir()
+	os.WriteFile(filepath.Join(secret, "probe.json"), []byte(`{"token":"x"}`), 0o644)
+	for name, target := range map[string]string{"dirlink": secret, "filelink": filepath.Join(secret, "probe.json")} {
+		r := newRig(t, 10)
+		r.write("ok.txt", []byte("ok"))
+		if err := os.Symlink(target, filepath.Join(r.src, name)); err != nil {
+			t.Skip("建不了链接:", err)
+		}
+		_, err := Upload(context.Background(), http.DefaultClient, r.srv.URL, "tok", "j1", r.src, 1<<20)
+		if err == nil || !strings.Contains(err.Error(), "不是普通文件") {
+			t.Fatalf("%s: 要拒: %v", name, err)
+		}
+		if code, _ := r.req("GET", "/v1/jobs/j1/output", "key", nil); code != 404 {
+			t.Fatalf("%s: 拒了就不该有清单", name)
+		}
+	}
+}
