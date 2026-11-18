@@ -2,8 +2,8 @@ package boot
 
 // 断电注入（设计书 11.12 "断电模拟"）：每个场景先无故障跑一遍，数出一共 N 个写盘点；
 // 再对 k = 0..N-1 每个点都试一次（不抽样），每次从同一个初始现场出发：
-//   - 从第 k 个写盘点起所有写操作都失败（第 k 个若是 write，先写进一半：撕裂写），
-//     fake Start / Rescue 也失败，然后停掉这个 Boot；
+//   - 第 k 个写盘点失败（若是 write，先写进一半：撕裂写）；之后 Run 再走到写盘点就直接结束
+//     （runtime.Goexit，像真断电一样后面的代码不再跑），fake Start / Rescue 也失败，然后停掉这个 Boot；
 //   - 在同一个目录上新建一个 Boot（hook 只计数、不再注入），跑到稳定，检查不变量 I1–I7。
 //
 // 模型的前提：改名、删除一旦返回成功就算落盘；刷盘前断电丢的只有临时文件。
@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -84,6 +85,7 @@ type pcEnv struct {
 	cutAt  int // 第几个写盘点断电；-1 不断
 	cut    bool
 	cutCh  chan struct{}
+	after  int      // 断电之后还被调到的写盘点次数（真断电后不会再有代码跑）
 	ops    []string // 这一阶段断电前走过的写盘点
 	lastOp time.Time
 	starts []pcStart // 两个阶段累计
@@ -106,7 +108,10 @@ func (e *pcEnv) hook(op, path string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.cut {
-		return errPowerCut
+		// 断电之后又走到写盘点：直接结束这个 goroutine（Run 的），和真断电一样后面的代码不再跑。
+		// 断电那一下本身仍返回错误，撕裂写才能写进一半。
+		e.after++
+		runtime.Goexit()
 	}
 	if len(e.ops) == e.cutAt {
 		e.cut = true
@@ -211,7 +216,10 @@ func (e *pcEnv) stable() bool {
 
 func runBoot(b *Boot) (stop func()) {
 	stopCh, done := make(chan struct{}), make(chan struct{})
-	go func() { b.Run(stopCh); close(done) }()
+	go func() {
+		defer close(done) // 断电时 hook 用 Goexit 结束这个 goroutine，defer 照样跑
+		b.Run(stopCh)
+	}()
 	return func() { close(stopCh); <-done }
 }
 
@@ -423,6 +431,31 @@ func TestPowerCut(t *testing.T) {
 				t.Logf("%s：%d 个写盘点全试过\n  %s", sc.name, len(ops), strings.Join(ops, "\n  "))
 			}
 		})
+	}
+}
+
+// 断电那一下之后，Run 不能再走到下一个写盘点：真断电后没有代码在跑。
+// 否则断在改名上时 writeAtomic 还要重试 10 次（约 0.9 秒）才回到 Run 看 stop。
+func TestPowerCutNoCodeAfterCut(t *testing.T) {
+	_, priv := keys(t)
+	sc := pcScenarios()[0] // 消费staged-接受：第一个写盘点之后就是写 state 的改名
+	dry := newPCEnv(t, sc, priv, -1)
+	if dry.runToStable() == "" {
+		t.Fatal(dry.diag())
+	}
+	k := slices.Index(dry.ops, "rename "+StateFile+".tmp")
+	if k < 0 {
+		t.Fatalf("没有改名写盘点: %v", dry.ops)
+	}
+	e := newPCEnv(t, sc, priv, k)
+	stop := runBoot(e.boot())
+	<-e.cutCh
+	time.Sleep(300 * time.Millisecond)
+	stop()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.after > 1 {
+		t.Fatalf("断电后又走了 %d 个写盘点", e.after)
 	}
 }
 
