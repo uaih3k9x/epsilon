@@ -227,7 +227,7 @@ func (c *Controller) register(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	c.nodes[reg.Node] = &node{reg: reg, addr: remoteIP(r), seen: c.now(), chunks: chunks}
-	c.nodes[reg.Node].hb.Jobs, c.nodes[reg.Node].hb.Job = reg.Jobs, reg.Job
+	c.nodes[reg.Node].hb.Jobs, c.nodes[reg.Node].hb.JobsSandboxed, c.nodes[reg.Node].hb.Job = reg.Jobs, reg.JobsSandboxed, reg.Job
 	if c.jobsEnabled() && c.reconcile(reg.Node, reg.Job, true) {
 		c.saveQueue()
 	}

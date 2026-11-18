@@ -30,6 +30,8 @@ type Supervisor struct {
 	cmd     *exec.Cmd
 	cur     WorkloadStatus
 	done    chan struct{}
+	last    *exec.Cmd     // 最近起的进程（Stop 之后 cmd 是 nil，它可能还在退出）
+	lastEnd chan struct{} // last 退出了就关
 	events  []proto.Event
 	crashed time.Time // 上次崩溃时间，退避用
 	crashes int
@@ -75,6 +77,7 @@ func (s *Supervisor) Ensure(name string, w Workload, want bool) {
 	}
 	winproc.Bind(cmd.Process.Pid)
 	s.cmd, s.done = cmd, make(chan struct{})
+	s.last, s.lastEnd = cmd, s.done
 	s.cur = WorkloadStatus{Name: name, PID: cmd.Process.Pid, Model: w.Model, Port: w.Port}
 	go s.wait(cmd, s.done, name, w.Log)
 	go s.health(cmd, w)
@@ -171,6 +174,24 @@ func (s *Supervisor) Stop() {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
+	}
+}
+
+// Idle 是没有工作负载进程活着（包括 Stop 之后还在退出的）。
+func (s *Supervisor) Idle() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cmd != nil {
+		return false
+	}
+	if s.lastEnd == nil {
+		return true
+	}
+	select {
+	case <-s.lastEnd:
+		return true
+	default:
+		return false
 	}
 }
 

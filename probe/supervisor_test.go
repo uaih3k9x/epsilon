@@ -152,3 +152,32 @@ func TestSupervisorHealthFailedCarriesLogTail(t *testing.T) {
 		t.Fatalf("health_failed 要带日志末尾: %q", ev)
 	}
 }
+
+func TestSupervisorIdleOnlyAfterProcessExited(t *testing.T) {
+	// Stop 先把 cmd 置空再等进程退出：Status 说"没在跑"时推理进程可能还占着 8080/50052（回环不过防火墙）
+	s := NewSupervisor()
+	if !s.Idle() {
+		t.Fatal("没起过就是空的")
+	}
+	w := fakeWorkload(t, false)
+	s.Ensure("fake", w, true)
+	waitFor(t, "起来", func() bool { return s.Status().PID != 0 })
+	if s.Idle() {
+		t.Fatal("在跑就不空")
+	}
+	s.mu.Lock()
+	done := s.done
+	s.cmd, s.cur = nil, WorkloadStatus{} // Stop 的第一步：已经不算在跑，但进程还没退
+	s.mu.Unlock()
+	if s.Idle() {
+		t.Fatal("进程还没退出就不算空")
+	}
+	s.mu.Lock()
+	last := s.last
+	s.mu.Unlock()
+	last.Process.Kill()
+	<-done
+	if !s.Idle() {
+		t.Fatal("退出了就空")
+	}
+}

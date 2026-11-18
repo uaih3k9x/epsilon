@@ -38,7 +38,11 @@ type Config struct {
 	P2PPort      int    `json:"p2p_port"`       // 分块服务端口；没写 = 47100，写 0 = 不开
 
 	// 批任务（docs/jobs.md）
-	Jobs       bool  `json:"jobs"`        // 能力 32：执行签名任务包（一律经沙箱）。默认关；真机验证 docs/jobs-sandbox.md 第 7 节之前不要开
+	// Jobs 是能力 32：执行签名任务包（一律经沙箱）。默认关；真机验证 docs/jobs-sandbox.md 第 7 节之前不要开。
+	// 键名不是 "jobs"：A/B 槽回滚到这一版之前的探针读的是 "jobs"，会以登录用户不受限地跑任务。
+	Jobs bool `json:"jobs_sandboxed"`
+	// LegacyJobs 是旧开关 "jobs"。写了 true 本机就不接任务（旧探针看得到它），要删掉、改用 jobs_sandboxed。
+	LegacyJobs bool  `json:"jobs"`
 	JobKeyring *bool `json:"job_keyring"` // 能力 33：拉任务钥匙环、记住最高版本号。默认开
 }
 

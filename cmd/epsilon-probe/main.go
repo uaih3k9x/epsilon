@@ -75,6 +75,9 @@ func main() {
 	a.Boot = *bootArg
 	a.LogPath = *logPath
 	a.JobRoots = l.Keys // 任务钥匙环和本体发布同一套根公钥（docs/jobs.md）
+	if cfg.LegacyJobs {
+		log.Print(probe.LegacyJobsMsg)
+	}
 	if cfg.Jobs {
 		// 任务一律经沙箱（docs/jobs-sandbox.md）；非 Windows 构建、或沙箱建不起来时是 Unavailable，心跳报 jobs:false
 		if bc, err := probe.SandboxConfig(cfg); err != nil {

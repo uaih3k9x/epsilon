@@ -19,6 +19,10 @@ type passBox struct {
 	notes    []string
 	killed   string // 非空：假装被沙箱按这个原因杀了
 	ran      int
+	retry    bool          // reject 是本机的问题
+	rejectN  int           // 只拒前几次（0 = 一直拒）
+	blocked  int           // 非 0：运行中先报这么多次拦截
+	hold     chan struct{} // 非 nil：报完拦截等它关了再跑
 }
 
 func (b *passBox) Check() error {
@@ -40,9 +44,19 @@ func (b *passBox) Run(ctx context.Context, j jobbox.Job) (jobbox.Result, error) 
 	b.mu.Lock()
 	reject, audit, auditLog, notes, killed := b.reject, b.audit, b.auditLog, b.notes, b.killed
 	b.ran++
+	if b.rejectN > 0 && b.ran > b.rejectN {
+		reject = ""
+	}
+	retry, blocked, hold := b.retry, b.blocked, b.hold
 	b.mu.Unlock()
 	if reject != "" {
-		return jobbox.Result{}, &jobbox.RejectError{Msg: reject}
+		return jobbox.Result{}, &jobbox.RejectError{Msg: reject, Retry: retry}
+	}
+	if blocked > 0 && j.OnBlocked != nil {
+		j.OnBlocked(blocked)
+	}
+	if hold != nil {
+		<-hold
 	}
 	r, err := jobrun.Run(ctx, jobrun.Spec{Dir: j.Dir, Interp: j.Interp, Entry: j.Entry, Timeout: j.Timeout,
 		DiskMaxMB: j.DiskMaxMB, Env: j.Env, CheckEvery: j.CheckEvery})

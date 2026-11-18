@@ -143,3 +143,29 @@ func TestSandboxConfig(t *testing.T) {
 		t.Fatal("主控地址不对要报错")
 	}
 }
+
+func TestJobE2EMachineRejectIsRetriedElsewhere(t *testing.T) {
+	// 沙箱说是本机的问题：主控把任务放回队列（这里只有一台，就还是它），第二次照常跑
+	e := newE2E(t, 30)
+	e.probe("pc-01", func(a *Agent) { a.JobBox = &passBox{reject: "系统控制金丝雀不符", retry: true, rejectN: 1} })
+	id := e.submit(map[string]any{"package": e.pkg("demo", "ok", nil)})[0]
+	v := e.wait(id)
+	if v.State != proto.JobSucceeded || v.Attempt != 2 || len(v.Lost) != 1 {
+		t.Fatalf("本机的问题换一次重跑，不算任务失败: %+v", v)
+	}
+}
+
+func TestJobE2EAuditBlockedReportedWhileRunning(t *testing.T) {
+	hold := make(chan struct{})
+	e := newE2E(t, 30)
+	p := e.probe("pc-01", func(a *Agent) { a.JobBox = &passBox{blocked: 3, hold: hold} })
+	id := e.submit(map[string]any{"package": e.pkg("demo", "ok", nil)})[0]
+	waitFor(t, "运行中心跳就报拦截次数", func() bool {
+		st := p.a.jobStatus()
+		return st != nil && st.AuditBlocked == 3
+	})
+	close(hold)
+	if v := e.wait(id); v.State != proto.JobSucceeded {
+		t.Fatalf("%+v", v)
+	}
+}

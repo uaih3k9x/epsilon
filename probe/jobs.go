@@ -88,11 +88,23 @@ type jobRun struct {
 }
 
 // rejectErr 是"一行代码都没跑就拒了"：验签、钥匙环、过期、权限、哈希、参数。
-type rejectErr struct{ msg string }
+type rejectErr struct {
+	msg   string
+	retry bool // 本机的问题：主控换一台
+}
 
 func (e rejectErr) Error() string { return e.msg }
 
-func reject(format string, args ...any) error { return rejectErr{fmt.Sprintf(format, args...)} }
+func reject(format string, args ...any) error { return rejectErr{msg: fmt.Sprintf(format, args...)} }
+func rejectRetry(format string, args ...any) error {
+	return rejectErr{msg: fmt.Sprintf(format, args...), retry: true}
+}
+
+// LegacyJobsMsg：probe.json 里还留着旧开关。
+const LegacyJobsMsg = `probe.json 里还有旧开关 "jobs": true（回滚到之前的探针会不经沙箱跑任务）：删掉它，改用 "jobs_sandboxed"`
+
+// workloadStopWait 是开始跑任务前最多等推理、rpc 进程退出多久（回环不过防火墙，它们在听的端口任务连得上）。
+const workloadStopWait = 30 * time.Second
 
 func (a *Agent) localNow() time.Time {
 	if a.clock != nil {
@@ -265,9 +277,21 @@ func SandboxConfig(cfg Config) (jobbox.Config, error) {
 	return jobbox.Config{Root: cfg.ArtifactRoot, Controller: net.JoinHostPort(u.Hostname(), port)}, nil
 }
 
-// jobsOK 是心跳里的 jobs（能力 32）：开了、有沙箱、沙箱没停接任务。
+// jobsOK 是心跳里的 jobs 和 jobs_sandboxed（能力 32）：开了、没留旧开关、有沙箱、沙箱没停接任务。
 func (a *Agent) jobsOK() bool {
-	return a.cfg.Jobs && a.JobBox != nil && a.JobBox.Halted() == ""
+	return a.cfg.Jobs && !a.cfg.LegacyJobs && a.JobBox != nil && a.JobBox.Halted() == ""
+}
+
+// waitWorkloadStopped 等工作负载（llama-server、ggml-rpc-server）的进程真的退出：Step 里 Ensure 停它是异步的。
+func (a *Agent) waitWorkloadStopped(ctx context.Context, max time.Duration) bool {
+	deadline := time.Now().Add(max)
+	for !a.sup.Idle() {
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return true
 }
 
 // refreshBox 每 10 分钟（第一次立刻）在后台做一次沙箱健康检查。
@@ -341,7 +365,7 @@ func (a *Agent) startJob(as proto.JobAssign) {
 		defer cancel()
 		st := a.runJob(ctx, j)
 		a.jmu.Lock()
-		j.status.State, j.status.Detail, j.status.ExitCode = st.State, st.Detail, st.ExitCode
+		j.status.State, j.status.Detail, j.status.ExitCode, j.status.Retry = st.State, st.Detail, st.ExitCode, st.Retry
 		if !j.started.IsZero() {
 			j.status.Seconds = st.Seconds
 		}
@@ -386,11 +410,11 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 	fail := func(err error) proto.JobStatus {
 		var rj rejectErr
 		if errors.As(err, &rj) {
-			return proto.JobStatus{State: proto.JobRejected, Detail: rj.msg}
+			return proto.JobStatus{State: proto.JobRejected, Detail: rj.msg, Retry: rj.retry}
 		}
 		var br *jobbox.RejectError
 		if errors.As(err, &br) {
-			return proto.JobStatus{State: proto.JobRejected, Detail: br.Msg}
+			return proto.JobStatus{State: proto.JobRejected, Detail: br.Msg, Retry: br.Retry}
 		}
 		if ctx.Err() != nil {
 			return proto.JobStatus{State: proto.JobKilled, Detail: "撤销"}
@@ -398,8 +422,11 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 		return proto.JobStatus{State: proto.JobFailed, Detail: err.Error()}
 	}
 	as := j.assign
+	if a.cfg.LegacyJobs {
+		return fail(rejectRetry("%s", LegacyJobsMsg))
+	}
 	if !a.cfg.Jobs {
-		return fail(reject("本机没开批任务（probe.json \"jobs\": true，能力 32）"))
+		return fail(rejectRetry("本机没开批任务（probe.json \"jobs_sandboxed\": true，能力 32）"))
 	}
 	if !a.keyringEnabled() {
 		return fail(reject("本机关了任务钥匙环（能力 33），验不了任务包"))
@@ -408,10 +435,10 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 		return fail(reject("任务号不合法: %q", as.ID))
 	}
 	if a.JobBox == nil {
-		return fail(reject("本机没有批任务沙箱"))
+		return fail(rejectRetry("本机没有批任务沙箱"))
 	}
 	if h := a.JobBox.Halted(); h != "" { // 先查，免得白拉几个 GB 的环境层
-		return fail(reject("本机停接任务: %s", h))
+		return fail(rejectRetry("本机停接任务: %s", h))
 	}
 	fetchTimeout := a.jobFetchTimeout
 	if fetchTimeout <= 0 {
@@ -477,12 +504,22 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 	if a.jobInterp != nil {
 		interp = a.jobInterp(envDir)
 	}
+	if !a.waitWorkloadStopped(ctx, workloadStopWait) {
+		if ctx.Err() != nil {
+			return fail(ctx.Err())
+		}
+		return fail(rejectRetry("推理进程 %s 内没退出，不跑任务（它在回环上听的端口任务连得上）", workloadStopWait))
+	}
 	a.setJob(j, func(s *proto.JobStatus) { s.State = proto.JobRunning })
 	a.jmu.Lock()
 	j.started = time.Now()
 	a.jmu.Unlock()
 	res, err := a.JobBox.Run(ctx, jobbox.Job{Dir: dir, EnvDir: envDir, Interp: interp, Entry: job.Entry,
-		Timeout: time.Duration(job.MaxHours * float64(time.Hour)), DiskMaxMB: job.DiskMaxMB, Env: a.jobEnv, CheckEvery: a.jobCheckEvery})
+		Timeout: time.Duration(job.MaxHours * float64(time.Hour)), DiskMaxMB: job.DiskMaxMB, Env: a.jobEnv, CheckEvery: a.jobCheckEvery,
+		OnBlocked: func(n int) { a.setJob(j, func(s *proto.JobStatus) { s.AuditBlocked = n }) }})
+	if res.Dir != "" { // 收不回权限、改名隔离了：输出在新地方
+		dir = res.Dir
+	}
 	for _, n := range res.Notes {
 		log.Printf("任务 %s: %s", as.ID, n)
 		a.sendEvent(proto.Event{Kind: "jobbox", Detail: as.ID + ": " + n})
