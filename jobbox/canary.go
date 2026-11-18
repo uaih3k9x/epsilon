@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -16,6 +18,37 @@ var canarySysSrc string
 
 //go:embed py/canary_hook.py
 var canaryHookSrc string
+
+// canaryBoot 是两次金丝雀的引导（-c 的参数）。源码有几 KB，命令行装不下（CreateProcessWithLogonW 最多 1024 个字符），
+// 所以源码和配置由探针写进任务目录的 canary\（任务只读），命令行只带路径：argv[1] 源码、argv[2] 配置。
+// 先去掉 sys.path 里的 ”：-c 时它是当前目录 code\，任务包里的 shutil.py、socket.py 会抢在标准库前面被金丝雀导入。
+const canaryBoot = `import sys;p=sys.argv.pop(1);sys.path[:]=[x for x in sys.path if x];exec(compile(open(p,'rb').read(),p,'exec'))`
+
+// canaryFiles 是 canary\ 下的文件：探针每次任务都重写（金丝雀和任务都只能读）。
+const (
+	canaryDir      = "canary"
+	canarySysFile  = "sys.txt" // 不叫 .py：钩子拦 code\ 和环境层以外的 .py
+	canaryHookFile = "hook.txt"
+	canaryCfgFile  = "cfg.json"
+)
+
+// canaryPaths 是 canary\\ 下两份源码和配置的路径。
+type canaryPaths struct{ sys, hook, cfg string }
+
+// writeCanaryFiles 写 canary\\ 的三个文件（在 Grant 之后写，继承根上任务账户的只读）。
+func writeCanaryFiles(jobDir, cfg string) (canaryPaths, error) {
+	d := filepath.Join(jobDir, canaryDir)
+	cf := canaryPaths{filepath.Join(d, canarySysFile), filepath.Join(d, canaryHookFile), filepath.Join(d, canaryCfgFile)}
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		return cf, err
+	}
+	for path, body := range map[string]string{cf.sys: canarySysSrc, cf.hook: canaryHookSrc, cf.cfg: cfg} {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			return cf, err
+		}
+	}
+	return cf, nil
+}
 
 // Desktop 是任务进程的窗口站\桌面。不指定的话 seclogon 会把任务账户加进 WinSta0\Default，任务就能截学生的屏、读剪贴板。
 const Desktop = `epsilon-job\Default`

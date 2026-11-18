@@ -84,6 +84,7 @@ type plat struct {
 	tmpAtJob  []string
 	audit     *fakeAudit
 	revoked   []string
+	launches  []jobrun.Launch
 }
 
 func (f *plat) call(s string) {
@@ -111,11 +112,16 @@ func (f *plat) Audit() (AuditServer, error) {
 	return f.audit, nil
 }
 
+// kind 按引导和源码文件认出两次金丝雀：-I -S -c 引导 canary\sys.txt；-E -s -B -c 引导 canary\hook.txt。
 func kind(l jobrun.Launch) string {
+	n := len(l.Args)
+	if n < 4 || l.Args[n-4] != "-c" || l.Args[n-3] != canaryBoot {
+		return "job"
+	}
 	switch {
-	case len(l.Args) > 3 && l.Args[0] == "-I" && l.Args[3] == canarySysSrc:
+	case l.Args[0] == "-I" && filepath.Base(l.Args[n-2]) == "sys.txt":
 		return "sys"
-	case len(l.Args) > 4 && l.Args[3] == "-c" && l.Args[4] == canaryHookSrc:
+	case l.Args[0] == "-E" && filepath.Base(l.Args[n-2]) == "hook.txt":
 		return "hook"
 	}
 	return "job"
@@ -124,6 +130,9 @@ func kind(l jobrun.Launch) string {
 func (f *plat) Start(l jobrun.Launch) (jobrun.Proc, error) {
 	k := kind(l)
 	f.call("start-" + k)
+	f.mu.Lock()
+	f.launches = append(f.launches, l)
+	f.mu.Unlock()
 	if err := f.startErr[k]; err != nil {
 		return nil, err
 	}

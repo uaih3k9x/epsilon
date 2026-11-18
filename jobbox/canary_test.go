@@ -3,6 +3,7 @@ package jobbox
 import (
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -68,8 +69,13 @@ func TestCanaryScriptsReportEveryCheck(t *testing.T) {
 		src  string
 		want []string
 	}{{canarySysSrc, SysChecks}, {canaryHookSrc, HookChecks}} {
-		cmd := exec.Command(py, "-I", "-S", "-c", c.src, "{}")
-		cmd.Dir = t.TempDir()
+		// 和 Box 一样：源码、配置写成文件，经引导执行
+		dir := t.TempDir()
+		src, cfg := filepath.Join(dir, "src.txt"), filepath.Join(dir, "cfg.json")
+		os.WriteFile(src, []byte(c.src), 0o644)
+		os.WriteFile(cfg, []byte("{}"), 0o644)
+		cmd := exec.Command(py, "-I", "-S", "-c", canaryBoot, src, cfg)
+		cmd.Dir = dir
 		out, _ := cmd.CombinedOutput()
 		got := map[string]int{}
 		for _, l := range ParseCanary(out) {

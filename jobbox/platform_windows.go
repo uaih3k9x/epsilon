@@ -352,14 +352,6 @@ func (w *winProc) Close() {
 	})
 }
 
-func cmdLine(path string, args []string) string {
-	parts := []string{syscall.EscapeArg(path)}
-	for _, a := range args {
-		parts = append(parts, syscall.EscapeArg(a))
-	}
-	return strings.Join(parts, " ")
-}
-
 // Start 用 CreateProcessWithLogonW（走 seclogon，不需要探针有特权）以任务账户、独立桌面挂起起进程，
 // 放进作业对象再恢复。stdout/stderr 接到 l.Log 的句柄（seclogon 复制给新进程，所以先复制一份可继承的）。
 func (p *winPlatform) Start(l jobrun.Launch) (jobrun.Proc, error) {
@@ -383,7 +375,7 @@ func (p *winPlatform) Start(l jobrun.Launch) (jobrun.Proc, error) {
 		return nil, fmt.Errorf("复制日志句柄: %v", err)
 	}
 	defer syscall.CloseHandle(logh)
-	cmd, err := syscall.UTF16FromString(cmdLine(l.Path, l.Args)) // lpCommandLine 必须可写
+	cmd, err := syscall.UTF16FromString(CmdLine(l.Path, l.Args)) // lpCommandLine 必须可写；长度 Box 已经查过
 	if err != nil {
 		return nil, err
 	}

@@ -1,6 +1,6 @@
 """金丝雀二：审计钩子检查（docs/jobs-sandbox.md 第 5 节）。
 
-探针以任务账户跑：python.exe -E -s -B -c <本文件> <配置 JSON>，和真任务一样经过环境层的 sitecustomize。
+探针以任务账户跑：python.exe -E -s -B -c <引导> canary\\hook.txt canary\\cfg.json，和真任务一样经过环境层的 sitecustomize。
 就绪记录（sitecustomize 在环境层里）和 multiprocessing 子进程的就绪由探针从审计管道核对；这里查拦截。
 每一项打印一行 "CANARY ok 名字" 或 "CANARY fail 名字 原因"。名字和 jobbox.HookChecks 一致。
 """
@@ -12,8 +12,9 @@ import socket
 import subprocess
 import sys
 
-try:
-    CFG = json.loads(sys.argv[1])
+try:  # argv[1] 是探针写的配置文件（命令行装不下）
+    with open(sys.argv[1], "rb") as _f:
+        CFG = json.load(_f)
 except Exception:
     CFG = {}
 

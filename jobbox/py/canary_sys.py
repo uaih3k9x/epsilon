@@ -1,6 +1,6 @@
 """金丝雀一：系统控制检查（docs/jobs-sandbox.md 第 5 节）。
 
-探针以任务账户、独立桌面、作业对象跑：python.exe -I -S -c <本文件> <配置 JSON>。不加载审计钩子，查的是系统本身。
+探针以任务账户、独立桌面、作业对象跑：python.exe -I -S -c <引导> canary\\sys.txt canary\\cfg.json（jobbox.canaryBoot）。不加载审计钩子，查的是系统本身。
 先像 sitecustomize 一样把自己降到 Low IL（降级代码两边一模一样，jobbox 的测试核对），再逐项查。
 每一项打印一行 "CANARY ok 名字" 或 "CANARY fail 名字 原因"；一项出异常不影响别的项。名字和 jobbox.SysChecks 一致。
 """
@@ -12,8 +12,9 @@ import socket
 import subprocess
 import sys
 
-try:
-    CFG = json.loads(sys.argv[1])
+try:  # argv[1] 是探针写的配置文件（命令行装不下）
+    with open(sys.argv[1], "rb") as _f:
+        CFG = json.load(_f)
 except Exception:
     CFG = {}
 

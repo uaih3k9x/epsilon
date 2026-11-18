@@ -79,12 +79,16 @@ func (b *Box) SelfTest(ctx context.Context, envDir string, w io.Writer) error {
 	if err := b.resetScratch(dir); err != nil {
 		return err
 	}
-	out, err := b.sysCanary(ctx, j, env, cfg)
+	cf, err := writeCanaryFiles(dir, cfg)
+	if err != nil {
+		return err
+	}
+	out, err := b.sysCanary(ctx, j, env, cf)
 	table("系统控制（python -I -S，不加载钩子）", out, err, SysChecks)
 	if err := b.resetScratch(dir); err != nil {
 		return err
 	}
-	out, err = b.hookCanary(ctx, j, env, cfg)
+	out, err = b.hookCanary(ctx, j, env, cf)
 	table("审计钩子（python -E -s -B，环境层 "+filepath.Base(envDir)+"）", out, err, hookWant)
 	if len(failed) > 0 {
 		return errors.New("自检没过: " + fmt.Sprint(failed))

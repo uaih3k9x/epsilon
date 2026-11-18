@@ -235,7 +235,11 @@ func (b *Box) Run(ctx context.Context, j Job) (res Result, err error) {
 	if err := b.resetScratch(j.Dir); err != nil {
 		return res, rejectf("准备 tmp\\: %v", err)
 	}
-	out, err := b.sysCanary(ctx, j, env, cfg)
+	cf, err := writeCanaryFiles(j.Dir, cfg)
+	if err != nil {
+		return res, rejectf("写金丝雀: %v", err)
+	}
+	out, err := b.sysCanary(ctx, j, env, cf)
 	if err != nil {
 		return res, err
 	}
@@ -243,7 +247,7 @@ func (b *Box) Run(ctx context.Context, j Job) (res Result, err error) {
 		b.setSoft("系统控制金丝雀不符（本机配置漂移，重跑 install.ps1）: " + err.Error())
 		return res, rejectf("系统控制金丝雀不符（本机配置漂移，不是任务的问题）: %v", err)
 	}
-	out, err = b.hookCanary(ctx, j, env, cfg)
+	out, err = b.hookCanary(ctx, j, env, cf)
 	if err != nil {
 		return res, err
 	}
@@ -298,7 +302,11 @@ func (b *Box) launch(ctx context.Context, j Job, env, args []string, onStart fun
 		return nil, rejectf("建 canary.out: %v", err)
 	}
 	defer f.Close()
-	p, err := b.P.Start(jobrun.Launch{Path: j.Interp, Args: args, Dir: filepath.Join(j.Dir, "code"), Env: env, Log: f})
+	l := jobrun.Launch{Path: j.Interp, Args: args, Dir: filepath.Join(j.Dir, "code"), Env: env, Log: f}
+	if err := checkCmdLine(l); err != nil {
+		return nil, rejectf("金丝雀: %v", err)
+	}
+	p, err := b.P.Start(l)
 	if err != nil {
 		return nil, b.startFailed(err)
 	}
@@ -325,14 +333,14 @@ func (b *Box) launch(ctx context.Context, j Job, env, args []string, onStart fun
 	return os.ReadFile(path)
 }
 
-func (b *Box) sysCanary(ctx context.Context, j Job, env []string, cfg string) ([]byte, error) {
+func (b *Box) sysCanary(ctx context.Context, j Job, env []string, cf canaryPaths) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return b.launch(ctx, j, env, []string{"-I", "-S", "-c", canarySysSrc, cfg}, nil)
+	return b.launch(ctx, j, env, []string{"-I", "-S", "-c", canaryBoot, cf.sys, cf.cfg}, nil)
 }
 
-func (b *Box) hookCanary(ctx context.Context, j Job, env []string, cfg string) ([]byte, error) {
+func (b *Box) hookCanary(ctx context.Context, j Job, env []string, cf canaryPaths) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -344,7 +352,7 @@ func (b *Box) hookCanary(ctx context.Context, j Job, env []string, cfg string) (
 	w := newWatcher(log, b.readyTimeout(), b.grace())
 	stop := serveAudit(srv, w)
 	main := 0
-	args := append(append([]string{}, envlayer.Flags...), "-c", canaryHookSrc, cfg)
+	args := append(append([]string{}, envlayer.Flags...), "-c", canaryBoot, cf.hook, cf.cfg)
 	out, err := b.launch(ctx, j, env, args, func(pid int) { main = pid; w.Start(pid) })
 	stop()
 	if err != nil {
@@ -382,7 +390,7 @@ func (b *Box) runJob(ctx context.Context, j Job, env []string) (Result, error) {
 	stop := serveAudit(srv, w)
 	main := 0
 	r, err := jobrun.Run(ctx, jobrun.Spec{Dir: j.Dir, Interp: j.Interp, Entry: j.Entry, Timeout: j.Timeout, DiskMaxMB: j.DiskMaxMB,
-		Env: j.Env, CheckEvery: j.CheckEvery, Start: b.P, BaseEnv: env,
+		Env: j.Env, CheckEvery: j.CheckEvery, Start: limitStarter{b.P}, BaseEnv: env,
 		OnStart: func(pid int) { main = pid; w.Start(pid) }, Abort: w.Abort()})
 	stop()
 	res := Result{Result: r, Audit: log.Summary(main), AuditLog: log.Bytes()}
