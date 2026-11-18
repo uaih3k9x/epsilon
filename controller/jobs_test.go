@@ -428,6 +428,10 @@ func TestJobControllerRestart(t *testing.T) {
 	r.beat("pc-01", true, nil)
 	r.beat("pc-01", true, st(ids[0], 1, proto.JobRunning))
 	r.restart()
+	// 别的节点先登记上、心跳进来：pc-01 还没来得及重新登记，不能当它失联
+	r.join("pc-02", true)
+	r.advance(5 * time.Second)
+	r.beat("pc-02", true, nil)
 	// 探针心跳 409 → 重新登记，带上手上的任务
 	if w := r.do("POST", "/v1/heartbeat", "tok", proto.Heartbeat{Node: "pc-01"}); w.Code != 409 {
 		t.Fatalf("主控重启后要 409: %d", w.Code)
@@ -437,8 +441,14 @@ func TestJobControllerRestart(t *testing.T) {
 	if d.Job == nil || d.Job.ID != ids[0] || d.Job.Attempt != 1 {
 		t.Fatalf("重启后任务还在这台: %+v", d.Job)
 	}
-	if v := r.job(ids[1]); v.State != "queued" {
-		t.Fatalf("排队的还在: %+v", v)
+	if v := r.job(ids[1]); v.Node == "pc-01" || v.State != "assigned" {
+		t.Fatalf("排队的还在，派给了空着的 pc-02: %+v", v)
+	}
+	// 一直没回来的节点，过了 stale 照样判失联
+	r.advance(31 * time.Second)
+	r.beat("pc-02", true, st(ids[1], 1, proto.JobRunning))
+	if v := r.job(ids[0]); v.State != "queued" || v.Attempt != 1 || len(v.Lost) != 1 {
+		t.Fatalf("pc-01 失联要放回队列: %+v", v)
 	}
 	// 编号接着往下排，不和旧的撞
 	more := r.mustSubmit(map[string]any{"package": r.pkg(nil)})

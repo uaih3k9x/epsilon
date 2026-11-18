@@ -80,6 +80,7 @@ type Controller struct {
 	jobs        map[string]*jobRec
 	jobSeq      int
 	queueBroken bool
+	jobsSince   time.Time // 第一次排程的时间：主控重启后给节点一个 stale 的时间重新登记
 	// JobRoots 是验钥匙环的根公钥，默认和探针、引导器同一套（loader.PublicKeys）；测试里换掉。
 	JobRoots []ed25519.PublicKey
 }

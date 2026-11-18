@@ -454,10 +454,14 @@ func (c *Controller) scheduleLocked(now time.Time) bool {
 	}
 	changed := false
 	stale := time.Duration(c.cfg.StaleSeconds) * time.Second
+	if c.jobsSince.IsZero() {
+		c.jobsSince = now // 主控刚起来：节点还没重新登记，先等一个 stale 再判失联
+	}
 	var queued []*jobRec
 	for _, j := range c.sortedJobs() {
 		if j.active() {
-			if n := c.nodes[j.Node]; n == nil || now.Sub(n.seen) >= stale {
+			n := c.nodes[j.Node]
+			if n == nil && now.Sub(c.jobsSince) >= stale || n != nil && now.Sub(n.seen) >= stale {
 				c.requeue(j, fmt.Sprintf("节点 %s 失联", j.Node))
 				changed = true
 			}
@@ -529,11 +533,14 @@ func (c *Controller) TickJobs() {
 	}
 }
 
-// jobFor 是这台节点心跳回包里要带的任务；带上就记"已发出"。调用方持 c.mu。
+// jobFor 是这台节点心跳回包里要带的任务；带上就记"已发出"（第一次发出时存盘）。调用方持 c.mu。
 func (c *Controller) jobFor(node string) *proto.JobAssign {
 	j := c.assignedTo(node)
 	if j == nil {
 		return nil
+	}
+	if !j.Delivered {
+		defer c.saveQueue()
 	}
 	var signed jobsign.SignedJob
 	json.Unmarshal([]byte(j.Signed), &signed)
