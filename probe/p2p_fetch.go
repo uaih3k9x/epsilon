@@ -170,10 +170,13 @@ func (a *Agent) pull(ctx context.Context, m proto.Manifest) error {
 	}
 }
 
-// pullRound 并发取一轮；每块按来源顺序试，取到一块就报 have。返回取到几块、有没有块给了来源。
+// pullRound 并发取一轮；每块按来源顺序试，取到一块就报 have（交给 haveBatcher，不等 HTTP）。
+// 返回取到几块、有没有块给了来源。
 func (a *Agent) pullRound(ctx context.Context, miss []string, sources map[string][]string, bad *blacklist, limit int64) (int, bool) {
 	var got atomic.Int32
 	var offered atomic.Bool
+	hb := a.startHaveBatcher()
+	defer hb.close()
 	work := make(chan string)
 	var wg sync.WaitGroup
 	for i := 0; i < a.fetchParallel; i++ {
@@ -192,7 +195,7 @@ func (a *Agent) pullRound(ctx context.Context, miss []string, sources map[string
 					bad.record(src, err)
 					if err == nil {
 						got.Add(1)
-						a.reportHave([]string{h}, nil)
+						hb.add(h)
 						break
 					}
 					if ctx.Err() == nil {
@@ -322,6 +325,52 @@ func (a *Agent) reportHave(add, del []string) {
 		return
 	}
 	a.haveAdd, a.haveDel = nil, nil
+}
+
+// haveBatcher 在后台替 worker 报新块：worker 只记下块名就回去接着取。上一次 POST 还没回来时
+// 取到的块攒着，和下一次一起报；主控不慢时和以前一样一块一报，主控慢或卡住时取块不跟着停。
+type haveBatcher struct {
+	mu      sync.Mutex
+	pending []string
+	kick    chan struct{} // 容量 1：有没报的块
+	done    chan struct{}
+}
+
+func (a *Agent) startHaveBatcher() *haveBatcher {
+	b := &haveBatcher{kick: make(chan struct{}, 1), done: make(chan struct{})}
+	go func() {
+		defer close(b.done)
+		flush := func() {
+			b.mu.Lock()
+			p := b.pending
+			b.pending = nil
+			b.mu.Unlock()
+			if len(p) > 0 {
+				a.reportHave(p, nil)
+			}
+		}
+		for range b.kick {
+			flush()
+		}
+		flush()
+	}()
+	return b
+}
+
+func (b *haveBatcher) add(h string) {
+	b.mu.Lock()
+	b.pending = append(b.pending, h)
+	b.mu.Unlock()
+	select {
+	case b.kick <- struct{}{}:
+	default: // 已经有一次在排队，会一起带走
+	}
+}
+
+// close 报完剩下的再返回。所有 add 都要在 close 之前。
+func (b *haveBatcher) close() {
+	close(b.kick)
+	<-b.done
 }
 
 // merge 把 more 加进 list（去重）。

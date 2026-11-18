@@ -351,3 +351,43 @@ func TestCapReaderBoundary(t *testing.T) {
 		t.Errorf("空块 limit=0: n=%d err=%v", n, err)
 	}
 }
+
+// 疑点 5：主控的 /v1/have 卡住时，并发取块不能跟着停（以前每个 worker 取到一块就排队等同一把锁里的 HTTP）。
+// 卡住期间取到的块攒着，主控恢复后一起报。
+func TestPullNotBlockedBySlowHave(t *testing.T) {
+	e := newFetchEnv(t, 8)
+	release := make(chan struct{})
+	inner := e.fc.handler()
+	ctl := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/have" {
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer ctl.Close()
+	e.a.cfg.Controller = ctl.URL
+	nb, _ := neighbor(t, func(w http.ResponseWriter, h string) { w.Write(e.data[h]) })
+	e.fc.peers = e.sources(nb.URL)
+
+	done := make(chan error, 1)
+	go func() { done <- e.a.fetch(context.Background(), "m1") }()
+	deadline := time.Now().Add(3 * time.Second)
+	for len(e.store.List()) < 8 {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatalf("have 卡住时只取到 %d/8 块：取块被报 have 拖住了", len(e.store.List()))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got, want := e.haveAdds(), sorted(e.hashes()); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("恢复后 have 应该补齐全部块: %v", got)
+	}
+}
