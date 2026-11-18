@@ -15,6 +15,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"epsilon/jobsign"
@@ -28,6 +29,9 @@ const (
 	queueFile    = "queue.json"
 	maxJobCount  = 1000
 )
+
+// verifyJob 是 jobsign.VerifyJob（测试里数验签次数）。
+var verifyJob = jobsign.VerifyJob
 
 var packageName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]@[0-9]+\.[0-9]+\.[0-9]+$`)
 
@@ -44,6 +48,7 @@ type jobRec struct {
 	Nodes      []string                   `json:"nodes,omitempty"` // 提交时的约束
 	Rooms      []string                   `json:"rooms,omitempty"`
 	MaxRetries int                        `json:"max_retries"`
+	MaxHours   float64                    `json:"max_hours,omitempty"` // 任务包的 max_hours：失联节点最多还能占着名额多久
 
 	State     string    `json:"state"`
 	Node      string    `json:"node,omitempty"`
@@ -101,33 +106,57 @@ func (c *Controller) loadQueue() {
 	}
 }
 
-// saveQueue 原子写 queue.json。调用方持 c.mu。
+// saveQueue 原子写 queue.json（临时文件 + Sync + 改名，断电不会留下空文件）。调用方持 c.mu。
+// 队列读坏了就一个字都不写：坏文件里是旧任务和序号，等人修，不能被只有新任务的文件盖掉。
 func (c *Controller) saveQueue() {
+	if c.queueBroken {
+		return
+	}
 	q := queueState{Seq: c.jobSeq, Jobs: c.sortedJobs()}
 	b, _ := json.MarshalIndent(q, "", "  ")
-	if err := os.MkdirAll(c.cfg.JobsDir, 0o755); err == nil {
-		tmp := filepath.Join(c.cfg.JobsDir, queueFile+".tmp")
-		if err = os.WriteFile(tmp, b, 0o644); err == nil {
-			err = os.Rename(tmp, filepath.Join(c.cfg.JobsDir, queueFile))
-		}
-		if err != nil {
-			log.Printf("任务队列没存上: %v", err)
+	err := os.MkdirAll(c.cfg.JobsDir, 0o755)
+	tmp := filepath.Join(c.cfg.JobsDir, queueFile+".tmp")
+	if err == nil {
+		var f *os.File
+		if f, err = os.Create(tmp); err == nil {
+			_, err = f.Write(b)
+			if err == nil {
+				err = f.Sync()
+			}
+			if cerr := f.Close(); err == nil {
+				err = cerr
+			}
 		}
 	}
+	if err == nil {
+		err = os.Rename(tmp, filepath.Join(c.cfg.JobsDir, queueFile))
+	}
+	if err != nil {
+		os.Remove(tmp)
+		log.Printf("任务队列没存上: %v", err)
+	}
 }
+
+const queueBrokenMsg = "任务队列 queue.json 读不了，批任务停用：修好或挪走再重启主控"
 
 func (c *Controller) sortedJobs() []*jobRec {
 	out := make([]*jobRec, 0, len(c.jobs))
 	for _, j := range c.jobs {
 		out = append(out, j)
 	}
-	sort.Slice(out, func(a, b int) bool {
-		if !out[a].Submitted.Equal(out[b].Submitted) {
-			return out[a].Submitted.Before(out[b].Submitted)
-		}
-		return out[a].ID < out[b].ID
-	})
+	sort.Slice(out, func(a, b int) bool { return submittedBefore(out[a], out[b]) })
 	return out
+}
+
+// submittedBefore 按提交顺序：同一次提交的 demo-9 排在 demo-10 前面（序号短的在前）。
+func submittedBefore(a, b *jobRec) bool {
+	if !a.Submitted.Equal(b.Submitted) {
+		return a.Submitted.Before(b.Submitted)
+	}
+	if len(a.ID) != len(b.ID) {
+		return len(a.ID) < len(b.ID)
+	}
+	return a.ID < b.ID
 }
 
 // keyring 读并验主控手上的钥匙环（每次现读：换钥匙环不用重启主控）。
@@ -179,6 +208,10 @@ type submitReq struct {
 func CodeManifestID(sha string) string { return "code-" + sha }
 
 func (c *Controller) submitJob(w http.ResponseWriter, r *http.Request) {
+	if c.queueBroken {
+		writeErr(w, http.StatusServiceUnavailable, queueBrokenMsg)
+		return
+	}
 	var req submitReq
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	dec.DisallowUnknownFields() // 不认识的字段直接拒（22.5）
@@ -215,6 +248,10 @@ func (c *Controller) submitJob(w http.ResponseWriter, r *http.Request) {
 	job, key, err := jobsign.VerifyJob(signed, kr, c.now())
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if key.Limits.MaxNodes == 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Sprintf("钥匙 %s 的 max_nodes 是 0，一台都不能派", key.Name))
 		return
 	}
 	if job.Name+"@"+job.Version != req.Package {
@@ -262,7 +299,7 @@ func (c *Controller) submitJob(w http.ResponseWriter, r *http.Request) {
 		}
 		c.jobs[id] = &jobRec{ID: id, Package: req.Package, Signed: raw, Signer: key.Name, Digest: jobsign.JobDigest(signed),
 			Params: params, GPU: job.NeedsGPU(), GPUMemMB: job.GPUMemMB, Nodes: req.Nodes, Rooms: req.Rooms,
-			MaxRetries: c.maxRetries(), State: jobQueued, Submitted: now}
+			MaxRetries: c.maxRetries(), MaxHours: job.MaxHours, State: jobQueued, Submitted: now}
 		ids = append(ids, id)
 	}
 	c.scheduleLocked(now)
@@ -312,7 +349,9 @@ func (c *Controller) view(j *jobRec) jobView {
 
 func (c *Controller) listJobs(w http.ResponseWriter, _ *http.Request) {
 	c.mu.Lock()
-	c.scheduleLocked(c.now())
+	if c.scheduleLocked(c.now()) {
+		c.saveQueue()
+	}
 	out := []jobView{}
 	for _, j := range c.sortedJobs() {
 		out = append(out, c.view(j))
@@ -344,6 +383,9 @@ func (c *Controller) cancelJob(w http.ResponseWriter, r *http.Request) {
 	defer c.mu.Unlock()
 	j := c.jobs[r.PathValue("id")]
 	switch {
+	case c.queueBroken:
+		writeErr(w, http.StatusServiceUnavailable, queueBrokenMsg)
+		return
 	case j == nil:
 		writeErr(w, http.StatusNotFound, "没有这个任务")
 		return
@@ -369,7 +411,11 @@ func (c *Controller) assignedTo(node string) *jobRec {
 }
 
 // requeue：机器失联或重启，任务放回队列从头跑；重试用完就算失败。调用方持 c.mu。
+// 输出已经传完的不重跑，见 finishFromOutput。
 func (c *Controller) requeue(j *jobRec, why string) {
+	if c.finishFromOutput(j, why) {
+		return
+	}
 	log.Printf("任务 %s 第 %d 次在 %s 上中断: %s", j.ID, j.Attempt, j.Node, why)
 	j.Lost = append(j.Lost, j.Node)
 	if j.Attempt > j.MaxRetries {
@@ -377,11 +423,50 @@ func (c *Controller) requeue(j *jobRec, why string) {
 		return
 	}
 	j.State, j.Node, j.Delivered, j.Detail = jobQueued, "", false, why
-	// 上一次没传完的块不要了，免得算进输出上限（传完的清单冻结，不会走到这里）
+	os.RemoveAll(filepath.Join(c.cfg.JobsDir, j.ID, "chunks")) // 上一次没传完的块不要了，免得算进输出上限
+}
+
+// finishFromOutput：探针传完输出（manifest.json 冻结）以后、下一次心跳报结束状态之前重启或失联了。
+// 这时不能重跑：下一次的运行摘要不一样，回传必然 409，白跑一遍还记成失败。
+// 按回传的 _runner/summary.json 结束（探针写的；任务写 _runner/ 探针就不回传）。调用方持 c.mu。
+func (c *Controller) finishFromOutput(j *jobRec, why string) bool {
 	dir := filepath.Join(c.cfg.JobsDir, j.ID)
-	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); os.IsNotExist(err) {
-		os.RemoveAll(filepath.Join(dir, "chunks"))
+	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err != nil {
+		return false
 	}
+	var sum struct {
+		ExitCode *int    `json:"exit_code"`
+		Killed   string  `json:"killed"`
+		Seconds  float64 `json:"seconds"`
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "output", "_runner", "summary.json"))
+	if err == nil {
+		err = json.Unmarshal(b, &sum)
+	}
+	state, detail := proto.JobFailed, ""
+	j.ExitCode = nil
+	switch {
+	case err != nil || sum.ExitCode == nil:
+		detail = "运行摘要读不了"
+	case sum.Killed == "timeout":
+		state, detail = proto.JobKilled, "超时"
+	case sum.Killed == "disk":
+		state, detail = proto.JobKilled, "写盘超过 disk_max_mb"
+	case sum.Killed != "":
+		detail = "被杀（" + sum.Killed + "）"
+	default:
+		code := *sum.ExitCode
+		j.ExitCode = &code
+		if code == 0 {
+			state = proto.JobSucceeded
+		} else {
+			detail = fmt.Sprintf("退出码 %d", code)
+		}
+	}
+	note := fmt.Sprintf("输出已传完，结束状态没报上来（%s），按回传的运行摘要记", why)
+	j.State, j.Detail, j.Seconds, j.Finished = state, strings.TrimLeft(detail+"；"+note, "；"), sum.Seconds, c.now()
+	log.Printf("任务 %s 第 %d 次在 %s 上: %s", j.ID, j.Attempt, j.Node, j.Detail)
+	return true
 }
 
 // reconcile 拿探针报的任务状态（登记或心跳）对账。调用方持 c.mu。
@@ -413,15 +498,13 @@ func (c *Controller) reconcile(node string, st *proto.JobStatus, restarted bool)
 	return changed
 }
 
-// nodeFree：开了能力 32、心跳没过期、手上没有没结束的任务（包括正在被杀的旧任务）。调用方持 c.mu。
-func (c *Controller) nodeFree(name string, n *node, now time.Time) bool {
+// nodeFree：开了能力 32、心跳没过期、探针手上没有没结束的任务（包括正在被杀的旧任务）。
+// 主控这边派给它的任务由调用方另查。调用方持 c.mu。
+func (c *Controller) nodeFree(n *node, now time.Time) bool {
 	if !n.hb.Jobs && !n.reg.Jobs || now.Sub(n.seen) >= time.Duration(c.cfg.StaleSeconds)*time.Second {
 		return false
 	}
-	if n.hb.Job != nil && !proto.JobFinal(n.hb.Job.State) {
-		return false
-	}
-	return c.assignedTo(name) == nil
+	return n.hb.Job == nil || proto.JobFinal(n.hb.Job.State)
 }
 
 func (c *Controller) fits(j *jobRec, key jobsign.Key, name string, n *node) bool {
@@ -448,6 +531,8 @@ func (c *Controller) fits(j *jobRec, key jobsign.Key, name string, n *node) bool
 }
 
 // scheduleLocked：先把失联节点上的任务放回队列，再给排队的任务挑节点。调用方持 c.mu。
+// 每次心跳都在 c.mu 里跑：先做便宜的（有没有空节点、钥匙名额满没满、挑得出节点没有），
+// 真要派了才读钥匙环、验签，排队再多每次也只验要派出去的那几份。
 func (c *Controller) scheduleLocked(now time.Time) bool {
 	if !c.jobsEnabled() || c.queueBroken {
 		return false
@@ -458,7 +543,7 @@ func (c *Controller) scheduleLocked(now time.Time) bool {
 		c.jobsSince = now // 主控刚起来：节点还没重新登记，先等一个 stale 再判失联
 	}
 	var queued []*jobRec
-	for _, j := range c.sortedJobs() {
+	for _, j := range c.jobs {
 		if j.active() {
 			n := c.nodes[j.Node]
 			if n == nil && now.Sub(c.jobsSince) >= stale || n != nil && now.Sub(n.seen) >= stale {
@@ -473,55 +558,90 @@ func (c *Controller) scheduleLocked(now time.Time) bool {
 	if len(queued) == 0 {
 		return changed
 	}
+	occupied := map[string]bool{}
+	busy := map[string]int{} // 每把钥匙现在占着几台
+	for _, j := range c.jobs {
+		if j.active() {
+			occupied[j.Node] = true
+			busy[j.Signer]++
+		}
+	}
+	var free []string
+	for name, n := range c.nodes {
+		// 探针还报着没结束、主控这边已经不算派给它的任务（撤销了正在杀、失联了可能还在跑）：
+		// 也算那把钥匙占着一台。失联的最多算到最后一次心跳后 max_hours，探针自己到时也会杀。
+		if hj := n.hb.Job; hj != nil && !proto.JobFinal(hj.State) {
+			r := c.jobs[hj.ID]
+			counted := r != nil && r.active() && r.Node == name && r.Attempt == hj.Attempt
+			if r != nil && !counted && (now.Sub(n.seen) < stale || now.Sub(n.seen) < time.Duration(r.MaxHours*float64(time.Hour))) {
+				busy[r.Signer]++
+			}
+		}
+		if !occupied[name] && c.nodeFree(n, now) {
+			free = append(free, name)
+		}
+	}
+	if len(free) == 0 {
+		return changed
+	}
+	sort.Strings(free)
+	sort.Slice(queued, func(a, b int) bool { return submittedBefore(queued[a], queued[b]) })
 	kr, _, err := c.keyring()
 	if err != nil {
 		log.Printf("钥匙环不可用，先不派任务: %v", err)
 		return changed
 	}
-	names := make([]string, 0, len(c.nodes))
-	for name := range c.nodes {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	busy := map[string]int{} // 每把钥匙现在占着几台
-	for _, j := range c.jobs {
-		if j.active() {
-			busy[j.Signer]++
-		}
+	keys := map[string]jobsign.Key{}
+	for _, k := range kr.Keys {
+		keys[k.Name] = k
 	}
 	for _, j := range queued {
+		if len(free) == 0 {
+			break
+		}
+		key, ok := keys[j.Signer] // 不在钥匙环里的直接去验签，验不过就 rejected
+		if ok && key.Limits.MaxNodes == 0 {
+			if msg := fmt.Sprintf("钥匙 %s 的 max_nodes 是 0，一台都不派", key.Name); j.Detail != msg {
+				j.Detail, changed = msg, true
+			}
+			continue
+		}
+		if ok && busy[key.Name] >= key.Limits.MaxNodes {
+			continue
+		}
+		pick := ""
+		if ok {
+			if pick = c.pickNode(j, key, free); pick == "" {
+				continue
+			}
+		}
 		var signed jobsign.SignedJob
 		json.Unmarshal([]byte(j.Signed), &signed)
-		_, key, err := jobsign.VerifyJob(signed, kr, now) // 钥匙环可能换过：吊销、过期
-		if err != nil {
+		if _, _, err := verifyJob(signed, kr, now); err != nil { // 钥匙环可能换过：吊销、过期
 			j.State, j.Detail, j.Finished = proto.JobRejected, "主控复核: "+err.Error(), now
 			changed = true
 			continue
 		}
-		if busy[key.Name] >= key.Limits.MaxNodes { // max_nodes 0 = 一台都不派
-			continue
-		}
-		pick := ""
-		for pass := 0; pass < 2 && pick == ""; pass++ { // 先避开失联过的节点，实在没有再用
-			for _, name := range names {
-				n := c.nodes[name]
-				if (pass == 0) == slices.Contains(j.Lost, name) || !c.nodeFree(name, n, now) || !c.fits(j, key, name, n) {
-					continue
-				}
-				pick = name
-				break
-			}
-		}
-		if pick == "" {
-			continue
-		}
 		j.State, j.Node, j.Attempt, j.Delivered, j.Detail = jobAssigned, pick, j.Attempt+1, false, ""
 		j.ExitCode, j.Started, j.Seconds = nil, time.Time{}, 0
+		free = slices.DeleteFunc(free, func(n string) bool { return n == pick })
 		busy[key.Name]++
 		changed = true
 		log.Printf("任务 %s 第 %d 次派给 %s", j.ID, j.Attempt, pick)
 	}
 	return changed
+}
+
+// pickNode 从空着的节点（按名字排好）里挑一台：先避开失联过的，实在没有再用。
+func (c *Controller) pickNode(j *jobRec, key jobsign.Key, free []string) string {
+	for pass := 0; pass < 2; pass++ {
+		for _, name := range free {
+			if (pass == 0) != slices.Contains(j.Lost, name) && c.fits(j, key, name, c.nodes[name]) {
+				return name
+			}
+		}
+	}
+	return ""
 }
 
 // TickJobs 给主程序定时调：没有心跳进来时也要发现失联节点。

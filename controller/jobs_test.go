@@ -2,18 +2,21 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"epsilon/internal/jobtest"
+	"epsilon/joboutput"
 	"epsilon/jobsign"
 	"epsilon/proto"
 )
@@ -350,11 +353,12 @@ func TestJobMaxNodes(t *testing.T) {
 
 func TestJobMaxNodesZeroMeansNone(t *testing.T) {
 	r := newJobRig(t, nil)
+	pkg := r.pkg(nil)
+	r.mustSubmit(map[string]any{"package": pkg})
 	ring := r.f.Ring
-	ring.Keys[0].Limits.MaxNodes = 0
+	ring.Keys[0].Limits.MaxNodes = 0 // 提交以后钥匙环换了
 	r.f.WriteKeyring(t, ring)
 	r.join("pc-01", true)
-	r.mustSubmit(map[string]any{"package": r.pkg(nil)})
 	if d := r.beat("pc-01", true, nil); d.Job != nil {
 		t.Fatal("max_nodes 0 = 一台都不派（宁可误拒）")
 	}
@@ -534,5 +538,197 @@ func TestJobOutputBoundToNode(t *testing.T) {
 	}
 	if v := r.job(id); v.Output {
 		t.Fatal("还没传清单")
+	}
+}
+
+type hdrTransport struct{ node, attempt string }
+
+func (t hdrTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	r.Header.Set("X-Epsilon-Node", t.node)
+	r.Header.Set("X-Epsilon-Attempt", t.attempt)
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// uploadOutput 冒充探针把一份输出传完（含平台写的 _runner/summary.json）。
+func (r *jobRig) uploadOutput(id, node string, attempt int, summary string) {
+	r.t.Helper()
+	srv := httptest.NewServer(r.h)
+	defer srv.Close()
+	out := r.t.TempDir()
+	os.WriteFile(filepath.Join(out, "RESULT.json"), []byte(`{"ok":true}`), 0o644)
+	os.MkdirAll(filepath.Join(out, "_runner"), 0o755)
+	os.WriteFile(filepath.Join(out, "_runner", "summary.json"), []byte(summary), 0o644)
+	hc := &http.Client{Transport: hdrTransport{node, strconv.Itoa(attempt)}}
+	if _, err := joboutput.Upload(context.Background(), hc, srv.URL, "tok", id, out, 0); err != nil {
+		r.t.Fatalf("回传: %v", err)
+	}
+}
+
+func TestJobOutputCompleteNotRerun(t *testing.T) {
+	// 输出已经传完、结束状态还没随心跳报上来，探针就重启了 / 节点失联了：不能重跑（第二次必然 409），按摘要结束
+	cases := []struct {
+		name, summary, state, detail string
+		exit                         int
+		lose                         func(r *jobRig)
+	}{
+		{"探针重启 成功", `{"exit_code":0,"killed":""}`, proto.JobSucceeded, "", 0, func(r *jobRig) { r.register("pc-01", true, nil) }},
+		{"探针重启 退出码 3", `{"exit_code":3,"killed":""}`, proto.JobFailed, "退出码 3", 3, func(r *jobRig) { r.register("pc-01", true, nil) }},
+		{"节点失联 超时被杀", `{"exit_code":-1,"killed":"timeout"}`, proto.JobKilled, "超时", -1, func(r *jobRig) {
+			r.advance(31 * time.Second)
+			r.join("pc-02", true)
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newJobRig(t, nil)
+			r.join("pc-01", true)
+			id := r.mustSubmit(map[string]any{"package": r.pkg(nil)})[0]
+			r.beat("pc-01", true, nil)
+			r.beat("pc-01", true, st(id, 1, proto.JobUploading))
+			r.uploadOutput(id, "pc-01", 1, c.summary)
+			c.lose(r)
+			v := r.job(id)
+			if v.State != c.state || !strings.Contains(v.Detail, c.detail) || !strings.Contains(v.Detail, "输出已传完") || v.Attempt != 1 || !v.Output {
+				t.Fatalf("要按摘要结束成 %s，不重跑: %+v", c.state, v)
+			}
+			if c.state == proto.JobFailed && (v.ExitCode == nil || *v.ExitCode != c.exit) {
+				t.Fatalf("退出码要从摘要里来: %+v", v)
+			}
+			if d := r.beat("pc-01", true, nil); d.Job != nil {
+				t.Fatal("结束了不能再派")
+			}
+		})
+	}
+}
+
+func TestJobBrokenQueueNotOverwritten(t *testing.T) {
+	r := newJobRig(t, nil)
+	pkg := r.pkg(nil)
+	os.MkdirAll(r.cfg.JobsDir, 0o755)
+	qf := filepath.Join(r.cfg.JobsDir, queueFile)
+	broken := []byte(`{"seq":7,"jobs":[{"id":"old-7",`)
+	os.WriteFile(qf, broken, 0o644)
+	r.restart()
+	if code, _, raw := r.submit(map[string]any{"package": pkg}); code != http.StatusServiceUnavailable {
+		t.Fatalf("队列坏了要 503，不能收: %d %s", code, raw)
+	}
+	if w := r.do("DELETE", "/v1/jobs/old-7", "sk-1", nil); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("队列坏了撤销也要 503: %d", w.Code)
+	}
+	r.join("pc-01", true)
+	r.c.TickJobs()
+	if b, _ := os.ReadFile(qf); !bytes.Equal(b, broken) {
+		t.Fatalf("坏了的 queue.json 不能被覆盖: %s", b)
+	}
+}
+
+func TestJobMaxNodesCountsStillRunning(t *testing.T) {
+	setup := func(t *testing.T) (*jobRig, []string) {
+		r := newJobRig(t, nil)
+		ring := r.f.Ring
+		ring.Keys[0].Limits.MaxNodes = 1
+		r.f.WriteKeyring(t, ring)
+		r.join("pc-01", true)
+		r.join("pc-02", true)
+		ids := r.mustSubmit(map[string]any{"package": r.pkg(nil), "count": 2})
+		r.beat("pc-01", true, nil)
+		r.beat("pc-01", true, st(ids[0], 1, proto.JobRunning))
+		return r, ids
+	}
+	t.Run("撤销后探针还在杀", func(t *testing.T) {
+		r, ids := setup(t)
+		if w := r.do("DELETE", "/v1/jobs/"+ids[0], "sk-1", nil); w.Code != 200 {
+			t.Fatalf("撤销: %d", w.Code)
+		}
+		if d := r.beat("pc-02", true, nil); d.Job != nil {
+			t.Fatal("pc-01 还在跑这把钥匙的任务，max_nodes 1 不能再派")
+		}
+		r.beat("pc-01", true, &proto.JobStatus{ID: ids[0], Attempt: 1, State: proto.JobKilled})
+		if v := r.job(ids[1]); v.State != "assigned" {
+			t.Fatalf("pc-01 停下了就能派: %+v", v)
+		}
+	})
+	t.Run("失联但可能还在跑", func(t *testing.T) {
+		r, ids := setup(t)
+		r.advance(31 * time.Second) // pc-01 失联：任务放回队列
+		if d := r.beat("pc-02", true, nil); d.Job != nil {
+			t.Fatalf("pc-01 最后报的还在跑，max_hours 内照样占着名额: %+v", d.Job)
+		}
+		if v := r.job(ids[0]); v.State != "queued" {
+			t.Fatalf("失联照样放回队列: %+v", v)
+		}
+		r.advance(time.Hour) // 过了 max_hours（1 小时）：探针自己也早杀了
+		if d := r.beat("pc-02", true, nil); d.Job == nil || d.Job.ID != ids[0] {
+			t.Fatalf("过了 max_hours 就不算占着: %+v", d.Job)
+		}
+	})
+}
+
+func TestJobListPersistsScheduling(t *testing.T) {
+	r := newJobRig(t, nil)
+	r.join("pc-01", true)
+	id := r.mustSubmit(map[string]any{"package": r.pkg(nil)})[0]
+	r.beat("pc-01", true, nil)
+	r.beat("pc-01", true, st(id, 1, proto.JobRunning))
+	r.advance(31 * time.Second)
+	r.do("GET", "/v1/jobs", "sk-1", nil) // GET 里排程发现失联、放回队列
+	b, _ := os.ReadFile(filepath.Join(r.cfg.JobsDir, queueFile))
+	var q queueState
+	json.Unmarshal(b, &q)
+	if len(q.Jobs) != 1 || q.Jobs[0].State != jobQueued || len(q.Jobs[0].Lost) != 1 {
+		t.Fatalf("GET 改了的状态要存盘: %s", b)
+	}
+}
+
+func TestJobScheduleSkipsCryptoWhenNothingCanRun(t *testing.T) {
+	// 每次心跳都在 c.mu 里排程：没机器可派、钥匙名额满了的时候不能把排队的任务挨个验签
+	n := 0
+	old := verifyJob
+	verifyJob = func(s jobsign.SignedJob, kr jobsign.Keyring, now time.Time) (jobsign.Job, jobsign.Key, error) {
+		n++
+		return old(s, kr, now)
+	}
+	defer func() { verifyJob = old }()
+	r := newJobRig(t, nil)
+	ring := r.f.Ring
+	ring.Keys[0].Limits.MaxNodes = 1
+	r.f.WriteKeyring(t, ring)
+	r.join("pc-01", true)
+	r.join("pc-02", true)
+	ids := r.mustSubmit(map[string]any{"package": r.pkg(nil), "count": 50})
+	r.beat("pc-01", true, nil)
+	r.beat("pc-01", true, st(ids[0], 1, proto.JobRunning))
+	n = 0
+	for i := 0; i < 5; i++ {
+		r.beat("pc-01", true, st(ids[0], 1, proto.JobRunning))
+		r.beat("pc-02", true, nil)
+	}
+	if n != 0 {
+		t.Fatalf("名额满了还验了 %d 次签", n)
+	}
+	r.beat("pc-01", true, st(ids[0], 1, proto.JobSucceeded))
+	if v := r.job(ids[1]); v.State != "assigned" {
+		t.Fatalf("名额空出来照常派: %+v", v)
+	}
+	if n > 2 {
+		t.Fatalf("派一份只该验一次，验了 %d 次", n)
+	}
+}
+
+func TestJobMaxNodesZeroExplained(t *testing.T) {
+	r := newJobRig(t, nil)
+	pkg := r.pkg(nil)
+	id := r.mustSubmit(map[string]any{"package": pkg})[0]
+	ring := r.f.Ring
+	ring.Version = 2
+	ring.Keys[0].Limits.MaxNodes = 0
+	r.f.WriteKeyring(t, ring)
+	if code, _, raw := r.submit(map[string]any{"package": pkg}); code != 400 || !strings.Contains(raw, "max_nodes") {
+		t.Fatalf("max_nodes 0 的钥匙提交时就拒: %d %s", code, raw)
+	}
+	r.join("pc-01", true)
+	if v := r.job(id); v.State != "queued" || !strings.Contains(v.Detail, "max_nodes") {
+		t.Fatalf("排队中的要说明为什么不派: %+v", v)
 	}
 }
