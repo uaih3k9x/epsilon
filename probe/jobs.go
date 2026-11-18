@@ -56,6 +56,7 @@ type jobState struct {
 	jobCheckEvery   time.Duration              // 多久查一次任务写盘；0 = 10 秒
 	jobUploadRetry  time.Duration              // 回传失败后多久再试
 	jobFetchTimeout time.Duration              // 拉环境层和代码包最多多久；0 = 2 小时
+	jobFetchRetry   time.Duration              // 拉取一时出错后第一次多久再试（之后翻倍）；0 = 5 秒
 	clock           func() time.Time           // 本机时钟；nil = time.Now
 
 	jmu    sync.Mutex
@@ -64,6 +65,7 @@ type jobState struct {
 	krMu    sync.Mutex // 拉钥匙环、读写版本号一次一个
 	krAt    time.Time  // 上次后台刷新（只在 Step 里碰）
 	krBusy  atomic.Bool
+	kr404   atomic.Bool // 主控没配批任务（钥匙环 404）已经记过一次日志
 	skewMu  sync.Mutex
 	ctlSkew time.Duration // 主控 Date 比本机快多少（只记正的）
 }
@@ -197,8 +199,18 @@ func (a *Agent) refreshKeyring(now time.Time) {
 		defer a.krBusy.Store(false)
 		ctx, cancel := context.WithTimeout(a.fetchCtx, time.Minute)
 		defer cancel()
-		if _, err := a.keyring(ctx); err != nil {
+		_, err := a.keyring(ctx)
+		var he httpError
+		switch {
+		case errors.As(err, &he) && he.code == http.StatusNotFound:
+			// 主控没配 jobs_dir / job_keyring：正常情况，只记一次
+			if !a.kr404.Swap(true) {
+				log.Printf("主控没有任务钥匙环（/v1/job-keyring 404），批任务用不了；以后不再记")
+			}
+		case err != nil:
 			log.Printf("任务钥匙环: %v", err)
+		default:
+			a.kr404.Store(false)
 		}
 	}()
 }
@@ -215,10 +227,18 @@ func (a *Agent) getRaw(ctx context.Context, path string, max int64) ([]byte, err
 	}
 	defer r.Body.Close()
 	if r.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%s: HTTP %d", path, r.StatusCode)
+		return nil, httpError{path, r.StatusCode}
 	}
 	return io.ReadAll(io.LimitReader(r.Body, max))
 }
+
+// httpError 是主控回了非 200。
+type httpError struct {
+	path string
+	code int
+}
+
+func (e httpError) Error() string { return fmt.Sprintf("%s: HTTP %d", e.path, e.code) }
 
 // stepJob 每个 Step 调：期望状态换了任务（或没了）就撤销手上的；手上空了、期望里有就开始。
 // 返回 true 表示这台机器现在归批任务，不起推理。
@@ -262,9 +282,14 @@ func (a *Agent) startJob(as proto.JobAssign) {
 		if !j.started.IsZero() {
 			j.status.Seconds = st.Seconds
 		}
+		signer, digest := j.status.Signer, j.status.Digest
 		a.jmu.Unlock()
 		log.Printf("任务 %s 第 %d 次: %s %s", as.ID, as.Attempt, st.State, st.Detail)
-		a.sendEvent(proto.Event{Kind: "job", Detail: fmt.Sprintf("结束 %s#%d %s %s", as.ID, as.Attempt, st.State, st.Detail)})
+		who := "（没验过签，不知道签名者）"
+		if signer != "" {
+			who = fmt.Sprintf("签名 %s 摘要 %s", signer, digest[:min(12, len(digest))])
+		}
+		a.sendEvent(proto.Event{Kind: "job", Detail: fmt.Sprintf("结束 %s#%d %s %s %s", as.ID, as.Attempt, st.State, who, st.Detail)})
 	}()
 }
 
@@ -310,9 +335,21 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 	if !jobIDPattern.MatchString(as.ID) {
 		return fail(reject("任务号不合法: %q", as.ID))
 	}
-	kr, err := a.keyring(ctx)
-	if err != nil {
+	fetchTimeout := a.jobFetchTimeout
+	if fetchTimeout <= 0 {
+		fetchTimeout = 2 * time.Hour // 环境层 5–8 GB，教室内 P2P 够了；拉不下来就别一直占着机器
+	}
+	fctx, fcancel := context.WithTimeout(ctx, fetchTimeout)
+	defer fcancel()
+	fetchFailed := func(err error) proto.JobStatus {
+		if fctx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+			return proto.JobStatus{State: proto.JobFailed, Detail: fmt.Sprintf("%s 内没拉齐钥匙环、环境层和代码包: %v", fetchTimeout, err)}
+		}
 		return fail(err)
+	}
+	var kr jobsign.Keyring
+	if err := a.retryFetch(fctx, as.ID, func() (err error) { kr, err = a.keyring(fctx); return }); err != nil {
+		return fetchFailed(err)
 	}
 	var signed jobsign.SignedJob
 	if err := json.Unmarshal([]byte(as.Signed), &signed); err != nil {
@@ -343,24 +380,17 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 		log.Printf("任务 %s 声明要联网；出站防火墙还没做（issue #1 第 4 步）", as.ID)
 	}
 
-	fetchTimeout := a.jobFetchTimeout
-	if fetchTimeout <= 0 {
-		fetchTimeout = 2 * time.Hour // 环境层 5–8 GB，教室内 P2P 够了；拉不下来就别一直占着机器
-	}
-	fctx, fcancel := context.WithTimeout(ctx, fetchTimeout)
-	envDir, err := a.prepareEnv(fctx, kr, job.Env)
-	var codeZip string
-	if err == nil {
-		codeZip, err = a.prepareCode(fctx, job.CodeSHA256)
-	}
-	timedOut := fctx.Err() == context.DeadlineExceeded
-	fcancel()
-	if err != nil && timedOut && ctx.Err() == nil {
-		return proto.JobStatus{State: proto.JobFailed, Detail: fmt.Sprintf("%s 内没拉齐环境层和代码包: %v", fetchTimeout, err)}
-	}
+	var envDir, codeZip string
+	err = a.retryFetch(fctx, as.ID, func() (err error) {
+		if envDir, err = a.prepareEnv(fctx, kr, job.Env); err == nil {
+			codeZip, err = a.prepareCode(fctx, job.CodeSHA256)
+		}
+		return
+	})
 	if err != nil {
-		return fail(err)
+		return fetchFailed(err)
 	}
+	fcancel()
 	dir := filepath.Join(a.cfg.ArtifactRoot, "jobs", as.ID)
 	if err := jobrun.Prepare(dir, codeZip, paramsJSON); err != nil {
 		return fail(reject("展开任务目录: %v", err))
@@ -394,11 +424,18 @@ func (a *Agent) runJob(ctx context.Context, j *jobRun) proto.JobStatus {
 			end.State, end.Detail = proto.JobFailed, fmt.Sprintf("退出码 %d", code)
 		}
 	}
+	// output/_runner/ 只许平台写：任务进程树这时已经整棵杀掉，有东西就是任务自己写的（伪造摘要、绕过 output_max_mb）
+	if _, err := os.Lstat(filepath.Join(dir, "output", jobrun.Runner)); !os.IsNotExist(err) {
+		return proto.JobStatus{State: proto.JobFailed, Detail: "任务写了平台保留的 output/" + jobrun.Runner + "/，不回传",
+			ExitCode: end.ExitCode, Seconds: res.Seconds}
+	}
 	if n := jobrun.OutputBytes(dir); n > int64(job.OutputMaxMB)<<20 {
 		return proto.JobStatus{State: proto.JobFailed, Detail: fmt.Sprintf("output 有 %d MB，超过 output_max_mb %d，不回传", n>>20, job.OutputMaxMB),
 			ExitCode: end.ExitCode, Seconds: res.Seconds}
 	}
-	a.writeSummary(dir, as, job, key.Name, digest, params, res)
+	if err := a.writeSummary(dir, as, job, key.Name, digest, params, res); err != nil {
+		return proto.JobStatus{State: proto.JobFailed, Detail: "运行摘要写不进去，不回传: " + err.Error(), ExitCode: end.ExitCode, Seconds: res.Seconds}
+	}
 	a.setJob(j, func(s *proto.JobStatus) { s.State = proto.JobUploading })
 	if err := a.uploadOutput(ctx, as, filepath.Join(dir, "output")); err != nil {
 		if ctx.Err() != nil {
@@ -509,15 +546,44 @@ func fileSHA256(p string) (string, error) {
 }
 
 // writeSummary 写 output/_runner/：运行摘要和 job.log 末尾，随输出回传（失败时也能看到原因）。
-func (a *Agent) writeSummary(dir string, as proto.JobAssign, job jobsign.Job, signer, digest string, params map[string]json.RawMessage, res jobrun.Result) {
+// 摘要是审核人核对签名者、摘要、参数的依据，写不进去就报错，不回传没有摘要的输出。
+func (a *Agent) writeSummary(dir string, as proto.JobAssign, job jobsign.Job, signer, digest string, params map[string]json.RawMessage, res jobrun.Result) error {
 	rd := filepath.Join(dir, "output", jobrun.Runner)
-	os.MkdirAll(rd, 0o755)
+	if err := os.Mkdir(rd, 0o755); err != nil {
+		return err
+	}
 	sum := map[string]any{"id": as.ID, "attempt": as.Attempt, "node": a.cfg.Node, "package": job.Name + "@" + job.Version,
 		"signer": signer, "digest": digest, "params": params, "exit_code": res.ExitCode, "killed": res.Killed,
 		"seconds": res.Seconds, "probe": a.version}
 	b, _ := json.MarshalIndent(sum, "", "  ")
-	os.WriteFile(filepath.Join(rd, "summary.json"), b, 0o644)
-	os.WriteFile(filepath.Join(rd, "job.log"), []byte(tailFile(filepath.Join(dir, "job.log"), jobLogKeep)), 0o644)
+	if err := os.WriteFile(filepath.Join(rd, "summary.json"), b, 0o644); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(rd, "job.log"), []byte(tailFile(filepath.Join(dir, "job.log"), jobLogKeep)), 0o644)
+}
+
+// retryFetch 跑 f，主控一时出错（连不上、超时、5xx）就退避重试，直到 ctx（拉取时限）到。
+// 验签、哈希这类 rejectErr 不重试：内容不对，再拉也一样；主控明确回 4xx（没有这个清单）也不重试。
+func (a *Agent) retryFetch(ctx context.Context, id string, f func() error) error {
+	wait := a.jobFetchRetry
+	if wait <= 0 {
+		wait = 5 * time.Second
+	}
+	for {
+		err := f()
+		var rj rejectErr
+		var he httpError
+		if err == nil || errors.As(err, &rj) || errors.As(err, &he) && he.code < 500 || ctx.Err() != nil {
+			return err
+		}
+		log.Printf("任务 %s 拉取出错（%s 后重试）: %v", id, wait, err)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(wait):
+		}
+		wait = min(wait*2, 2*time.Minute)
+	}
 }
 
 // jobTransport 给回传请求带上节点名和第几次：主控只收当前派到的那台、那一次。

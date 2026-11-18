@@ -29,11 +29,11 @@ import (
 )
 
 func fakePython(args []string) int {
-	if len(args) < 3 || args[0] != "-E" || args[1] != "-B" {
+	if len(args) < 4 || args[0] != "-E" || args[1] != "-s" || args[2] != "-B" {
 		fmt.Fprintln(os.Stderr, "参数不对:", args)
 		return 90
 	}
-	b, err := os.ReadFile(args[2])
+	b, err := os.ReadFile(args[3])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 91
@@ -55,7 +55,7 @@ func fakePython(args []string) int {
 		return n
 	case "tree": // 起一个孙进程，写下 pid，都睡着
 		os.WriteFile("sleep.py", []byte("sleep"), 0o644)
-		c := exec.Command(os.Args[0], "-E", "-B", "sleep.py")
+		c := exec.Command(os.Args[0], "-E", "-s", "-B", "sleep.py")
 		c.Env = os.Environ()
 		if err := c.Start(); err != nil {
 			return 92
@@ -64,6 +64,16 @@ func fakePython(args []string) int {
 		time.Sleep(time.Hour)
 	case "sleep":
 		time.Sleep(time.Hour)
+	case "forge": // 往平台保留的 _runner/ 里塞东西：伪造运行摘要、绕过 output_max_mb
+		os.MkdirAll("../output/_runner", 0o755)
+		os.WriteFile("../output/_runner/big.bin", make([]byte, 11<<20), 0o644)
+		os.WriteFile("../output/_runner/summary.json", []byte(`{"signer":"forged","digest":"0000"}`), 0o444)
+		if len(f) > 1 && f[1] == "dir" { // summary.json 做成目录：root 也写不进去
+			os.Remove("../output/_runner/summary.json")
+			os.MkdirAll("../output/_runner/summary.json", 0o755)
+		}
+		os.Chmod("../output/_runner", 0o555)
+		return 0
 	}
 	return 0
 }
@@ -75,13 +85,22 @@ type evil struct {
 	keyring   []byte
 	manifests map[string][]byte
 	mutate    func(*proto.JobAssign)
-	noSource  bool // peers 一律说"现在没人能给"
+	noSource  bool           // peers 一律说"现在没人能给"
+	fail      map[string]int // 路径前缀 → 还要回几次 503（模拟主控一时出错）
 }
 
 func (e *evil) set(f func(e *evil)) { e.mu.Lock(); f(e); e.mu.Unlock() }
 
 func (e *evil) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	e.mu.Lock()
+	for prefix, n := range e.fail {
+		if n > 0 && strings.HasPrefix(r.URL.Path, prefix) {
+			e.fail[prefix] = n - 1
+			e.mu.Unlock()
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	kr, mutate := e.keyring, e.mutate
 	m := e.manifests[strings.TrimPrefix(r.URL.Path, "/v1/manifests/")]
 	e.mu.Unlock()
@@ -172,6 +191,7 @@ func (e *e2e) probe(name string, mod func(*Agent)) *probeRig {
 	a.Assemble = func(m proto.Manifest, root string) error { return chunk.Assemble(m, store, root) }
 	a.JobRoots = []ed25519.PublicKey{e.f.RootPub}
 	a.beatEvery, a.jobCheckEvery, a.jobUploadRetry = 100*time.Millisecond, 50*time.Millisecond, 100*time.Millisecond
+	a.jobFetchRetry = 50 * time.Millisecond
 	a.jobInterp = func(string) string { return os.Args[0] }
 	a.jobEnv = []string{"EPSILON_FAKE_PY=1"}
 	if mod != nil {
@@ -585,7 +605,8 @@ func TestJobE2ERealPython(t *testing.T) {
 from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 P = json.loads((ROOT / "params.json").read_text(encoding="utf-8"))
-(ROOT / "output" / "RESULT.json").write_text(json.dumps({"ok": True, "params": P, "argv": sys.argv[1:]}), encoding="utf-8")
+(ROOT / "output" / "RESULT.json").write_text(json.dumps({"ok": True, "params": P, "argv": sys.argv[1:],
+    "no_user_site": sys.flags.no_user_site, "ignore_env": sys.flags.ignore_environment}), encoding="utf-8")
 print("EPSILON-PROGRESS 1.0 done", flush=True)
 `
 	id := e.submit(map[string]any{"package": e.pkg("pyjob", script, func(j *jobsign.Job) { j.Entry = []string{"python", "-u", "main.py", "--x"} }),
@@ -598,4 +619,68 @@ print("EPSILON-PROGRESS 1.0 done", flush=True)
 	if !strings.Contains(string(files["RESULT.json"]), `"sleep_ms": 1`) || !strings.Contains(string(files["RESULT.json"]), `"--x"`) {
 		t.Fatalf("RESULT.json: %s", files["RESULT.json"])
 	}
+	// -E 不关用户 site-packages，要 -s：那里的 .pth 会跑进以后每个任务
+	if !strings.Contains(string(files["RESULT.json"]), `"no_user_site": 1`) || !strings.Contains(string(files["RESULT.json"]), `"ignore_env": 1`) {
+		t.Fatalf("解释器要带 -E -s: %s", files["RESULT.json"])
+	}
+}
+
+func TestJobE2ERunnerDirIsReserved(t *testing.T) {
+	for _, mode := range []string{"", "dir"} {
+		t.Run("forge "+mode, func(t *testing.T) {
+			e := newE2E(t, 30)
+			p := e.probe("pc-01", nil)
+			t.Cleanup(func() {
+				filepath.WalkDir(p.root, func(q string, _ os.DirEntry, _ error) error { os.Chmod(q, 0o755); return nil })
+			})
+			id := e.submit(map[string]any{"package": e.pkg("demo", strings.TrimSpace("forge "+mode), nil)})[0]
+			v := e.wait(id)
+			if v.State != proto.JobFailed || !strings.Contains(v.Detail, "_runner") || v.Output {
+				t.Fatalf("任务写了平台保留的 _runner/ 要算失败、不回传: %+v", v)
+			}
+		})
+	}
+}
+
+func TestJobE2EFetchRetriesTransientErrors(t *testing.T) {
+	// 主控一时 503（重启、锁忙）：在拉取时限内退避重试，不能一次就判 failed
+	e := newE2E(t, 30)
+	e.probe("pc-01", nil)
+	pkg := e.pkg("demo", "ok", nil)
+	e.evil.set(func(ev *evil) { ev.fail = map[string]int{"/v1/peers": 1, "/v1/manifests/code-": 1} })
+	v := e.wait(e.submit(map[string]any{"package": pkg})[0])
+	if v.State != proto.JobSucceeded || v.Attempt != 1 {
+		t.Fatalf("一次 503 不该让任务失败: %+v", v)
+	}
+	e.evil.mu.Lock()
+	left := e.evil.fail["/v1/peers"] + e.evil.fail["/v1/manifests/code-"]
+	e.evil.mu.Unlock()
+	if left != 0 {
+		t.Fatal("503 没打到，测试没测到")
+	}
+}
+
+func TestJobE2EEndEventNamesSigner(t *testing.T) {
+	e := newE2E(t, 30)
+	e.probe("pc-01", nil)
+	pkg := e.pkg("demo", "ok", nil)
+	id := e.submit(map[string]any{"package": pkg})[0]
+	if v := e.wait(id); v.State != proto.JobSucceeded {
+		t.Fatalf("先跑通: %+v", v)
+	}
+	raw, _ := os.ReadFile(filepath.Join(e.f.PackagesDir, pkg+".json"))
+	var sj jobsign.SignedJob
+	json.Unmarshal(raw, &sj)
+	digest := jobsign.JobDigest(sj)[:12]
+	waitFor(t, "结束事件带签名者和摘要", func() bool {
+		_, b := e.api("GET", "/v1/events?kind=job", nil)
+		var evs []proto.Event
+		json.Unmarshal(b, &evs)
+		for _, ev := range evs {
+			if strings.HasPrefix(ev.Detail, "结束 "+id) && strings.Contains(ev.Detail, jobtest.Reviewer) && strings.Contains(ev.Detail, digest) {
+				return true
+			}
+		}
+		return false
+	})
 }

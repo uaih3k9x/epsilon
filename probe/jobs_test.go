@@ -1,10 +1,56 @@
 package probe
 
 import (
+	"bytes"
+	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"epsilon/jobrun"
+	"epsilon/jobsign"
+	"epsilon/proto"
 )
+
+func TestKeyringNotServedLoggedOnce(t *testing.T) {
+	// 主控没配批任务：/v1/job-keyring 是 404。能力 33 默认开，但不能每 10 分钟报一次错
+	srv := httptest.NewServer(http.NotFoundHandler())
+	defer srv.Close()
+	a := NewAgent(Config{Controller: srv.URL, ArtifactRoot: t.TempDir()}, &fakeSys{}, "t")
+	defer a.Shutdown()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+	now := time.Now()
+	for i := 0; i < 3; i++ {
+		a.refreshKeyring(now.Add(time.Duration(i) * keyringRefresh))
+		waitFor(t, "后台拉完", func() bool { return !a.krBusy.Load() })
+	}
+	n := 0
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(line, "job-keyring") {
+			n++
+		}
+	}
+	if n > 1 {
+		t.Fatalf("404 最多记一次，记了 %d 次:\n%s", n, buf.String())
+	}
+}
+
+func TestWriteSummaryReportsErrors(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "output"), []byte("不是目录"), 0o644)
+	a := NewAgent(Config{}, &fakeSys{}, "t")
+	err := a.writeSummary(dir, proto.JobAssign{ID: "x-1", Attempt: 1}, jobsign.Job{}, "k", "d", nil, jobrun.Result{})
+	if err == nil {
+		t.Fatal("摘要写不进去要报错（不能悄悄回传没有摘要的输出）")
+	}
+
+}
 
 func TestKeyringVersionFile(t *testing.T) {
 	p := filepath.Join(t.TempDir(), keyringVersionFile)
