@@ -21,6 +21,8 @@ PY_VERSION = "3.11"
 ZIP_TIME = (1980, 1, 1, 0, 0, 0)  # 固定时间：同样的输入得到同样的摘要
 LAUNCHER_DIRS = ("bin", "Scripts")
 PROVENANCE = ("layer.json", "requirements.in", "requirements.lock")
+# 审计钩子（能力 35，docs/jobs-sandbox.md 第 5 节）：放进 Lib/site-packages/，site.py 启动时导入
+AUDIT_HOOK = Path(__file__).resolve().parent.parent / "jobbox" / "py" / "sitecustomize.py"
 
 
 class BuildError(Exception):
@@ -71,7 +73,11 @@ def assemble(embed, site, spec_dir, layer):
     for pth in layer.glob("*._pth"):
         pth.unlink()
     target = layer / "Lib" / "site-packages"
+    for name in ("sitecustomize.py", "usercustomize.py"):
+        if (site / name).exists():
+            raise BuildError(f"依赖包自带 {name}，会和审计钩子抢位置")
     shutil.copytree(site, target)
+    shutil.copyfile(AUDIT_HOOK, target / "sitecustomize.py")
     for d in LAUNCHER_DIRS:
         if (target / d).is_dir():
             shutil.rmtree(target / d)
