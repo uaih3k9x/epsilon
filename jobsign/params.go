@@ -8,13 +8,15 @@ import (
 	"strconv"
 )
 
-// paramSpec 是 job.json params 里一项的声明（手册 5.4）：简写 "int"，或 {"type","min","max","enum","default"}。
+// paramSpec 是 job.json params 里一项的声明（手册 5.4，契约见 docs/jobs.md 任务包第 7 条）：
+// 简写 "int"，或 {"type","min","max","enum","default","description"}，别的键一律拒（写错的 "minimum" 不能悄悄失效）。
 type paramSpec struct {
-	Type    string            `json:"type"`
-	Min     *float64          `json:"min,omitempty"`
-	Max     *float64          `json:"max,omitempty"`
-	Enum    []json.RawMessage `json:"enum,omitempty"`
-	Default json.RawMessage   `json:"default,omitempty"`
+	Type        string            `json:"type"`
+	Min         *float64          `json:"min,omitempty"`
+	Max         *float64          `json:"max,omitempty"`
+	Enum        []json.RawMessage `json:"enum,omitempty"`
+	Default     json.RawMessage   `json:"default,omitempty"`
+	Description string            `json:"description,omitempty"` // 给人看，不参与校验
 }
 
 var paramTypes = map[string]bool{"int": true, "number": true, "string": true, "bool": true}
@@ -24,11 +26,24 @@ func parseSpec(name string, raw json.RawMessage) (paramSpec, error) {
 	var short string
 	if json.Unmarshal(raw, &short) == nil {
 		s.Type = short
-	} else if err := json.Unmarshal(raw, &s); err != nil {
-		return s, fmt.Errorf("参数 %s 的声明看不懂", name)
+	} else {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&s); err != nil {
+			return s, fmt.Errorf("参数 %s 的声明看不懂（只认 type / min / max / enum / default / description）: %v", name, err)
+		}
 	}
 	if !paramTypes[s.Type] {
 		return s, fmt.Errorf("参数 %s 的类型 %q 不认识（只有 int / number / string / bool）", name, s.Type)
+	}
+	numeric := s.Type == "int" || s.Type == "number"
+	switch {
+	case !numeric && (s.Min != nil || s.Max != nil):
+		return s, fmt.Errorf("参数 %s 是 %s，不能写 min / max", name, s.Type)
+	case s.Min != nil && s.Max != nil && *s.Min > *s.Max:
+		return s, fmt.Errorf("参数 %s 的 min 比 max 大", name)
+	case s.Enum != nil && len(s.Enum) == 0:
+		return s, fmt.Errorf("参数 %s 的 enum 是空的", name)
 	}
 	for _, e := range s.Enum {
 		if _, err := s.check(name, e); err != nil {
@@ -36,11 +51,35 @@ func parseSpec(name string, raw json.RawMessage) (paramSpec, error) {
 		}
 	}
 	if len(s.Default) > 0 {
-		if _, err := s.check(name, s.Default); err != nil {
+		if _, err := s.value(name, s.Default); err != nil {
 			return s, fmt.Errorf("参数 %s 的 default 不合法: %v", name, err)
 		}
 	}
 	return s, nil
+}
+
+// CheckParamDecls 只检查声明本身（sign-job 和 VerifyJob 调）：签出去的任务包，每个参数声明都要能用。
+func CheckParamDecls(decl map[string]json.RawMessage) error {
+	for name, raw := range decl {
+		if _, err := parseSpec(name, raw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// value 校验一个值并查 enum，返回规范化后的 JSON。
+func (s paramSpec) value(name string, v json.RawMessage) (json.RawMessage, error) {
+	c, err := s.check(name, v)
+	if err != nil || len(s.Enum) == 0 {
+		return c, err
+	}
+	for _, e := range s.Enum {
+		if ce, _ := s.check(name, e); bytes.Equal(ce, c) {
+			return c, nil
+		}
+	}
+	return nil, fmt.Errorf("参数 %s = %s 不在声明的 enum 里", name, c)
 }
 
 // check 校验一个值，返回规范化后的 JSON。不查 enum（enum 本身也要过 check）。
@@ -98,19 +137,9 @@ func FillParams(decl, values map[string]json.RawMessage) (map[string]json.RawMes
 		if !ok {
 			return nil, fmt.Errorf("任务包没有声明参数 %s", name)
 		}
-		c, err := s.check(name, v)
+		c, err := s.value(name, v)
 		if err != nil {
 			return nil, err
-		}
-		if len(s.Enum) > 0 {
-			in := false
-			for _, e := range s.Enum {
-				ce, _ := s.check(name, e)
-				in = in || bytes.Equal(ce, c)
-			}
-			if !in {
-				return nil, fmt.Errorf("参数 %s = %s 不在声明的 enum 里", name, c)
-			}
 		}
 		out[name] = c
 	}

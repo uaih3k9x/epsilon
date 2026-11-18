@@ -85,3 +85,32 @@ func TestFillParamsNoDecl(t *testing.T) {
 		t.Fatalf("没声明却填了要拒: %v", err)
 	}
 }
+
+func TestParamDeclsCheckedAtSignTime(t *testing.T) {
+	// 声明写错了要在 sign-job（VerifyJob）就拒，不能签出来以后每次提交都 400
+	f := setup(t)
+	bad := map[string]string{
+		"类型不认识":         `{"lr": "float"}`,
+		"default 类型不对":  `{"n": {"type": "int", "default": "3"}}`,
+		"不认识的键":         `{"n": {"type": "int", "minimum": 0}}`,
+		"min 大于 max":    `{"n": {"type": "int", "min": 5, "max": 1}}`,
+		"字符串不能有 min":    `{"s": {"type": "string", "min": 1}}`,
+		"enum 是空的":      `{"s": {"type": "string", "enum": []}}`,
+		"default 越界":    `{"n": {"type": "int", "min": 0, "max": 3, "default": 9}}`,
+		"default 不在枚举里": `{"s": {"type": "string", "enum": ["a"], "default": "b"}}`,
+	}
+	for name, d := range bad {
+		j := goodJob()
+		j.Params = decl(t, d)
+		sj, _ := signStruct(j, "reviewer-a", f.revPriv)
+		if _, _, err := VerifyJob(sj, f.ring, t0); err == nil {
+			t.Errorf("%s: 竟然验过了", name)
+		}
+	}
+	j := goodJob()
+	j.Params = decl(t, `{"lr": {"type": "number", "min": 0, "max": 1, "default": 0.1, "description": "学习率"}, "n": "int"}`)
+	sj, _ := signStruct(j, "reviewer-a", f.revPriv)
+	if _, _, err := VerifyJob(sj, f.ring, t0); err != nil {
+		t.Fatalf("合法声明（带 description）要能过: %v", err)
+	}
+}

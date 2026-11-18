@@ -64,7 +64,8 @@ type SignedKeyring struct {
 	Sig     string `json:"sig"`
 }
 
-// Job 是 job.json（提交手册第 5.2 节）。Params 只保留原文，参数值的类型校验是主控提交时的事。
+// Job 是 job.json（提交手册第 5.2 节）。Params 保留原文：声明格式在验签时查（CheckParamDecls），
+// 参数值在主控提交时和探针拿到时查（FillParams）。
 type Job struct {
 	Schema      int                        `json:"schema"`
 	Name        string                     `json:"name"`
@@ -351,5 +352,5 @@ func checkJob(j Job) error {
 			return fmt.Errorf("数据集名要是 名字@版本: %q", d)
 		}
 	}
-	return nil
+	return CheckParamDecls(j.Params)
 }
