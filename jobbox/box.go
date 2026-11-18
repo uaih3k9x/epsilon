@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -221,7 +222,7 @@ func (b *Box) recover() {
 		var res Result
 		b.release(filepath.Join(b.Root, "jobs", e.Name()), &res)
 		for _, n := range res.Notes {
-			fmt.Fprintln(os.Stderr, "jobbox: 启动时", n)
+			log.Printf("批任务沙箱启动时: %s", n)
 		}
 	}
 	if n, err := b.P.Sweep(); err != nil || n > 0 {
@@ -341,9 +342,7 @@ func (b *Box) Run(ctx context.Context, j Job) (res Result, err error) {
 	if err := b.resetScratch(j.Dir); err != nil {
 		return res, retryf("清空 tmp\\: %v", err)
 	}
-	r, err := b.runJob(ctx, j, env)
-	r.Notes, r.Dir = res.Notes, res.Dir
-	return r, err
+	return b.runJob(ctx, j, env) // 清场和收回在 defer 里，写进返回的 res
 }
 
 // hookWant 是钩子金丝雀的单子加上探针从审计管道核对的三项。
