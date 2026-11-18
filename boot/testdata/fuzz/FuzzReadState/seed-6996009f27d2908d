@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"current\":\"A\",\"versions\":{\"A\":\"1.A\"}}\x00\x00")

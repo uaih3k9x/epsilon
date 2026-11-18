@@ -35,7 +35,7 @@ func TestMain(m *testing.M) {
 }
 
 // onFault 给 root 下的写盘点登记 hook，测试结束自动注销。
-func onFault(t *testing.T, root string, h func(op, path string) error) {
+func onFault(t testing.TB, root string, h func(op, path string) error) {
 	t.Helper()
 	key := filepath.Clean(root) + string(filepath.Separator)
 	faultRoots.Store(key, h)
