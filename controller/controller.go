@@ -3,6 +3,7 @@ package controller
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"epsilon/loader"
 	"epsilon/proto"
 )
 
@@ -34,6 +36,11 @@ type Config struct {
 	JobOutputMaxMB int                           `json:"job_output_max_mb"` // 单个任务输出上限；没写 = 2048
 	Topology       map[string]Place              `json:"topology"`          // 节点在哪间教室、哪台交换机，peers 排序用
 	SeedsPerRoom   int                           `json:"seeds_per_room"`    // 每间教室几台种子可以直接从主控拉块（默认 2）
+
+	// 批任务队列（docs/jobs.md）：jobs_dir 和 job_keyring 都配了才开 /v1/jobs。
+	JobKeyring     string `json:"job_keyring"`      // 根钥匙签的 job-keyring.json，原样发给探针
+	JobPackagesDir string `json:"job_packages_dir"` // 签好的任务包 <名字>@<版本>.json
+	JobMaxRetries  *int   `json:"job_max_retries"`  // 节点失联或重启后重派几次；没写 = 2
 }
 
 // Place 是节点的物理位置；不在 Topology 里的节点两项都是空串。
@@ -68,6 +75,13 @@ type Controller struct {
 	// 预热规则单独一把锁：peers 持着 mu 时会经 desiredFor 读规则。加锁顺序只能 mu → pmu。
 	pmu     sync.RWMutex
 	preload map[string]preloadRule // manifest → 规则
+
+	// 批任务队列，和 nodes 同用 mu
+	jobs        map[string]*jobRec
+	jobSeq      int
+	queueBroken bool
+	// JobRoots 是验钥匙环的根公钥，默认和探针、引导器同一套（loader.PublicKeys）；测试里换掉。
+	JobRoots []ed25519.PublicKey
 }
 
 func New(cfg Config) *Controller {
@@ -84,6 +98,10 @@ func New(cfg Config) *Controller {
 		}}}
 	if cfg.ChunksDir != "" {
 		c.loadPreload()
+	}
+	c.JobRoots, _ = loader.ParseKeys(loader.PublicKeys)
+	if c.jobsEnabled() {
+		c.loadQueue()
 	}
 	return c
 }
@@ -111,10 +129,17 @@ func (c *Controller) Handler() http.Handler {
 	}
 	if c.cfg.JobsDir != "" {
 		mux.HandleFunc("HEAD /v1/jobs/{id}/chunks/{hash}", c.probeAuth(c.jobChunkHead))
-		mux.HandleFunc("PUT /v1/jobs/{id}/chunks/{hash}", c.probeAuth(c.jobChunkPut))
-		mux.HandleFunc("PUT /v1/jobs/{id}/output", c.probeAuth(c.jobOutputPut))
+		mux.HandleFunc("PUT /v1/jobs/{id}/chunks/{hash}", c.probeAuth(c.bindJob(c.jobChunkPut)))
+		mux.HandleFunc("PUT /v1/jobs/{id}/output", c.probeAuth(c.bindJob(c.jobOutputPut)))
 		mux.HandleFunc("GET /v1/jobs/{id}/output", c.apiAuth(c.jobOutputGet))
 		mux.HandleFunc("GET /v1/jobs/{id}/files/{path...}", c.apiAuth(c.jobFileGet))
+	}
+	if c.jobsEnabled() {
+		mux.HandleFunc("GET /v1/job-keyring", c.probeAuth(c.serveKeyring))
+		mux.HandleFunc("POST /v1/jobs", c.apiAuth(c.submitJob))
+		mux.HandleFunc("GET /v1/jobs", c.apiAuth(c.listJobs))
+		mux.HandleFunc("GET /v1/jobs/{id}", c.apiAuth(c.getJob))
+		mux.HandleFunc("DELETE /v1/jobs/{id}", c.apiAuth(c.cancelJob))
 	}
 	if c.cfg.ChunksDir != "" {
 		mux.HandleFunc("GET /v1/manifests/{id}", c.probeAuth(c.manifest))
@@ -201,6 +226,10 @@ func (c *Controller) register(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	c.nodes[reg.Node] = &node{reg: reg, addr: remoteIP(r), seen: c.now(), chunks: chunks}
+	c.nodes[reg.Node].hb.Jobs, c.nodes[reg.Node].hb.Job = reg.Jobs, reg.Job
+	if c.jobsEnabled() && c.reconcile(reg.Node, reg.Job, true) {
+		c.saveQueue()
+	}
 	c.mu.Unlock()
 	log.Printf("登记 %s (%s) 探针 %s 工作负载 %v", reg.Node, remoteIP(r), reg.Version, reg.Workload)
 	w.Write([]byte("{}"))
@@ -215,9 +244,17 @@ func (c *Controller) heartbeat(w http.ResponseWriter, r *http.Request) {
 	c.mu.Lock()
 	n, ok := c.nodes[hb.Node]
 	var logReq int64
+	var job *proto.JobAssign
 	if ok {
 		n.hb, n.addr, n.seen = hb, remoteIP(r), c.now()
 		logReq = n.logReq
+		if c.jobsEnabled() {
+			changed := c.reconcile(hb.Node, hb.Job, false)
+			if c.scheduleLocked(c.now()) || changed {
+				c.saveQueue()
+			}
+			job = c.jobFor(hb.Node)
+		}
 	}
 	c.mu.Unlock()
 	if !ok { // 主控重启过：让探针重新登记
@@ -226,6 +263,9 @@ func (c *Controller) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	d := c.desiredFor(hb.Node)
 	d.LogRequest = logReq
+	if job != nil { // 派了任务就先停推理（22.5：不让位 ≠ 跟自己抢显卡）
+		d.Job, d.Workload = job, ""
+	}
 	json.NewEncoder(w).Encode(d)
 }
 
