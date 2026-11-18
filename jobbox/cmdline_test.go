@@ -93,3 +93,21 @@ func TestCanaryFilesWrittenUnderJobDir(t *testing.T) {
 		t.Fatal("sys.txt 要是打包在探针里的源码")
 	}
 }
+
+// 真机验证套件（cmd/epsilon-sandbox-check）按 CanaryCmdLines 核对真机上的长度：必须和真正起的两次金丝雀一字不差
+func TestCanaryCmdLinesMatchLaunches(t *testing.T) {
+	r := newRig(t, nil)
+	if _, err := r.run(); err != nil {
+		t.Fatal(err)
+	}
+	sys, hook := CanaryCmdLines(r.job)
+	if got := CmdLine(r.p.launches[0].Path, r.p.launches[0].Args); got != sys {
+		t.Fatalf("系统金丝雀:\n%s\n%s", got, sys)
+	}
+	if got := CmdLine(r.p.launches[1].Path, r.p.launches[1].Args); got != hook {
+		t.Fatalf("钩子金丝雀:\n%s\n%s", got, hook)
+	}
+	if CmdLen("é𝄞") != 3 {
+		t.Fatal("CmdLen 按 UTF-16 算")
+	}
+}

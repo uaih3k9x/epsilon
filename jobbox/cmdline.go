@@ -23,6 +23,9 @@ func CmdLine(path string, args []string) string {
 // cmdLen 按 UTF-16 算长度（Windows 的"字符"）。
 func cmdLen(s string) int { return len(utf16.Encode([]rune(s))) }
 
+// CmdLen 是 cmdLen（真机验证套件用）。
+func CmdLen(s string) int { return cmdLen(s) }
+
 // escapeArg 是 syscall.EscapeArg（只在 Windows 构建里有）的照抄。
 func escapeArg(s string) string {
 	if s == "" {

@@ -16,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	"epsilon/envlayer"
 	"epsilon/jobrun"
 )
 
@@ -447,7 +446,7 @@ func (b *Box) sysCanary(ctx context.Context, j Job, env []string, cf canaryPaths
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return b.launch(ctx, j, env, []string{"-I", "-S", "-c", canaryBoot, cf.sys, cf.cfg}, nil, true)
+	return b.launch(ctx, j, env, sysCanaryArgs(cf), nil, true)
 }
 
 func (b *Box) hookCanary(ctx context.Context, j Job, env []string, cf canaryPaths) ([]byte, error) {
@@ -462,8 +461,7 @@ func (b *Box) hookCanary(ctx context.Context, j Job, env []string, cf canaryPath
 	w := newWatcher(log, b.readyTimeout(), b.grace(), j.Dir)
 	stop := serveAudit(srv, w)
 	main := 0
-	args := append(append([]string{}, envlayer.Flags...), "-c", canaryBoot, cf.hook, cf.cfg)
-	out, err := b.launch(ctx, j, env, args, func(pid int) { main = pid; w.Start(pid) }, false)
+	out, err := b.launch(ctx, j, env, hookCanaryArgs(cf), func(pid int) { main = pid; w.Start(pid) }, false)
 	stop()
 	if err != nil {
 		return nil, err

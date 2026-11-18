@@ -229,7 +229,8 @@ Mac 上测了：SDDL 字面量、环境块、金丝雀解析和对照（每一�
 编排顺序和每一步失败的出错即拒、心跳 `jobs` 跟着沙箱、`network:true` 拒、`sitecustomize.py` 拒收、链接不回传、钩子策略（pytest，subprocess/socket/环境变量在真解释器里端到端）、
 `install.ps1` 静态检查；`GOOS=windows go build/vet ./...`。
 
-**必须在真 Windows 上验证**（牺牲机或测试机，不铺教室）：
+**必须在真 Windows 上验证**（牺牲机或测试机，不铺教室）。验证套件在 `tools/sandbox-check/`：拷到牺牲机一条命令跑完下面 18 项，
+出一份 PASS / FAIL / MANUAL / SKIP 的报告（`D:\epsilon\sandbox-check-<时间>.txt`），用法、回滚和结果怎么看见那里的 README。
 
 1. `CreateProcessWithLogonW` 在 `CREATE_SUSPENDED` 下重定向 stdout/stderr 是否可用；返回的进程句柄能不能 AssignProcessToJobObject；进程会不会已经被 seclogon 放进别的作业。
 2. 非提升用户能不能建窗口站和桌面；CUDA 在这个桌面下能不能用；Low 标签对 user32 初始化够不够；非交互窗口站的桌面堆够不够。

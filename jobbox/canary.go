@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"epsilon/envlayer"
 )
 
 // 金丝雀（docs/jobs-sandbox.md 第 5 节）：每个任务都跑两次，平台代码打包在探针里。
@@ -35,11 +37,28 @@ const (
 // canaryPaths 是 canary\\ 下两份源码和配置的路径。
 type canaryPaths struct{ sys, hook, cfg string }
 
+func canaryFilePaths(jobDir string) canaryPaths {
+	d := filepath.Join(jobDir, canaryDir)
+	return canaryPaths{filepath.Join(d, canarySysFile), filepath.Join(d, canaryHookFile), filepath.Join(d, canaryCfgFile)}
+}
+
+func sysCanaryArgs(cf canaryPaths) []string {
+	return []string{"-I", "-S", "-c", canaryBoot, cf.sys, cf.cfg}
+}
+func hookCanaryArgs(cf canaryPaths) []string {
+	return append(append([]string{}, envlayer.Flags...), "-c", canaryBoot, cf.hook, cf.cfg)
+}
+
+// CanaryCmdLines 是两次金丝雀交给 CreateProcessWithLogonW 的命令行（真机验证套件 cmd/epsilon-sandbox-check 按真机路径核对长度）。
+func CanaryCmdLines(j Job) (sys, hook string) {
+	cf := canaryFilePaths(j.Dir)
+	return CmdLine(j.Interp, sysCanaryArgs(cf)), CmdLine(j.Interp, hookCanaryArgs(cf))
+}
+
 // writeCanaryFiles 写 canary\\ 的三个文件（在 Grant 之后写，继承根上任务账户的只读）。
 func writeCanaryFiles(jobDir, cfg string) (canaryPaths, error) {
-	d := filepath.Join(jobDir, canaryDir)
-	cf := canaryPaths{filepath.Join(d, canarySysFile), filepath.Join(d, canaryHookFile), filepath.Join(d, canaryCfgFile)}
-	if err := os.MkdirAll(d, 0o755); err != nil {
+	cf := canaryFilePaths(jobDir)
+	if err := os.MkdirAll(filepath.Dir(cf.sys), 0o755); err != nil {
 		return cf, err
 	}
 	for path, body := range map[string]string{cf.sys: canarySysSrc, cf.hook: canaryHookSrc, cf.cfg: cfg} {
