@@ -122,9 +122,9 @@ func TestPrepareLayout(t *testing.T) {
 
 func TestPrepareRejectsBadZip(t *testing.T) {
 	for name, files := range map[string]map[string]string{
-		"路径穿越": {"../evil.py": "x"},
-		"绝对路径": {"/evil.py": "x"},
-		"盘符":   {"C:/evil.py": "x"},
+		"路径穿越":  {"../evil.py": "x"},
+		"绝对路径":  {"/evil.py": "x"},
+		"盘符":    {"C:/evil.py": "x"},
 		"大小写冲突": {"a.py": "x", "A.py": "y"},
 	} {
 		dir := filepath.Join(t.TempDir(), "j")

@@ -50,7 +50,7 @@ func TestFillParamsRejects(t *testing.T) {
 		"fast": "bool"
 	}`)
 	cases := map[string]string{
-		"不认识的参数":   `{"cmd": "rm -rf"}`,
+		"不认识的参数":    `{"cmd": "rm -rf"}`,
 		"int 给小数":   `{"epochs": 1.5}`,
 		"int 给字符串":  `{"epochs": "3"}`,
 		"number 越界": `{"lr": 2}`,
