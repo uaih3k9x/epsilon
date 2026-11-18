@@ -2,6 +2,7 @@ package boot
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,5 +138,19 @@ func TestFaultSkipSync(t *testing.T) {
 	}
 	if got := readFile(t, p); got != "x" {
 		t.Fatalf("%q", got)
+	}
+}
+
+// 两个开关都按 errors.Is 认：包了一层的 errSkip（比如和断电错误 Join 在一起）也是跳过刷盘。
+func TestFaultSkipSyncWrapped(t *testing.T) {
+	dir := t.TempDir()
+	onFault(t, dir, func(op, path string) error {
+		if op == "sync" {
+			return fmt.Errorf("包一层: %w", errSkip)
+		}
+		return nil
+	})
+	if err := writeAtomic(filepath.Join(dir, "s"), []byte("x")); err != nil {
+		t.Fatalf("包着 errSkip 的 sync 应当跳过，却报错: %v", err)
 	}
 }

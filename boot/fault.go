@@ -12,10 +12,12 @@ import (
 // op 是 create / write / sync / rename / remove / openfile，path 是被写的文件（rename 是原路径）。
 var faultHook func(op, path string) error
 
-// errTorn 被 hook 返回的错误包着时，fsWrite 先写进一半再报错，模拟写到一半断电。
+// 下面两个是只给测试用的开关，只在 faultHook 非 nil（也就是测试里）才可能生效；两个都按 errors.Is 认。
+//
+// errTorn：hook 返回的错误包着它时，fsWrite 先写进一半再报错，模拟写到一半断电。
 var errTorn = errors.New("撕裂写")
 
-// errSkip 被 hook 原样返回时，fsSync 当作成功、不真的刷盘：只为测试提速
+// errSkip：hook 返回的错误包着它时，fsSync 当作成功、不真的刷盘：只为测试提速
 // （macOS 上一次刷盘要几毫秒，穷举和断电测试要刷上万次）。
 var errSkip = errors.New("跳过刷盘")
 
@@ -53,7 +55,7 @@ func fsWrite(f *os.File, b []byte) (int, error) {
 
 func fsSync(f *os.File) error {
 	if err := fault("sync", f.Name()); err != nil {
-		if err == errSkip {
+		if errors.Is(err, errSkip) {
 			return nil
 		}
 		return err
