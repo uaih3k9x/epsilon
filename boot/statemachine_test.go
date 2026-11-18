@@ -384,8 +384,11 @@ func TestStateMachine(t *testing.T) {
 	for i := range workers {
 		w := &smWorker{tmpl: tmpl, keys: pub, base: t.TempDir(), boots: map[[3]smContent]*Boot{}}
 		onFault(t, w.base, func(op, path string) error {
-			if op == "sync" {
+			switch {
+			case op == "sync":
 				return errSkip // 只模拟逻辑，不需要真刷盘
+			case op == "openfile" && filepath.Base(path) == EventsFile:
+				return errPowerCut // 事件和状态机无关；不写省掉一半的文件操作（boot 写不进事件照常往下走）
 			}
 			return nil
 		})
