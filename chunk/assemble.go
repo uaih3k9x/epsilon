@@ -79,22 +79,24 @@ var destLocks [64]sync.Mutex
 
 func lockDest(path string) *sync.Mutex {
 	h := fnv.New32a()
-	h.Write([]byte(path))
+	h.Write([]byte(destKey(path)))
 	mu := &destLocks[h.Sum32()%uint32(len(destLocks))]
 	mu.Lock()
 	return mu
 }
 
+// destKey: 排队用的路径键。Windows（NTFS）和 macOS 默认文件系统不分大小写，Bin/x 和 bin/x 是同一个文件，
+// 所以一律转小写；在分大小写的文件系统上只是多排一会儿队。
+func destKey(path string) string { return strings.ToLower(filepath.Clean(path)) }
+
 // errSize: 拼出来的大小和清单不符。
 var errSize = errors.New("大小对不上")
-
-// testHookRenamed 不为 nil 时在成品改名就位之后调用（测试用来拉长并发窗口）。
-var testHookRenamed func(path string)
 
 // Assemble 把清单里每个文件从块拼到 root/<path>：写临时文件、校验整文件 sha256 和大小、改名，
 // 再写 <文件>.epsilon-ok。stamp 对得上的文件跳过。动手前先查齐块，缺块直接报错、什么都不写。
 // 整文件对不上时逐块重算，内容不对的块从 s 里删掉（错误里带块名、包着 ErrHashMismatch），
 // 调用方看 s.Has 就知道该重新取哪些；不删的话本地坏块会让每次重试都同样失败。
+// 某个文件发现坏块后接着拼剩下的文件，一次把所有文件的坏块都找出来（错误合在一起返回）。
 func Assemble(m proto.Manifest, s *Store, root string) error {
 	var todo []proto.ManifestFile
 	for _, f := range m.Files {
@@ -111,12 +113,18 @@ func Assemble(m proto.Manifest, s *Store, root string) error {
 		}
 		todo = append(todo, f)
 	}
+	var errs []error
 	for _, f := range todo {
-		if err := assembleFile(f, s, dest(root, f)); err != nil {
-			return fmt.Errorf("%s: %w", f.Path, err)
+		err := assembleFile(f, s, dest(root, f))
+		if err == nil {
+			continue
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", f.Path, err))
+		if !errors.Is(err, ErrHashMismatch) && !errors.Is(err, errSize) {
+			break // 和块内容无关的错（磁盘满之类），后面的文件多半也一样
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func assembleFile(f proto.ManifestFile, s *Store, path string) error {
@@ -129,15 +137,22 @@ func assembleFile(f proto.ManifestFile, s *Store, path string) error {
 		return err // 成功，或者和块内容无关的错（缺块、磁盘满）：不用逐块重算
 	}
 	var bad []string
+	var verr error // 有块没核对成（读不了、删不掉）：不能断定是清单的错
 	for _, h := range f.Chunks {
-		if errors.Is(s.verify(h), ErrHashMismatch) {
+		switch e := s.verify(h); {
+		case errors.Is(e, ErrHashMismatch):
 			bad = append(bad, h)
+		case e != nil && verr == nil:
+			verr = e
 		}
 	}
 	if len(bad) > 0 {
 		return fmt.Errorf("坏块 %s 已从缓存删掉，要重新取: %w", strings.Join(bad, ", "), ErrHashMismatch)
 	}
-	return err
+	if verr != nil {
+		return fmt.Errorf("%w（逐块核对时: %v）", err, verr)
+	}
+	return fmt.Errorf("每块都对，清单里的整文件哈希或大小可能写错了: %w", err)
 }
 
 // writeFileFromChunks: 拼到临时文件、校验、改名、写 stamp。
@@ -154,14 +169,15 @@ func writeFileFromChunks(f proto.ManifestFile, s *Store, path string) error {
 	if err == nil {
 		err = out.Sync()
 	}
-	// stamp 用改名前这个 fd 的 Stat：改名不改修改时间；改名后再按路径 Stat，
-	// 读到的可能已经是别人（另一个进程）刚改名过来的文件
-	var fi os.FileInfo
-	if err == nil {
-		fi, err = out.Stat()
-	}
 	if cerr := out.Close(); err == nil {
 		err = cerr
+	}
+	// stamp 用改名前临时文件的 Stat：改名不改修改时间；改名后再按正式路径 Stat，读到的可能已经是
+	// 别人（另一个进程）刚改名过来的文件。临时文件名只有本进程知道。要在关掉句柄之后读：
+	// Windows 上写句柄全关之前修改时间不一定是最终的。
+	var fi os.FileInfo
+	if err == nil {
+		fi, err = os.Stat(tmp)
 	}
 	if err == nil {
 		os.Remove(path + StampSuffix) // 先删旧 stamp，免得改名后新文件配上旧记录
@@ -170,9 +186,6 @@ func writeFileFromChunks(f proto.ManifestFile, s *Store, path string) error {
 	if err != nil {
 		os.Remove(tmp)
 		return err
-	}
-	if testHookRenamed != nil {
-		testHookRenamed(path)
 	}
 	raw, _ := json.Marshal(stamp{SHA256: f.SHA256, Size: fi.Size(), ModTime: fi.ModTime().UnixNano()})
 	return writeAtomic(path+StampSuffix, raw)

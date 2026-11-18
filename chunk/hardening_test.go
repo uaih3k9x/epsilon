@@ -133,7 +133,7 @@ func TestAssembleConcurrentSameManifest(t *testing.T) {
 	})
 }
 
-// 疑点 4：两份清单同一路径、同样大小、内容不同，同时拼装。
+// 两份清单同一路径、同样大小、内容不同，同时拼装。
 // 不管谁赢，Ready(X) 为真时文件内容必须真是 X 的。
 func TestAssembleSamePathDifferentManifests(t *testing.T) {
 	src, out := t.TempDir(), t.TempDir()
@@ -149,11 +149,8 @@ func TestAssembleSamePathDifferentManifests(t *testing.T) {
 	}
 	s, _ := NewStore(out, 0)
 
-	// 把"改名之后"这个窗口拉长，让另一边有机会插进来
-	testHookRenamed = func(string) { time.Sleep(2 * time.Millisecond) }
-	defer func() { testHookRenamed = nil }()
-
-	for round := 0; round < 20; round++ {
+	// 不排队时一般几十轮内就会撞上一次
+	for round := 0; round < 200; round++ {
 		root := t.TempDir()
 		var wg sync.WaitGroup
 		for _, m := range []proto.Manifest{ma, mb} {
@@ -170,7 +167,7 @@ func TestAssembleSamePathDifferentManifests(t *testing.T) {
 	}
 }
 
-// 疑点 1：断电后块文件被截断（没刷盘就改了名）。
+// 断电后块文件被截断（没刷盘就改了名）。
 func TestNewStoreTruncatedChunk(t *testing.T) {
 	m, s, files := buildFixture(t)
 	a := m.Files[0].Chunks
@@ -208,7 +205,7 @@ func TestNewStoreTruncatedChunk(t *testing.T) {
 	healAndRetry(t, m, s2, root, files, half)
 }
 
-// 疑点 2：块内容坏了（大小不变），Assemble 要把它删掉，不能每次都同样失败。
+// 块内容坏了（大小不变），Assemble 要把它删掉，不能每次都同样失败。
 func TestAssembleDropsCorruptChunk(t *testing.T) {
 	m, s, files := buildFixture(t)
 	bad := m.Files[0].Chunks[2]
@@ -363,5 +360,86 @@ func TestAssembleOtherErrorKeepsChunks(t *testing.T) {
 		if x != h && !s.Has(x) {
 			t.Fatalf("好块 %s 被删了", x[:12])
 		}
+	}
+}
+
+// 两个文件各有一块坏了：一次 Assemble 就该把两块都找出来删掉，
+// 不能只删第一个文件的、第二个文件的留到下一次拉取（探针只自愈一次）。
+func TestAssembleDropsCorruptChunksAcrossFiles(t *testing.T) {
+	m, s, files := buildFixture(t)
+	if m.Files[0].Path != "models/a.gguf" || m.Files[1].Path != "b.txt" {
+		t.Fatalf("夹具顺序变了: %v", m.Files)
+	}
+	badA, badB := m.Files[0].Chunks[1], m.Files[1].Chunks[0]
+	for _, h := range []string{badA, badB} {
+		p := chunkPath(s.dir, h)
+		b, _ := os.ReadFile(p)
+		b[0] ^= 0xff
+		os.WriteFile(p, b, 0o644)
+	}
+	root := t.TempDir()
+	err := Assemble(m, s, root)
+	if !errors.Is(err, ErrHashMismatch) || !strings.Contains(err.Error(), badA) || !strings.Contains(err.Error(), badB) {
+		t.Fatalf("应报两个文件各自的坏块: %v", err)
+	}
+	for _, h := range []string{badA, badB} {
+		if s.Has(h) {
+			t.Fatalf("坏块 %s 还在缓存里", h[:12])
+		}
+	}
+	// a.gguf 的坏块按原内容放回（healAndRetry 只会补 a.gguf），b.txt 只有一块，整块放回
+	if err := s.Put(badB, bytes.NewReader(files["b.txt"])); err != nil {
+		t.Fatal(err)
+	}
+	healAndRetry(t, m, s, root, files, badA)
+}
+
+// 整文件哈希对不上、每块却都对：是清单写错了，错误要说清楚，一块都不删。
+func TestAssembleBadManifestNamesManifest(t *testing.T) {
+	m, s, _ := buildFixture(t)
+	m.Files[0].SHA256 = sum([]byte("not this"))
+	err := Assemble(m, s, t.TempDir())
+	if !errors.Is(err, ErrHashMismatch) || !strings.Contains(err.Error(), "清单") {
+		t.Fatalf("应指出清单本身不对: %v", err)
+	}
+	for _, h := range m.Files[0].Chunks {
+		if !s.Has(h) {
+			t.Fatalf("好块 %s 被删了", h[:12])
+		}
+	}
+}
+
+// stamp 里的修改时间必须等于成品最后的修改时间（Windows 上写句柄关掉之前读的 mtime 可能不准，
+// 那样 Ready 永远为假、每次都重拼）。
+func TestAssembleStampMatchesFinalFile(t *testing.T) {
+	m, s, _ := buildFixture(t)
+	root := t.TempDir()
+	if err := Assemble(m, s, root); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range m.Files {
+		p := dest(root, f)
+		raw, err := os.ReadFile(p + StampSuffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var st stamp
+		json.Unmarshal(raw, &st)
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.ModTime != fi.ModTime().UnixNano() || st.Size != fi.Size() {
+			t.Fatalf("%s: stamp %+v 和文件 (%d, %d) 对不上", f.Path, st, fi.Size(), fi.ModTime().UnixNano())
+		}
+	}
+}
+
+// 只差大小写的路径在 Windows（NTFS）和 macOS 默认文件系统上是同一个文件，要排同一把锁。
+func TestDestKeyFoldsCase(t *testing.T) {
+	a := filepath.Join("root", "Bin", "app.exe")
+	b := filepath.Join("root", "bin", ".", "APP.exe")
+	if destKey(a) != destKey(b) {
+		t.Fatalf("%q 和 %q 应该排同一把锁", a, b)
 	}
 }
