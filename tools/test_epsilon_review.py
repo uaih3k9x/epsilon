@@ -971,12 +971,14 @@ def test_read_dir_does_not_follow_swapped_symlink(tmp_path, monkeypatch):
     secret = tmp_path / "secret.txt"
     secret.write_text("SECRET", encoding="utf-8")
     real = os.lstat
+    target = str(code / "a.py")
 
     def lstat(p, *a, **k):
         st = real(p, *a, **k)
-        if str(p).endswith("a.py") and not stat.S_ISLNK(st.st_mode):
-            os.remove(p)
-            os.symlink(secret, p)
+        # 只动这个测试自己的文件：monkeypatch 的是全局 os.lstat，别的路径一律原样放过
+        if os.fspath(p) == target and not stat.S_ISLNK(st.st_mode):
+            os.remove(target)
+            os.symlink(secret, target)
         return st
 
     monkeypatch.setattr(er.os, "lstat", lstat)
