@@ -120,10 +120,13 @@ Step '4/8 job sandbox (OPT-IN, docs/jobs-sandbox.md): account epsilon-job, passw
 $SandboxMarker = "$Dst\job-sandbox.enabled"
 if ($env:EPS_JOB_SANDBOX -eq '1') { Set-Content $SandboxMarker 'on' }
 if ($env:EPS_JOB_SANDBOX -eq '0') { Remove-Item $SandboxMarker -Force -ErrorAction SilentlyContinue }
+$JobUser = 'epsilon-job'
+$Sec = "$Dst\secrets"
+$SecFile = "$Sec\epsilon-job.json"
 if (Test-Path $SandboxMarker) {
-    $JobUser = 'epsilon-job'
-    $Sec = "$Dst\secrets"
-    $SecFile = "$Sec\epsilon-job.json"
+  try {
+    # The probe is stopped (step 1) and only restarted in step 7: a failure here must not abort the install.
+    # The catch below deletes the password file, so the probe's health check fails closed (jobs:false).
     # One-time: replace the explicit Users ACEs that older installers (icacls /T) wrote on every file with inherited ones.
     # Effective rights for Users stay the same. Runs before secrets\ gets its own protected ACL below.
     $ResetMarker = "$Dst\.acl-reset-v1"
@@ -132,28 +135,58 @@ if (Test-Path $SandboxMarker) {
         icacls "$Dst\*" /reset /T /C /Q | Out-Null
         Set-Content $ResetMarker (Get-Date -Format s)
     }
+    Add-Type -AssemblyName System.Security
+    $Entropy = [Text.Encoding]::UTF8.GetBytes('epsilon-job/v1')
+    $Scope = [Security.Cryptography.DataProtectionScope]::LocalMachine
     $OldSid = $null
     if (Test-Path $SecFile) { try { $OldSid = (Get-Content $SecFile -Raw | ConvertFrom-Json).sid } catch {} }
-    # a) the account: new random password every run (never printed), Users only, never Administrators.
-    #    Not baked into the OSEasy image: every machine gets its own password, matching the file on its own D:.
-    $rb = New-Object byte[] 32
-    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($rb)
-    $JobPlain = 'Aa1-' + [Convert]::ToBase64String($rb)
-    $JobSecure = ConvertTo-SecureString $JobPlain -AsPlainText -Force
-    if (Get-LocalUser -Name $JobUser -ErrorAction SilentlyContinue) {
-        Set-LocalUser -Name $JobUser -Password $JobSecure -PasswordNeverExpires $true -AccountNeverExpires -UserMayChangePassword $false
-        Enable-LocalUser -Name $JobUser
-    } else {
-        New-LocalUser -Name $JobUser -Password $JobSecure -PasswordNeverExpires -AccountNeverExpires -UserMayNotChangePassword -Description 'Epsilon batch jobs' | Out-Null
+    # a) the account, Users only, never Administrators. Keep the password when the account exists and the password
+    #    file still decrypts for the same SID: rotating it every run leaves the two out of step (1326) whenever
+    #    anything fails in between. Not baked into the OSEasy image: every machine gets its own password.
+    $Existing = Get-LocalUser -Name $JobUser -ErrorAction SilentlyContinue
+    $Keep = $false
+    if ($Existing -and (Test-Path $SecFile)) {
+        try {
+            $old = Get-Content $SecFile -Raw | ConvertFrom-Json
+            $null = [Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String($old.password_dpapi), $Entropy, $Scope)
+            $Keep = ($old.sid -eq $Existing.SID.Value)
+        } catch { $Keep = $false }
     }
+    if (-not $Keep) {
+        $rb = New-Object byte[] 32
+        [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($rb)
+        $JobPlain = 'Aa1-' + [Convert]::ToBase64String($rb)   # new random password (never printed)
+        $JobSecure = ConvertTo-SecureString $JobPlain -AsPlainText -Force
+        if (-not $Existing) {
+            New-LocalUser -Name $JobUser -Password $JobSecure -PasswordNeverExpires -AccountNeverExpires -UserMayNotChangePassword -Description 'Epsilon batch jobs' | Out-Null
+        }
+    }
+    $JobSid = (Get-LocalUser -Name $JobUser).SID.Value
+    # b) password file, D: only, right after the account. DPAPI LocalMachine scope (this script is SYSTEM, the probe
+    #    is the logged-on user), extra entropy epsilon-job/v1. The deny ACE is what keeps job processes out; DPAPI only
+    #    stops reading a copied D:. secrets\ is readable by BU: every local user is trusted like the probe.
+    #    Rotating an existing account: write the new file first, then set the password, then rename.
+    New-Item -ItemType Directory -Force $Sec | Out-Null
+    $acl = Get-Acl $Sec
+    $acl.SetSecurityDescriptorSddlForm("D:P(D;OICI;FA;;;$JobSid)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)", 'Access')
+    Set-Acl -Path $Sec -AclObject $acl
+    if (-not $Keep) {
+        $blob = [Security.Cryptography.ProtectedData]::Protect([Text.Encoding]::UTF8.GetBytes($JobPlain), $Entropy, $Scope)
+        $json = '{"version":1,"user":"' + $JobUser + '","sid":"' + $JobSid + '","password_dpapi":"' + [Convert]::ToBase64String($blob) + '"}'
+        [IO.File]::WriteAllText("$SecFile.tmp", $json)   # UTF-8, no BOM
+        if ($Existing) { Set-LocalUser -Name $JobUser -Password $JobSecure }
+        Move-Item "$SecFile.tmp" $SecFile -Force
+        Remove-Variable JobPlain, JobSecure, rb, blob, json
+    }
+    Set-LocalUser -Name $JobUser -PasswordNeverExpires $true -AccountNeverExpires -UserMayChangePassword $false
+    Enable-LocalUser -Name $JobUser
     try { Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $JobUser -ErrorAction Stop } catch {}   # already a member
     Remove-LocalGroupMember -SID 'S-1-5-32-544' -Member $JobUser -ErrorAction SilentlyContinue
-    $JobSid = (Get-LocalUser -Name $JobUser).SID.Value
-    # b) hide it from the logon screen
+    # c) hide it from the logon screen
     $UserList = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList'
     if (-not (Test-Path $UserList)) { New-Item -Path $UserList -Force | Out-Null }
     New-ItemProperty -Path $UserList -Name $JobUser -Value 0 -PropertyType DWord -Force | Out-Null
-    # c) logon rights: deny network / RDP / batch / service. NOT SeDenyInteractiveLogonRight: seclogon logs on interactively.
+    # d) logon rights: deny network / RDP / batch / service. NOT SeDenyInteractiveLogonRight: seclogon logs on interactively.
     $inf = "$env:TEMP\eps-rights.inf"; $sdb = "$env:TEMP\eps-rights.sdb"
     secedit /export /cfg $inf /areas USER_RIGHTS /quiet | Out-Null
     $cur = @{}
@@ -170,41 +203,49 @@ if (Test-Path $SandboxMarker) {
     $seExit = $LASTEXITCODE
     Remove-Item $inf, $sdb -Force -ErrorAction SilentlyContinue
     if ($seExit -ne 0) { throw "secedit failed ($seExit)" }
-    # d) CreateProcessWithLogonW goes through Secondary Logon
+    # e) CreateProcessWithLogonW goes through Secondary Logon
     if ((Get-Service seclogon).StartType -eq 'Disabled') { Set-Service seclogon -StartupType Manual }
-    # e) password file, D: only. DPAPI LocalMachine scope (this script is SYSTEM, the probe is the logged-on user),
-    #    extra entropy epsilon-job/v1. The deny ACE is what keeps job processes out; DPAPI only stops reading a copied D:.
-    New-Item -ItemType Directory -Force $Sec | Out-Null
-    $acl = Get-Acl $Sec
-    $acl.SetSecurityDescriptorSddlForm("D:P(D;OICI;FA;;;$JobSid)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)", 'Access')
-    Set-Acl -Path $Sec -AclObject $acl
-    Add-Type -AssemblyName System.Security
-    $blob = [Security.Cryptography.ProtectedData]::Protect([Text.Encoding]::UTF8.GetBytes($JobPlain),
-        [Text.Encoding]::UTF8.GetBytes('epsilon-job/v1'), [Security.Cryptography.DataProtectionScope]::LocalMachine)
-    $json = '{"version":1,"user":"' + $JobUser + '","sid":"' + $JobSid + '","password_dpapi":"' + [Convert]::ToBase64String($blob) + '"}'
-    [IO.File]::WriteAllText("$SecFile.tmp", $json)   # UTF-8, no BOM
-    Move-Item "$SecFile.tmp" $SecFile -Force
-    Remove-Variable JobPlain, JobSecure, rb, blob, json
-    # f) the job account reads nothing under D:\epsilon (probe.json, secrets\, logs, other jobs) and writes nothing
-    #    (slots, keyring version, env layers incl. sitecustomize.py). Env layers: read + execute. Job dirs get their own
+    # f) the job account reads nothing under D:\epsilon (probe.json, secrets\, logs, other jobs), writes nothing
+    #    (slots, keyring version, env layers incl. sitecustomize.py) and executes nothing (probe, boot loader, llama-server).
+    #    Env layers: read + execute (explicit allow on envs\ comes before the inherited denies). Job dirs get their own
     #    protected ACL from the probe. 0xd0157 = read/list, write, append, write EA, delete child, write attributes, delete, WRITE_DAC, WRITE_OWNER.
     if ($OldSid -and $OldSid -ne $JobSid) {   # the account was recreated (C: restore): drop the dead SID's ACEs
         icacls $Dst /remove:d "*$OldSid" /Q | Out-Null
         if (Test-Path "$Dst\envs") { icacls "$Dst\envs" /remove:g "*$OldSid" /Q | Out-Null }
     }
     icacls $Dst /deny "*${JobSid}:(OI)(CI)(RD,WD,AD,WEA,DC,WA,DE,WDAC,WO)" /Q | Out-Null
+    icacls $Dst /deny "*${JobSid}:(OI)(IO)(X)" /Q | Out-Null
     New-Item -ItemType Directory -Force "$Dst\envs" | Out-Null
     icacls "$Dst\envs" /grant "*${JobSid}:(OI)(CI)RX" /Q | Out-Null
-    # g) firewall by account SID, not by program path: covers every process of this account (env layer exes,
+    # g) data volumes (D: is not restored; its root lets Users read by default: students' and teachers' files).
+    #    Deny read/list on the root of every fixed NTFS volume except the system drive. Only when missing: adding it
+    #    propagates through the whole volume. Job dirs and secrets\ are protected; envs\ has its explicit allow.
+    foreach ($d in [IO.DriveInfo]::GetDrives()) {
+        if ($d.DriveType -eq 'Fixed' -and $d.DriveFormat -eq 'NTFS' -and $d.Name -ne "$env:SystemDrive\") {
+            $v = $d.Name
+            if ($OldSid -and $OldSid -ne $JobSid) { icacls $v /remove:d "*$OldSid" /C /Q | Out-Null }
+            $rules = (Get-Acl $v).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])
+            if (-not ($rules | Where-Object { $_.AccessControlType -eq 'Deny' -and $_.IdentityReference.Value -eq $JobSid })) {
+                Write-Host "deny read for $JobUser on $v (propagates through the volume)"
+                icacls $v /deny "*${JobSid}:(OI)(CI)(RD)" /C /Q | Out-Null
+            }
+        }
+    }
+    # h) firewall by account SID, not by program path: covers every process of this account (env layer exes,
     #    System32 tools, anything that escaped the job object). Inbound too: epsilon-p2p allows 47100-47119 to any program.
-    #    DNS (dnscache) and UNC (SMB/WebDAV redirectors) are not matched by this; the audit hook and a VLAN cover those.
+    #    Not covered (docs/jobs-sandbox.md 4 and 8): DNS (dnscache), UNC (SMB/WebDAV redirectors run as System),
+    #    loopback (Windows Firewall does not filter it).
     Remove-NetFirewallRule -DisplayName 'epsilon-job-out' -ErrorAction SilentlyContinue
     New-NetFirewallRule -DisplayName 'epsilon-job-out' -Direction Outbound -Action Block -Protocol Any -Profile Any -LocalUser "O:LSD:(A;;CC;;;$JobSid)" | Out-Null
     Remove-NetFirewallRule -DisplayName 'epsilon-job-in' -ErrorAction SilentlyContinue
     New-NetFirewallRule -DisplayName 'epsilon-job-in' -Direction Inbound -Action Block -Protocol Any -Profile Any -LocalUser "O:LSD:(A;;CC;;;$JobSid)" | Out-Null
     Write-Host "job sandbox ready: account $JobUser ($JobSid), rules epsilon-job-out / epsilon-job-in, $SecFile"
+  } catch {
+    Remove-Item $SecFile, "$SecFile.tmp" -Force -ErrorAction SilentlyContinue
+    Write-Host "job sandbox setup FAILED, password file removed (probe reports jobs:false; rerun install.ps1): $_"
+  }
 } else {
-    Write-Host 'job sandbox off (OPT-IN: pass EPS_JOB_SANDBOX=1 once); probe.json "jobs": true will report jobs:false'
+    Write-Host 'job sandbox off (OPT-IN: pass EPS_JOB_SANDBOX=1 once); probe.json "jobs_sandboxed": true will report jobs:false'
 }
 
 Step "5/8 controller $Ctl`:8090"

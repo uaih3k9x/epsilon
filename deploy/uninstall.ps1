@@ -6,6 +6,12 @@ Get-Process epsilon-boot, epsilon-probe, llama-server, ggml-rpc-server -ErrorAct
 Start-Sleep 2
 Get-NetFirewallRule -DisplayName 'epsilon-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 # job sandbox (docs/jobs-sandbox.md): the account and its logon-screen entry; secrets\ goes with D:\epsilon
+$jobUser = Get-LocalUser -Name epsilon-job -ErrorAction SilentlyContinue
+if ($jobUser) {   # install.ps1 put a deny-read ACE for it on the root of every fixed data volume
+    foreach ($d in [IO.DriveInfo]::GetDrives()) {
+        if ($d.DriveType -eq 'Fixed' -and $d.DriveFormat -eq 'NTFS') { icacls $d.Name /remove:d "*$($jobUser.SID.Value)" /C /Q | Out-Null }
+    }
+}
 Remove-LocalUser -Name epsilon-job -ErrorAction SilentlyContinue
 Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList' -Name epsilon-job -ErrorAction SilentlyContinue
 # rmdir /s does not follow junctions; Remove-Item -Recurse on 5.1 can

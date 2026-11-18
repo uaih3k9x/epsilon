@@ -186,3 +186,50 @@ def test_uninstall_removes_job_account():
     s = read("uninstall.ps1")
     s.encode("ascii")
     assert "Remove-LocalUser -Name epsilon-job" in s
+
+
+def test_sandbox_failure_is_contained():
+    # 探针在第 1 步就停了：第 4 步出错不能把整个安装中断（不注册计划任务，C: 还原后整台掉线、推理也没了）。
+    # 出错就删掉密码文件（健康检查不过、心跳报 jobs:false），接着往下装
+    b = sandbox_block()
+    i = b.index("if (Test-Path $SandboxMarker) {")
+    assert b[i:].split("\n", 2)[1].strip() == "try {", "沙箱整段要包在 try 里"
+    end = b.index("\n} else {")
+    catch = b[b.rindex("} catch {", 0, end):end]  # 最外层的 catch（里面还有小的 try/catch）
+    assert "Remove-Item $SecFile" in catch and "throw" not in catch
+    assert b.index("$SecFile =") < i  # catch 里要用
+
+
+def test_sandbox_keeps_working_password():
+    # 每次都换密码：改密码和写密码文件之间任何一步出错，两边就对不上（1326）。账户在、密码文件解得开、SID 对得上就不换
+    b = sandbox_block()
+    assert "ProtectedData]::Unprotect" in b and b.index("ProtectedData]::Unprotect") < b.index("New-LocalUser")
+    assert "$Keep = ($old.sid -eq $Existing.SID.Value)" in b
+    # 要换：先写临时文件，再改账户密码，马上改名
+    tmp = b.index('[IO.File]::WriteAllText("$SecFile.tmp"')
+    setpw = b.index("Set-LocalUser -Name $JobUser -Password $JobSecure")
+    move = b.index('Move-Item "$SecFile.tmp" $SecFile')
+    assert tmp < setpw < move
+    assert b.index("New-LocalUser") < tmp  # 新账户要先有 SID 才写得出密码文件
+    assert move < b.index("secedit /export")  # 密码文件紧跟着账户写，不夹别的步骤
+
+
+def test_sandbox_root_denies_execute():
+    # 0xd0157 不含 FILE_EXECUTE：任务账户能执行（也能按映像映射进来读）探针、引导器、llama-server
+    b = sandbox_block()
+    assert 'icacls $Dst /deny "*${JobSid}:(OI)(IO)(X)" /Q' in b
+
+
+def test_sandbox_data_volumes_deny_read():
+    # 非系统盘根上默认 Users 可读，D: 又不被还原：学生、老师的文件。每个固定 NTFS 数据卷的根上拒读（已有就不重做，免得每次整盘传播）
+    b = sandbox_block()
+    assert "[IO.DriveInfo]::GetDrives()" in b and "DriveType -eq 'Fixed'" in b and "DriveFormat -eq 'NTFS'" in b
+    assert "$env:SystemDrive" in b
+    assert 'icacls $v /deny "*${JobSid}:(OI)(CI)(RD)" /C /Q' in b
+    assert "GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])" in b
+    assert 'icacls $v /remove:d "*$OldSid"' in b
+
+
+def test_uninstall_removes_data_volume_deny():
+    s = read("uninstall.ps1")
+    assert s.index('/remove:d "*$($jobUser.SID.Value)"') < s.index("Remove-LocalUser -Name epsilon-job")
