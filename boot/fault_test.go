@@ -119,3 +119,23 @@ func TestFaultTornWrite(t *testing.T) {
 		t.Fatalf("%q", got)
 	}
 }
+
+// hook 对 sync 返回 errSkip：算这个写盘点走过了，但不真的刷盘（只为测试提速）。
+func TestFaultSkipSync(t *testing.T) {
+	dir := t.TempDir()
+	n := 0
+	onFault(t, dir, func(op, path string) error {
+		if op == "sync" {
+			n++
+			return errSkip
+		}
+		return nil
+	})
+	p := filepath.Join(dir, "s")
+	if err := writeAtomic(p, []byte("x")); err != nil || n != 1 {
+		t.Fatalf("err %v，sync %d 次", err, n)
+	}
+	if got := readFile(t, p); got != "x" {
+		t.Fatalf("%q", got)
+	}
+}

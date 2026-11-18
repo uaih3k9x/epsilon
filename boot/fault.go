@@ -15,6 +15,10 @@ var faultHook func(op, path string) error
 // errTorn 被 hook 返回的错误包着时，fsWrite 先写进一半再报错，模拟写到一半断电。
 var errTorn = errors.New("撕裂写")
 
+// errSkip 被 hook 原样返回时，fsSync 当作成功、不真的刷盘：只为测试提速
+// （macOS 上一次刷盘要几毫秒，穷举和断电测试要刷上万次）。
+var errSkip = errors.New("跳过刷盘")
+
 func fault(op, path string) error {
 	if faultHook == nil {
 		return nil
@@ -49,6 +53,9 @@ func fsWrite(f *os.File, b []byte) (int, error) {
 
 func fsSync(f *os.File) error {
 	if err := fault("sync", f.Name()); err != nil {
+		if err == errSkip {
+			return nil
+		}
 		return err
 	}
 	return f.Sync()
