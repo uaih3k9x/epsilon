@@ -421,13 +421,16 @@ func TestPowerCut(t *testing.T) {
 			}
 			t.Run("每个写盘点", func(t *testing.T) {
 				for k := range ops {
+					if testing.Short() && k%5 != 0 && k != len(ops)-1 {
+						continue // -short 只断每第 5 个和最后一个，开发时快速回归用；冻结、合并前跑全量
+					}
 					t.Run(fmt.Sprintf("%02d-%s", k, strings.ReplaceAll(ops[k], " ", "_")), func(t *testing.T) {
 						t.Parallel()
 						powerCutAt(t, sc, priv, ops, k)
 					})
 				}
 			})
-			if !t.Failed() {
+			if !t.Failed() && !testing.Short() {
 				t.Logf("%s：%d 个写盘点全试过\n  %s", sc.name, len(ops), strings.Join(ops, "\n  "))
 			}
 		})
