@@ -35,7 +35,9 @@ def levels_of(findings, rule):
     return {f.level for f in findings if f.rule == rule}
 
 
-# ======================================================================== 代码层: 拒签
+# ======================================================================== 代码层: 动态执行 / 进程 / 系统 API / 联网
+# 2026-11-01 分级调整 (issue #3 评论): 这四类从拒签降到需解释, 审核人当场判断;
+# 拒签只留审核人读不到的代码 (二进制、pickle 系、写 .py 再导入、审计钩子).
 
 @pytest.mark.parametrize("src", [
     "eval('1+1')",
@@ -48,8 +50,10 @@ def levels_of(findings, rule):
     "__builtins__.exec(s)",
     "x = (eval)\nx('1')",
 ])
-def test_exec_family_rejected(src):
-    assert "exec-call" in rules(scan_py(src), REJECT)
+def test_exec_family_needs_explanation(src):
+    fs = scan_py(src)
+    assert levels_of(fs, "exec-call") == {EXPLAIN}
+    assert not rules(fs, REJECT)
 
 
 def test_getattr_builtins_concat_eval_is_caught():
@@ -62,7 +66,7 @@ def test_dunder_import_concat_os_system():
     fs = scan_py('__import__("o" + "s").system("whoami")')
     assert "reflect-nonliteral" in rules(fs, EXPLAIN)
     # .system 调用本身 (对着动态模块) 也要被标出来
-    assert "process-call" in rules(fs, REJECT)
+    assert "process-call" in rules(fs, EXPLAIN)
 
 
 @pytest.mark.parametrize("src,rule", [
@@ -95,21 +99,27 @@ def test_deserialization_rejected(src, rule):
     "import pty",
     "from os import system as s\ns('x')",
 ])
-def test_process_rejected(src):
-    assert "process-call" in rules(scan_py(src), REJECT)
+def test_process_needs_explanation(src):
+    fs = scan_py(src)
+    assert "process-call" in rules(fs, EXPLAIN)
+    assert not rules(fs, REJECT)
 
 
 @pytest.mark.parametrize("src", ["import ctypes", "from ctypes import windll", "import cffi", "import winreg",
                                  "import win32api", "import _winapi", "import msvcrt"])
-def test_native_rejected(src):
-    assert "native-api" in rules(scan_py(src), REJECT)
+def test_native_needs_explanation(src):
+    fs = scan_py(src)
+    assert "native-api" in rules(fs, EXPLAIN)
+    assert not rules(fs, REJECT)
 
 
 @pytest.mark.parametrize("src", ["import socket", "import requests", "from urllib.request import urlopen",
                                  "import urllib", "import http.client", "import ftplib", "import smtplib",
                                  "import paramiko", "import aiohttp", "import httpx"])
-def test_network_rejected(src):
-    assert "network" in rules(scan_py(src), REJECT)
+def test_network_needs_explanation(src):
+    fs = scan_py(src)
+    assert "network" in rules(fs, EXPLAIN)
+    assert not rules(fs, REJECT)
 
 
 def test_write_py_then_import_rejected():
@@ -186,10 +196,11 @@ def test_string_decoding(src):
     assert "string-decode" in rules(scan_py(src), EXPLAIN)
 
 
-def test_base64_then_exec_is_rejected_overall():
+def test_base64_then_exec_needs_at_least_explanation():
     src = "import base64\nexec(base64.b64decode('cHJpbnQoMSk='))"
     fs = scan_py(src)
-    assert er.verdict(fs) == REJECT and "string-decode" in rules(fs)
+    assert er.verdict(fs) in (REJECT, EXPLAIN) and er.exit_code(fs) >= 1
+    assert "string-decode" in rules(fs) and "exec-call" in rules(fs)
 
 
 def test_long_and_high_entropy_literals():
@@ -445,7 +456,9 @@ def test_exit_codes():
     assert er.exit_code([]) == 0
     assert er.exit_code(scan_py("getattr(o, 'w')")) == 0
     assert er.exit_code(scan_py("getattr(o, n)")) == 1
-    assert er.exit_code(scan_py("eval('1')")) == 2
+    assert er.exit_code(scan_py("eval('1')")) == 1
+    assert er.exit_code(scan_py("eval('1')"), strict=True) == 2
+    assert er.exit_code(scan_py("import pickle")) == 2
     assert er.exit_code(scan_py("getattr(o, n)"), strict=True) == 2
 
 
@@ -453,7 +466,7 @@ def test_json_report_shape(tmp_path):
     root = _pkg(tmp_path, dict(GOOD_JOB), {"train.py": "eval('1')\n"})
     fs = er.scan_package(root)
     rep = json.loads(er.render_json(root, fs))
-    assert rep["verdict"] == REJECT and rep["counts"][REJECT] >= 1
+    assert rep["verdict"] == EXPLAIN and rep["counts"][EXPLAIN] >= 1 and rep["counts"][REJECT] == 0
     f = next(x for x in rep["findings"] if x["rule"] == "exec-call")
     assert {"level", "rule", "file", "line", "col", "snippet", "message", "hint"} <= set(f)
     assert f["file"] == "train.py" and f["line"] == 1
@@ -479,4 +492,272 @@ def test_never_imports_scanned_code(tmp_path):
     marker = tmp_path / "pwned"
     src = f"open({str(marker)!r}, 'w').write('x')\n"
     scan_py(src)
+    assert not marker.exists()
+
+
+# ======================================================================== 补充: 绕过写法 / 分级边界
+
+@pytest.mark.parametrize("src,rule", [
+    ("__builtins__['exec'](s)", "exec-call"),
+    ("import os\ngetattr(os, 'system')('x')", "process-call"),
+    ("import importlib\nimportlib.import_module('subprocess')", "process-call"),
+    ("m = __import__('socket')", "network"),
+    ("import nt\nnt.system('x')", "process-call"),
+    ("import asyncio\nasyncio.create_subprocess_shell('x')", "process-call"),
+])
+def test_bypass_forms_need_explanation(src, rule):
+    assert rule in rules(scan_py(src), EXPLAIN)
+
+
+def test_getattr_literal_dunder_is_not_just_info():
+    fs = scan_py("getattr(f, '__globals__')")
+    assert "dunder-access" in rules(fs, EXPLAIN)
+
+
+def test_urllib_parse_is_not_network():
+    assert "network" not in rules(scan_py("from urllib.parse import urlparse\nurlparse('x')"))
+
+
+def test_multiprocessing_is_only_info():
+    fs = scan_py("import multiprocessing as mp\nmp.Process(target=f).start()")
+    assert not rules(fs, REJECT) and not rules(fs, EXPLAIN)
+
+
+def test_non_utf8_coding_cookie_rejected():
+    # 声明了别的源码编码: 审核人看到的字节和解释器执行的不是一回事
+    fs = scan_py("# -*- coding: utf-7 -*-\nx = 1\n")
+    assert "source-encoding" in rules(fs, REJECT)
+    assert not rules(scan_py("# -*- coding: utf-8 -*-\nx = 1\n"))
+
+
+@pytest.mark.parametrize("src", ["import tempfile\ntempfile.mkdtemp()", "import tempfile\ntempfile.NamedTemporaryFile()"])
+def test_tempfile_without_dir_writes_outside(src):
+    assert "write-outside" in rules(scan_py(src), EXPLAIN)
+
+
+def test_tempfile_with_dir_is_fine():
+    assert "write-outside" not in rules(scan_py("import tempfile\ntempfile.mkdtemp(dir=TMP)"))
+
+
+def test_write_py_alone_needs_explanation():
+    fs = scan_py("open('tmp/gen.py', 'w').write(s)\n")
+    assert levels_of(fs, "write-then-import") == {EXPLAIN}
+
+
+def test_no_cold_wording():
+    # 11-01: 文案不再写"不接受解释"
+    srcs = ["eval('1')", "import pickle", "import subprocess", "import socket", "import ctypes",
+            "import sys\nsys.addaudithook(h)"]
+    for src in srcs:
+        for f in scan_py(src):
+            assert "不接受" not in f.message + f.hint, (src, f.message, f.hint)
+
+
+# ======================================================================== 补充: 文件层 / zip 层
+
+@pytest.mark.parametrize("name,data", [
+    ("arr.csv", b"\x93NUMPY\x01\x00v\x00{'descr': '<f8'"),           # .npy 改名
+    ("w.txt", b"\x55\x0d\x0d\x0a" + b"\x00" * 12),                   # .pyc 改名成 .txt
+    ("m.json", b"\x00asm\x01\x00\x00\x00"),                          # wasm
+    ("t.md", b"x" * 257 + b"ustar\x0000" + b"\x00" * 240),           # tar 改名
+    ("b.txt", b"BZh91AY&SY" + b"\x00" * 10),                         # bz2
+    ("c.txt", b"\xfd7zXZ\x00\x00"),                                  # xz
+    ("d.txt", b"\x28\xb5\x2f\xfd\x00"),                              # zstd
+    ("e.txt", b"\xcf\xfa\xed\xfe\x07\x00"),                          # Mach-O 64 (反序)
+    ("f.txt", b"\xca\xfe\xba\xbe\x00\x00"),                          # Mach-O fat
+])
+def test_more_magic(name, data):
+    assert "file-magic" in rules(er.scan_files({name: data}), REJECT)
+
+
+def test_text_starting_with_mz_is_not_pe():
+    assert "file-magic" not in rules(er.scan_files({"notes.txt": b"MZ notes: hello\n"}))
+
+
+def _zip(path, entries):
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for e in entries:
+            if isinstance(e, zipfile.ZipInfo):
+                z.writestr(e, b"x = 1\n")
+            else:
+                z.writestr(e[0], e[1])
+    return str(path)
+
+
+def test_encrypted_entry_rejected(tmp_path):
+    info = zipfile.ZipInfo("secret.py")
+    info.flag_bits |= 0x1                                            # 加密标志位
+    p = _zip(tmp_path / "code.zip", [("a.py", "x = 1"), info])
+    assert "zip-encrypted" in rules(er.scan_package(p), REJECT)
+
+
+def test_duplicate_entry_rejected(tmp_path):
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        p = _zip(tmp_path / "code.zip", [("a.py", "x = 1"), ("a.py", "import pickle")])
+    assert "bad-path" in rules(er.scan_package(p), REJECT)
+
+
+def test_zip_bomb_is_tool_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(er, "MAX_UNPACKED_BYTES", 1 << 20)
+    p = _zip(tmp_path / "code.zip", [("a.py", "x = 1"), ("big.txt", b"\x00" * (2 << 20))])
+    fs = er.scan_package(p)
+    assert "zip-too-big" in rules(fs, er.ERROR) and er.exit_code(fs) == 3
+
+
+def test_empty_zip_is_tool_error(tmp_path):
+    p = _zip(tmp_path / "code.zip", [])
+    assert er.exit_code(er.scan_package(p)) == 3
+
+
+def test_python2_and_non_utf8_source_are_tool_errors():
+    assert er.exit_code(scan_py("print 'hello'\n")) == 3
+    fs = er.scan_files({"train.py": "x = '中文'\n".encode("gbk")})
+    assert er.exit_code(fs) == 3
+
+
+def test_directory_package_with_symlink(tmp_path):
+    code = tmp_path / "code"
+    code.mkdir()
+    (code / "a.py").write_text("x = 1\n", encoding="utf-8")
+    os.symlink("/etc/passwd", code / "link.txt")
+    assert "bad-path" in rules(er.scan_package(str(code)), REJECT)
+
+
+# ======================================================================== 补充: 干净样本 / 性能 / 接入契约
+
+HANDBOOK_13_1_JOB = {
+    "schema": 1, "name": "cifar10-resnet18-hpsearch", "version": "1.0.0",
+    "description": "CIFAR-10 上 ResNet-18 的学习率 × 权重衰减 × 种子网格搜索，每个 trial 一组",
+    "owner": "zhangsan", "entry": ["python", "train.py"], "env": "py311-torch2.5-cu124@1", "data": ["cifar10@1"],
+    "params": {"trial": {"type": "int", "min": 0, "max": 23},
+               "epochs": {"type": "int", "min": 1, "max": 60, "default": 30}},
+    "gpu_mem_mb": 3500, "max_hours": 2, "disk_max_mb": 1024, "output_max_mb": 100, "network": False, "gpu": True,
+}
+
+HANDBOOK_13_1_TRAIN = '''import json
+import os
+import random
+from pathlib import Path
+
+CODE = Path(__file__).resolve().parent
+ROOT = CODE.parent
+DATA, OUT, TMP = ROOT / "data" / "cifar10@1", ROOT / "output", ROOT / "tmp"
+
+LRS = [0.2, 0.1, 0.05, 0.02]
+WDS = [5e-4, 1e-4]
+SEEDS = [0, 1, 2]
+
+
+def load_params():
+    with open(ROOT / "params.json", encoding="utf-8") as f:
+        p = json.load(f)
+    trial = int(p["trial"])
+    epochs = int(p.get("epochs", 30))
+    assert 0 <= trial < len(LRS) * len(WDS) * len(SEEDS), "trial 超出范围"
+    assert 1 <= epochs <= 60, "epochs 超出范围"
+    lr = LRS[trial % 4]
+    wd = WDS[(trial // 4) % 2]
+    seed = SEEDS[trial // 8]
+    return trial, epochs, lr, wd, seed
+
+
+def main():
+    for k in ("TORCH_HOME", "MPLCONFIGDIR", "XDG_CACHE_HOME"):
+        os.environ[k] = str(TMP / k.lower())
+    OUT.mkdir(exist_ok=True)
+    TMP.mkdir(exist_ok=True)
+
+    import numpy as np
+    import torch
+    from safetensors.torch import save_file
+    trial, epochs, lr, wd, seed = load_params()
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.cuda.set_per_process_memory_fraction(3500 / 8192)
+    torch.set_num_threads(8)
+
+    print(f"trial={trial} lr={lr} wd={wd} seed={seed} epochs={epochs}", flush=True)
+    best = 0.0
+    for epoch in range(1, epochs + 1):
+        acc = train_one_epoch_and_eval(...)
+        print(f"EPSILON-PROGRESS {epoch / epochs:.3f} epoch {epoch} val_acc {acc:.4f}", flush=True)
+        if acc > best:
+            best = acc
+            save_file(model.state_dict(), str(OUT / "best.safetensors"))
+
+    result = {"ok": True, "metrics": {"best_val_acc": best},
+              "params": {"trial": trial, "lr": lr, "wd": wd, "seed": seed, "epochs": epochs}}
+    tmp = OUT / "RESULT.json.tmp"
+    tmp.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(OUT / "RESULT.json")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def test_handbook_13_1_package_is_clean(tmp_path):
+    root = _pkg(tmp_path, dict(HANDBOOK_13_1_JOB), {"train.py": HANDBOOK_13_1_TRAIN})
+    fs = er.scan_package(root)
+    assert [(f.level, f.rule, f.message) for f in fs if f.level != INFO] == []
+    assert er.exit_code(fs, strict=True) == 0
+
+
+def test_fifty_files_under_two_seconds(tmp_path):
+    import time
+    files = {f"mod{i:02d}.py": CLEAN_TRAIN * 3 for i in range(49)}
+    files["README.md"] = "# 说明\n" * 100
+    root = _pkg(tmp_path, dict(GOOD_JOB), files)
+    t0 = time.perf_counter()
+    fs = er.scan_package(root)
+    assert time.perf_counter() - t0 < 2.0
+    assert fs.meta["files"] == 50
+
+
+def _cli(*args):
+    import subprocess
+    import sys
+    return subprocess.run([sys.executable, "-I", os.path.join(HERE, "epsilon-review.py"), *args],
+                          capture_output=True, text=True)
+
+
+def test_cli_json_strict_contract(tmp_path):
+    # sign-job 以后按这个契约接: --json 的 code_sha256 必须是被扫 zip 的哈希, 退出码和 strict 一致
+    root = _pkg(tmp_path, dict(GOOD_JOB), {"train.py": "getattr(o, name)\n"})
+    zsha = hashlib.sha256((tmp_path / "code.zip").read_bytes()).hexdigest()
+    r = _cli(root, "--json")
+    rep = json.loads(r.stdout)
+    assert r.returncode == 1 and rep["exit_code"] == 1
+    assert rep["code_sha256"] == zsha == rep["sha256"]
+    assert isinstance(rep["rules_version"], int) and rep["tool_version"]
+    r = _cli(root, "--json", "--strict")
+    assert r.returncode == 2 and json.loads(r.stdout)["exit_code"] == 2
+    r = _cli(str(tmp_path / "code.zip"), "--job", str(tmp_path / "job.json"), "--json")
+    assert r.returncode == 1 and json.loads(r.stdout)["code_sha256"] == zsha
+
+
+@pytest.mark.parametrize("kind", ["corrupt", "empty", "py2", "gbk", "missing"])
+def test_cli_tool_errors_exit_3_without_traceback(tmp_path, kind):
+    p = tmp_path / "code.zip"
+    if kind == "corrupt":
+        p.write_bytes(b"PK\x03\x04garbage")
+    elif kind == "empty":
+        _zip(p, [])
+    elif kind == "py2":
+        _zip(p, [("a.py", "print 'x'\n")])
+    elif kind == "gbk":
+        _zip(p, [("a.py", "x = '中文'\n".encode("gbk"))])
+    r = _cli(str(p))
+    assert r.returncode == 3, (r.stdout, r.stderr)
+    assert "Traceback" not in r.stdout + r.stderr
+
+
+def test_package_scan_never_executes_code(tmp_path):
+    marker = tmp_path / "pwned"
+    src = f"open({str(marker)!r}, 'w').write('x')\nimport os\nos.system('touch {marker}')\n"
+    root = _pkg(tmp_path, dict(GOOD_JOB), {"train.py": src, "conftest.py": src, "setup.py": src})
+    er.scan_package(root)
+    _cli(root, "--json")
     assert not marker.exists()
