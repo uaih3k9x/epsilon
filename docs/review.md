@@ -45,13 +45,14 @@ python3 -I tools/epsilon-review.py <任务包目录|code.zip> [--job job.json] [
 |---|---|---|
 | `file-type` | 拒签 | 白名单以外的扩展名。白名单是 `.py .json .yaml .yml .toml .txt .md .csv .jinja .j2` |
 | `file-magic` | 拒签 | 按文件头判断真实类型，扩展名再正常也拒：<br>可执行文件和字节码：PE（`MZ`）、ELF、Mach-O（`feedface` `feedfacf` `cafebabe` 及反序）、wasm、`.pyc`；<br>压缩包：zip、gzip、bz2、xz、zstd、7z、rar、tar（偏移 257 处的 `ustar`）；<br>序列化数据：`.npy`、pickle 协议 2–5。<br>zip 里套的压缩包也由这条抓 |
-| `bad-path` | 拒签 | 路径有问题：`..`、绝对路径、盘符、冒号（NTFS 备用流）、反斜杠、控制字符、Windows 保留名、结尾是点或空格、超过 120 字符、只差大小写；还有符号链接、非普通文件、zip 里的重名条目 |
+| `bad-path` | 拒签 | 路径有问题：`..`、绝对路径、盘符、冒号（NTFS 备用流）、反斜杠、控制字符、零宽或双向控制符、Windows 保留名（含 `COM¹` `LPT²` 这类）、结尾是点或空格、超过 120 字符、只差大小写或 Unicode 写法（先 NFC 再 casefold 比较）；还有符号链接（包括 `code/`、`code.zip` 本身）、非普通文件、zip 里的重名条目、非 ASCII 文件名没标 UTF-8 的 zip 条目、扫描过程中被换掉的文件 |
 | `zip-encrypted` | 拒签 | zip 里有加密条目 |
 | `zip-too-big` / `too-big` | 工具出错 | 解压后总大小超过 256 MiB，或者条目超过 1 万个（防 zip 炸弹）。按 zip 头声明的大小先查一遍，读的时候再按实际读到的字节数查一遍 |
 | `zip-corrupt` / `empty` / `no-input` | 工具出错 | zip 损坏、空包、路径不存在 |
+| `internal-error` | 工具出错 | 工具自己的 bug，兜底用。出现了请报告 |
 | `big-text` | 需解释 | 单个文本文件超过 1 MB |
 | `encoding` | 需解释 | 文本不是 UTF-8，或者含 NUL 字节 |
-| `junk` | 提示 | `__pycache__`、`.git`、`.DS_Store`、`__MACOSX` 等打包残留。`__pycache__` 里的 `.pyc` 照样会被 `file-type` 拒 |
+| `junk` | 提示 | `__pycache__`、`.git`、`.DS_Store`、`__MACOSX` 等打包残留。只是多一条提示，**内容照常检查**：`__MACOSX` 是合法标识符，里面的 `.py` 能被 `import __MACOSX.x` 导入；残留目录里的二进制照样被 `file-type` / `file-magic` 拒 |
 
 ### 代码层（`ast` 逐个解析 `.py`）
 
@@ -66,16 +67,17 @@ python3 -I tools/epsilon-review.py <任务包目录|code.zip> [--job job.json] [
 
 | 规则 | 级别 | 抓什么 |
 |---|---|---|
-| `pickle-use` | 拒签 | 导入 `pickle` `_pickle` `cPickle` `cloudpickle` `dill` `joblib` `shelve` `marshal`；调用 `pandas.read_pickle`、`.to_pickle()` / `.read_pickle()`。`torch.save` 只到需解释 |
-| `unsafe-load` | 拒签 | 不带字面量 `weights_only=True` 的 `torch.load`；`np.load(allow_pickle=True)`；`Loader` 不是 Safe/Base 的 `yaml.load`；`yaml.unsafe_load`。参数看不出是什么（`**kw`、变量）时降为需解释；`yaml.full_load` 需解释 |
-| `write-then-import` | 拒签 / 需解释 | 同一个文件里，既写了 `.py` / `.pth` 文件，又有动态导入（`importlib`、`runpy`、`__import__`、`imp`、`zipimport`、`pkgutil`）或改了 `sys.path`，就拒签。只写 `.py`、没看到导入的，需解释 |
+| `pickle-use` | 拒签 | 导入 `pickle` `_pickle` `cPickle` `cloudpickle` `dill` `joblib` `shelve` `marshal` `multiprocessing.reduction`；引用 `ForkingPickler`；调用 `pandas.read_pickle`、`.to_pickle()` / `.read_pickle()`。`torch.save` 只到需解释 |
+| `unsafe-load` | 拒签 / 需解释 | 拒签：不带字面量 `weights_only=True` 的 `torch.load`；任何调用里的 `allow_pickle=True`（`np.load`、`np.lib.format.read_array` 等）；`Loader` 不是 Safe/Base 的 `yaml.load`；`yaml.unsafe_load`；`functools.partial` 里预先绑定了上面这些危险参数。<br>需解释：参数看不出是什么（`**kw`、变量）；`yaml.full_load`；这几个函数没被直接调用，而是赋给变量、放进容器、传给别的函数（工具查不了调用时的参数） |
+| `write-then-import` | 拒签 / 需解释 | 同一个文件里，既写了 `.py` / `.pth` 文件（`open`、`io.FileIO`、`os.open`、`Path.write_text`、`shutil.copy` 等），又有动态导入（`importlib`、`runpy`、`__import__`、`imp`、`zipimport`、`pkgutil`、`pydoc.locate`）、改了 `sys.path`，或者静态 `import` 了和写出的文件同名的模块，就拒签。只写 `.py`、没看到导入的，需解释 |
+| `load-source` | 拒签 / 需解释 | 按路径加载代码：`runpy.run_path`、`imp.load_source` / `load_module` / `load_compiled`、`importlib.machinery.SourceFileLoader` / `SourcelessFileLoader`、`importlib.util.spec_from_file_location`、`zipimport.zipimporter`。路径是字面量但不是 `.py`，或者加载的是字节码，拒签（工具没按代码扫过它）；其余需解释 |
 | `audit-hook` | 拒签 | `sys.addaudithook`：平台用审计钩子做运行时兜底，任务代码不该碰 |
-| `source-encoding` | 拒签 | 声明了非 UTF-8 的源码编码（如 `# coding: utf-7`）。解释器按声明的编码解码，审核人看到的就不是同一份代码 |
-| `exec-call` | 需解释 | `eval` `exec` `compile` 的任何引用，`types.CodeType` / `FunctionType`，`timeit` `cProfile` `profile` `pdb` 的字符串执行，`pandas.eval`。`model.eval()`、`re.compile` 不算 |
-| `process-call` | 需解释 | 导入 `subprocess` `pty` 等；`os.system` `popen` `exec*` `spawn*` `startfile` `posix_spawn` `fork`、`asyncio.create_subprocess_*`；对动态导入的模块调 `.system` 之类。`multiprocessing` 只到提示 |
+| `source-encoding` | 拒签 | 前两行声明了非 UTF-8 的源码编码（如 `# coding: utf-7`）。解释器按声明的编码解码，审核人看到的就不是同一份代码。“前两行”按解释器的规则数：直接运行时 `\r` `\n` 都算换行，`import` 时只认 `\n`，两种都查；`\x0c` `\x85` 这类字符不算换行。解析时把原始字节交给 `ast.parse`，解码方式和解释器一致 |
+| `exec-call` | 需解释 | `eval` `exec` `compile` 的任何引用，`types.CodeType` / `FunctionType`，`timeit` `cProfile` `profile` `pdb` 的字符串执行，`pandas.eval`，导入 `code` / `codeop`。`model.eval()`、`re.compile` 不算 |
+| `process-call` | 需解释 | 导入 `subprocess` `pty` 等；`os.system` `popen` `exec*` `spawn*` `startfile` `posix_spawn` `fork`、`asyncio.create_subprocess_*`；对动态导入的模块调 `.system` 之类；接收者认不出来（比如模块经函数参数传进来）时取 `.system` `.popen` `.Popen` `.check_output` `exec*` `spawn*` `fork` 这类属性，`getattr(m, "system")` 也算。`.run` `.call` 太常见，不算。`multiprocessing` 只到提示 |
 | `native-api` | 需解释 | `ctypes` `cffi` `winreg` `win32*` `_winapi` `msvcrt` 等，`os.add_dll_directory` |
 | `network` | 需解释 | `socket` `requests` `urllib`（`urllib.parse` 除外）`http.client` `ftplib` `smtplib` `paramiko` `aiohttp` `httpx` 等 |
-| `reflect-nonliteral` | 需解释 | `getattr` `setattr` `delattr` `hasattr` `__import__` `importlib.import_module` `importlib.util.*` `runpy.*` 的名字参数不是字符串字面量；`operator.attrgetter` / `methodcaller` |
+| `reflect-nonliteral` | 需解释 | `getattr` `setattr` `delattr` `hasattr` `__import__` `importlib.import_module` `importlib.util.*` `runpy.*` `pkgutil.resolve_name` `pydoc.locate` 的名字参数不是字符串字面量；`operator.attrgetter` / `methodcaller`；从 `sys.modules` 按变量名取模块（`sys.modules[name]`、`sys.modules.get(...)`；`sys.modules["os"]` 认得出，按 `os` 算）；`logging.config.dictConfig` / `fileConfig` / `listen` 和 Hydra 的 `instantiate` / `call`，它们按配置里写的名字导入并调用对象 |
 | `reflect-literal` | 提示 | 同上，但名字是字面量（能直接写就直接写）。字面量是内部属性的，另报 `dunder-access` |
 | `namespace-access` | 需解释 | `globals()` `locals()` `vars()` 被下标访问、取属性或传给别的函数 |
 | `dunder-access` | 需解释 | `__builtins__` `__dict__` `__code__` `__globals__` `__subclasses__` `__reduce__` `__reduce_ex__` `__getattribute__` `__mro__` `__bases__` `__base__` `__closure__`，以及定义 `__reduce__` |
@@ -94,8 +96,8 @@ python3 -I tools/epsilon-review.py <任务包目录|code.zip> [--job job.json] [
 | 规则 | 级别 | 抓什么 |
 |---|---|---|
 | `job-schema` | 拒签 | 解析不了、带 BOM、顶层不是对象、缺必填字段或写 `null`，`params` 不是对象 |
-| `job-entry` | 拒签 | `entry[0]` 不是 `python` / `python3`；脚本不是 `code/` 下的相对 `.py`；脚本不在代码包里；出现 `-c` / `-m` |
-| `job-sha` | 拒签 / 提示 | `code_sha256` 和 `code.zip` 不一致就拒签；扫的是 `code/` 目录、没有 zip 可核对时，提示 |
+| `job-entry` | 拒签 | `entry[0]` 不是 `python` / `python3`；脚本不是 `code/` 下的相对 `.py`；脚本不在代码包里，或者在 `__MACOSX` 这类打包残留目录里；出现 `-c` / `-m` |
+| `job-sha` | 拒签 / 提示 | `code_sha256` 和 `code.zip` 不一致就拒签；扫的是 `code/` 目录、没有 zip 可核对时，提示。库调用 `scan_files(files, job, zip_sha=...)` 时传了 `zip_sha` 就照样核对 |
 | `param-unconstrained` | 需解释 | 字符串参数没有 `enum`，数值参数缺 `min` 或 `max`，或者用的是不带约束的简写 |
 | `param-undeclared` | 需解释 | 代码里用字面量读了 `params` 里没声明的参数（`P["x"]`、`P.get("x")`，`P` 是 `json.load` 的结果；认得出哪个是 `params.json` 时只看那个） |
 
@@ -126,6 +128,8 @@ python3 -I tools/epsilon-review.py <任务包目录|code.zip> [--job job.json] [
 - `exit_code` 和进程退出码一致，算的时候已经考虑了 `--strict`。
 - 字段只增不改。
 
+文字报告（不带 `--json`）里，文件名、代码片段、说明中的控制字符、零宽和双向控制符会转义成 `\x1b`、`\u202e` 这样的形式再输出，免得被审代码里藏的终端转义序列改写审核人看到的结论。JSON 里的字符串按 JSON 规则转义。
+
 ## sign-job 以后怎么接（只写设计，这次不实现）
 
 1. `epsilon-release sign-job` 签名前用 `python3 -I tools/epsilon-review.py <code.zip> --job <job.json> --json` 跑一遍本工具，读 stdout 的 JSON。
@@ -137,7 +141,8 @@ python3 -I tools/epsilon-review.py <任务包目录|code.zip> [--job job.json] [
 
 ## 已知限制
 
-- 只做单文件局部匹配：数据跨文件流动（A 文件拼出名字，B 文件用）抓不到，靠审核人读代码。
+- 只做单文件局部匹配：数据跨文件流动（A 文件拼出名字，B 文件用）抓不到，靠审核人读代码。比如 A 文件写出 `gen.py`、B 文件 `import gen`，只在 A 报“写了 .py”需解释。
+- 不知道环境层里装了哪些依赖，所以“导入了包里没有、标准库里也没有的模块”不报。
 - 协议 0 / 1 的 pickle 是文本形状，没有魔数可抓。不过要加载它就得用 pickle，`pickle-use` 会拒。
 - 按运行工具的那个 Python 的语法解析。用 3.9 跑工具，审 3.10 以后的语法（`match`）会报 `parse-error`，换新一点的 Python 跑就行。
 - 不是沙箱：纯 Python 写的恶意逻辑（比如直接删 `output\` 以外的文件）只能靠审核人读，以及运行时的低权限账户兜底。
