@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import stat
 import zipfile
 
 import pytest
@@ -966,13 +967,14 @@ def test_read_dir_does_not_follow_swapped_symlink(tmp_path, monkeypatch):
     code = tmp_path / "code"
     code.mkdir()
     (code / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (code / "b.py").write_text("y = 2\n", encoding="utf-8")
     secret = tmp_path / "secret.txt"
     secret.write_text("SECRET", encoding="utf-8")
     real = os.lstat
 
     def lstat(p, *a, **k):
         st = real(p, *a, **k)
-        if str(p).endswith("a.py") and not os.path.islink(p):
+        if str(p).endswith("a.py") and not stat.S_ISLNK(st.st_mode):
             os.remove(p)
             os.symlink(secret, p)
         return st

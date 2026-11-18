@@ -21,6 +21,7 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 import warnings
 import zipfile
 import zlib
@@ -63,9 +64,10 @@ class Report(list):
 
 # ============================================================================ 文件层
 
-_RESERVED = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | {f"{p}{i}" for p in ("COM", "LPT") for i in range(10)}
+_RESERVED = {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | \
+    {f"{p}{i}" for p in ("COM", "LPT") for i in list(range(10)) + ["\u00b9", "\u00b2", "\u00b3"]}
 _JUNK_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
-_JUNK_DIRS = {".git", "__MACOSX"}     # 只出提示，不当代码扫（这两个目录名不能被正常 import）
+_JUNK_DIRS = {".git", "__MACOSX"}     # 出提示，但照常检查：__MACOSX 是合法标识符，能被 import
 _MACHO = {bytes.fromhex(h) for h in ("feedface", "feedfacf", "cefaedfe", "cffaedfe", "cafebabe", "bebafeca")}
 _BZ2 = re.compile(rb"BZh[1-9](1AY&SY|\x17rE8P\x90)")
 
@@ -82,8 +84,8 @@ def path_problem(name):
         return "带盘符"
     if ":" in name:
         return "路径里有冒号（NTFS 备用数据流）"
-    if any(ord(c) < 32 for c in name):
-        return "路径里有控制字符"
+    if any(ord(c) < 32 or unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in name):
+        return "路径里有控制字符或不可见字符（零宽、双向控制符）"
     if len(name) > MAX_PATH:
         return f"路径超过 {MAX_PATH} 字符"
     for part in name.split("/"):
@@ -102,14 +104,14 @@ def check_paths(names):
         why = path_problem(n)
         if why:
             out.append(Finding(REJECT, "bad-path", n, message=why, hint="文件名只用字母、数字、- _ .，相对路径，不超过 120 字符"))
-    by_lower = {}
+    by_key = {}
     for n in sorted(names):
-        by_lower.setdefault(n.lower(), []).append(n)
-    for group in by_lower.values():
+        by_key.setdefault(unicodedata.normalize("NFC", n).casefold(), []).append(n)
+    for group in by_key.values():
         if len(group) > 1:
             for n in group[1:]:
-                out.append(Finding(REJECT, "bad-path", n, message=f"和 {group[0]} 只差大小写，Windows 上会互相覆盖",
-                                   hint="改成不冲突的名字"))
+                out.append(Finding(REJECT, "bad-path", n, message=f"和 {group[0]} 只差大小写或 Unicode 写法，"
+                                   "Windows / macOS 上会互相覆盖", hint="改成不冲突的名字"))
     return out
 
 
@@ -150,12 +152,9 @@ def sniff(data):
 
 
 def _is_junk(name):
+    """打包残留只多出一条提示，内容照常检查：残留目录里的 .py 照样能被导入、被 exec 读进来。"""
     parts = name.split("/")
-    if parts[-1] in _JUNK_NAMES or any(p in _JUNK_DIRS for p in parts[:-1]):
-        return "skip"          # 只出提示、只查魔数
-    if "__pycache__" in parts:
-        return "flag"          # 出提示，照常检查（.pyc 照样拒）
-    return None
+    return parts[-1] in _JUNK_NAMES or any(p in _JUNK_DIRS or p == "__pycache__" for p in parts[:-1])
 
 
 def scan_contents(files):
@@ -169,7 +168,7 @@ def scan_contents(files):
                                hint="打包前删掉"))
         ext = os.path.splitext(name)[1].lower()
         bad = False
-        if junk != "skip" and ext not in ALLOWED_EXT:
+        if ext not in ALLOWED_EXT:
             out.append(Finding(REJECT, "file-type", name, message=f"白名单以外的文件类型（{ext or '无扩展名'}）",
                                hint="代码包只放 .py .json .yaml .yml .toml .txt .md .csv .jinja .j2；"
                                     "二进制和模型权重走环境层或数据集上架"))
@@ -179,7 +178,7 @@ def scan_contents(files):
             out.append(Finding(REJECT, "file-magic", name, message=f"文件头是 {kind}，审核人读不了",
                                hint="代码包里不能有二进制、序列化文件和压缩包；需要的走环境层或数据集上架"))
             bad = True
-        if bad or junk == "skip":
+        if bad:
             continue
         if len(data) > MAX_TEXT_BYTES:
             out.append(Finding(EXPLAIN, "big-text", name, message=f"文本文件 {len(data) / 1048576:.1f} MB，超过 1 MB",
@@ -202,15 +201,15 @@ def scan_contents(files):
     return out, uses
 
 
-def scan_files(files, job=None):
-    """files: {包内相对路径: 字节}。job: job.json 的字节或 dict（可选）。"""
+def scan_files(files, job=None, zip_sha=None):
+    """files: {包内相对路径: 字节}。job: job.json 的字节或 dict（可选）。zip_sha: files 来自的 code.zip 的哈希。"""
     out = check_paths(list(files))
     fs, uses = scan_contents(files)
     out += fs
     if job is not None:
         if isinstance(job, dict):
             job = json.dumps(job).encode("utf-8")
-        out += check_job(job, "job.json", files, None, uses)[0]
+        out += check_job(job, "job.json", files, zip_sha, uses)[0]
     return _finish(out, {"files": len(files)})
 
 
@@ -249,6 +248,11 @@ def read_zip(data, label):
             names.append(name.rstrip("/"))
             continue
         mode = info.external_attr >> 16
+        if not info.flag_bits & 0x800 and not name.isascii():
+            out.append(Finding(REJECT, "bad-path", name, message="非 ASCII 文件名没标 UTF-8：不同解压工具解出来的名字可能不一样",
+                               hint="用支持 UTF-8 文件名的工具重新打包，或者文件名只用 ASCII"))
+            names.append(name)
+            continue
         if stat.S_ISLNK(mode):
             out.append(Finding(REJECT, "bad-path", name, message="符号链接", hint="打包时不要带符号链接"))
             names.append(name)
@@ -305,11 +309,25 @@ def read_dir(root):
             if not stat.S_ISREG(st.st_mode):
                 out.append(Finding(REJECT, "bad-path", rel, message="不是普通文件", hint="只打包普通文件"))
                 continue
-            total += st.st_size
+            if total + st.st_size > MAX_UNPACKED_BYTES:
+                raise _ToolError("too-big", rel, f"目录总大小超过上限 {MAX_UNPACKED_BYTES} 字节")
+            try:
+                fd = os.open(full, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+            except OSError:
+                fd = None
+            if fd is None:
+                out.append(Finding(REJECT, "bad-path", rel, message="扫描过程中文件被换掉了（变成了符号链接？）", hint="重新扫"))
+                continue
+            with os.fdopen(fd, "rb") as f:
+                st2 = os.fstat(f.fileno())
+                if not stat.S_ISREG(st2.st_mode) or (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino):
+                    out.append(Finding(REJECT, "bad-path", rel, message="扫描过程中文件被换掉了", hint="重新扫"))
+                    continue
+                content = f.read(MAX_UNPACKED_BYTES - total + 1)
+            total += len(content)
             if total > MAX_UNPACKED_BYTES:
                 raise _ToolError("too-big", rel, f"目录总大小超过上限 {MAX_UNPACKED_BYTES} 字节")
-            with open(full, "rb") as f:
-                files[rel] = f.read()
+            files[rel] = content
     if not files:
         raise _ToolError("empty", root, "目录里没有文件")
     return files, check_paths(list(files)) + out
@@ -336,6 +354,10 @@ def scan_package(path, job_path=None):
                 src = path
         else:
             src = path
+        if src != path and os.path.islink(src):
+            out.append(Finding(REJECT, "bad-path", os.path.basename(src), message="code/ 或 code.zip 是符号链接，指向任务包以外",
+                               hint="放真实的目录或文件"))
+            return _finish(out, meta)
         if os.path.isdir(src):
             files, zfs = read_dir(src)
         else:
@@ -410,12 +432,14 @@ def check_job(raw, label, files, zip_sha, uses):
             bad("job-entry", f"entry 里没有 code/ 下的相对 .py 脚本：{entry}", hint)
         elif entry[i] not in files:
             bad("job-entry", f"entry 的脚本 {entry[i]} 不在代码包里", hint)
+        elif _is_junk(entry[i]):
+            bad("job-entry", f"entry 的脚本 {entry[i]} 在打包残留目录里", hint)
         if any(a in ("-c", "-m") for a in entry[1:]):
             bad("job-entry", "entry 里不许出现 -c / -m", hint)
 
     want = job.get("code_sha256")
     if zip_sha is None:
-        bad("job-sha", "扫的是 code/ 目录，没有 code.zip，没核对 code_sha256", "送审前打好 code.zip 再扫一遍", INFO)
+        bad("job-sha", "没有 code.zip 的哈希（扫的是目录？），没核对 code_sha256", "送审前打好 code.zip 再扫一遍", INFO)
     elif want != zip_sha:
         bad("job-sha", f"code_sha256 和 code.zip 不一致（job.json {str(want)[:12]}…，实际 {zip_sha[:12]}…）",
             "重新打包后把哈希写进 job.json")
