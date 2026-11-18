@@ -140,3 +140,15 @@ tools/eps-logs.sh events pc-01 crash     # 某台的某类事件
 tools/eps-logs.sh logs pc-01             # 要日志并打印
 ```
 
+
+## 审核任务包
+
+签名前先用 `tools/epsilon-review.py` 扫一遍（Python 3.9 及以上，只用标准库）。它只解析代码、不执行，把二进制、pickle、动态执行、反射、字符串还原这类可疑点列给审核人：
+
+```sh
+python3 -I tools/epsilon-review.py <任务包目录>                     # 目录里有 job.json 和 code.zip（或 code/）
+python3 -I tools/epsilon-review.py code.zip --job job.json --json   # 机器可读
+python3 -I tools/epsilon-review.py <任务包目录> --strict            # 需解释也按拒签算
+```
+
+退出码：0 = 没有问题或只有提示，1 = 有需解释，2 = 有拒签（`--strict` 时需解释也算 2），3 = 工具没扫完（zip 坏、语法错误等）。规则表、JSON 字段和以后怎么接进 `sign-job`，见 `docs/review.md`。测试：`python3 -m pytest tools/test_epsilon_review.py`。
