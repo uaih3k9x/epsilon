@@ -16,6 +16,10 @@
     "pc-28": {}
   },
   "chunks_dir": "/opt/epsilon/chunks",
+  "jobs_dir": "/opt/epsilon/jobs",
+  "job_keyring": "/opt/epsilon/job-keyring.json",
+  "job_packages_dir": "/opt/epsilon/job-packages",
+  "job_max_retries": 2,
   "seeds_per_room": 2,
   "topology": {
     "pc-01": {"room": "R1", "switch": "R1U12"},

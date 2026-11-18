@@ -1,7 +1,7 @@
 # 批任务签名契约（钥匙环 + 任务包）
 
-对应 issue #1 第 1 步。代码在 `jobsign/`（格式和校验）和 `cmd/epsilon-release/jobcmd.go`（签名命令）。
-探针执行、主控队列还没做；这里先把**格式和规则**定下来，格式一旦发布只增不改。
+对应 issue #1 第 1–2 步。代码在 `jobsign/`（格式和校验）、`cmd/epsilon-release/jobcmd.go`（签名命令）、
+`controller/jobs.go`（主控队列）、`probe/jobs.go` + `jobrun/`（探针执行）。格式一旦发布只增不改。
 
 ## 信任链
 
@@ -48,7 +48,7 @@
 | `keys[].pub` | base64 的 32 字节 ed25519 公钥 |
 | `keys[].expires` | RFC3339；过期后这把钥匙签的任务包一律不跑 |
 | `keys[].limits.max_hours` | > 0；任务包的 `max_hours` 不能超过它（探针核对） |
-| `keys[].limits.max_nodes` / `rooms` | 主控派活时执行（`rooms` 空 = 不限） |
+| `keys[].limits.max_nodes` / `rooms` | 主控派活时执行：这把钥匙签的任务同时最多占几台（**0 = 一台都不派**）；`rooms` 空 = 不限 |
 | `keys[].limits.network` | false 时，要联网的任务包（`network: true`）一律不跑 |
 | `revoked_jobs` | 任务包摘要（`job.signed.json` 里 `job` 字段原文的 SHA-256，小写十六进制） |
 | `env_layers` | `名字@版本` → 环境层清单原文的 SHA-256。探针只用表里的环境层，拉到清单后核对摘要；主控换不了环境层 |
@@ -77,7 +77,7 @@
 
 不影响安全和调度的问题只报 warning（`jobsign.JobWarnings`）：`description` 没写或超过 200 字、`owner` 格式不规范。`sign-job` 打印出来并写进 `job.signed.json` 的 `warnings` 留痕；这个字段不受签名保护，探针不看。
 
-`code_sha256` 和实际 `code.zip` 是否一致，签名时由 `sign-job` 核对；探针拉到代码包以后**还要再核一次**（还没实现）。
+`code_sha256` 和实际 `code.zip` 是否一致，签名时由 `sign-job` 核对；探针拉到代码包以后**再核一次**（见下面"探针执行"）。
 
 ## 命令
 
@@ -131,7 +131,7 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 
 - **续传**：重新运行一遍就行，主控已有的块不再传。
 - **完成后冻结**：`manifest.json` 写好后内容不可改，同样内容再传直接成功，不同内容回 409。完成后删掉块目录，不留两份。
-- 现在 token 是所有探针共用的，任一探针能传任一任务的输出；哪台机器能传哪个任务要等主控队列（`/v1/jobs`）落地后再绑定。
+- 队列里的任务（`/v1/jobs` 派出去的）只收**当前派到的节点、当前这一次**的回传（请求头 `X-Epsilon-Node`、`X-Epsilon-Attempt`，对不上回 403）；不在队列里的任务号（`epsilon-env upload` 手工传）照旧。token 还是所有探针共用，所以这只防错（失联后又回来的旧一次），不防冒充。
 
 ## 显存实测
 
@@ -148,9 +148,81 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 
 审核人按 `vram_delta_mb` 校对 `gpu_mem_mb`。`vram_reliable` 为 `false` 的数据不要用，换台机器重测。任务自己开的 GPU 子进程也会被标记，因为现在只认主进程的 pid。
 
+## 主控队列（第 2 步）
+
+`controller.json`：
+
+| 字段 | 说明 |
+|---|---|
+| `jobs_dir` | 已有：任务输出落这里；队列存 `<jobs_dir>/queue.json`（原子写，主控重启不丢） |
+| `job_keyring` | 根钥匙签的 `job-keyring.json`。原样发给探针；主控也拿它核任务包（每次现读，换文件不用重启） |
+| `job_packages_dir` | 签好的任务包，文件名 `<名字>@<版本>.json`（就是 `job.signed.json`） |
+| `job_max_retries` | 节点失联或重启后重派几次，没写 = 2 |
+| `chunks_dir` | 已有：环境层和代码包从这里发 |
+
+`jobs_dir` 和 `job_keyring` 都配了才开下面这些接口：
+
+| 接口 | 认证 | 说明 |
+|---|---|---|
+| `GET /v1/job-keyring` | probe token | 钥匙环原文 |
+| `POST /v1/jobs` | api key | `{"package":"名字@x.y.z","params":{...},"count":N,"nodes":[...],"rooms":[...]}`，回 `{"jobs":[任务号...]}`。不认识的字段、不认识的参数直接 400 |
+| `GET /v1/jobs` | api key | 全部任务（按提交时间） |
+| `GET /v1/jobs/{id}` | api key | 一个任务：状态、节点、第几次、失联过的节点、退出码、签名者、摘要、输出传完没有（`output`） |
+| `DELETE /v1/jobs/{id}` | api key | 撤销：排队的不再派；派出去的从期望状态里去掉，探针看不到了就整树杀。已结束的回 409 |
+
+- **主控只能挑、填、选**：提交时用 `jobsign.VerifyJob` 核任务包（验签、过期、吊销、字段），`jobsign.FillParams` 按包里的 `params` 声明校验参数（类型、`min`/`max`、`enum`）并补 `default`。下发的是任务包原文，探针自己再验。
+- **提交时就拒**：任务包不存在 404；签名/钥匙/字段不过、带 `data`（数据集还没做）、`rooms` 超出钥匙权限、`chunks_dir` 里没有代码包或环境层的清单都是 400。
+- **代码包约定**：清单 ID `code-<code_sha256>`，里面只有一个文件 `jobcode/<code_sha256>.zip`。在 Mac 上：把 `code.zip` 改名放到 `<目录>/jobcode/<sha>.zip`，`epsilon-chunk build -id code-<sha> -root <目录> -out <chunks_dir> jobcode/<sha>.zip`。
+- 任务号 `<任务名>-<序号>`，序号存在 `queue.json` 里接着往下排，不和 `jobs_dir` 里已有的目录撞。`count` 份就是 `count` 个任务号，各自回传输出。
+- **派活**（每次心跳和每 5 秒）：按提交顺序，给每个排队的任务挑一台节点（按名字排）：
+  - 节点开了能力 32（心跳 `jobs: true`）、心跳没过期、手上没有没结束的任务（正在杀的旧任务也算占着）；
+  - 在提交的 `nodes` / `rooms` 里；钥匙限了 `rooms` 的，节点必须在拓扑表里且在这些教室；
+  - GPU 任务：心跳里第一张卡的显存总量 ≥ `gpu_mem_mb`；
+  - 这把钥匙现在占着的节点数 < `max_nodes`。**`max_nodes` 为 0 = 一台都不派**（宁可误拒）；
+  - 派之前用当前钥匙环复核一次：已吊销、钥匙过期的任务直接 `rejected`。
+- **派了任务的节点先停推理**：心跳回包里 `job` 有值时 `workload` 置空；探针这边也会自己停（双保险）。
+- **失联从头重跑**：派到的节点心跳超过 `stale_seconds`，或探针重新登记时手上没有这次任务（重启过），任务放回队列，`attempt` 加一，丢掉上次没传完的输出块。重派先避开失联过的节点，实在没别的再用。超过 `job_max_retries` 次算 `failed`。退出码非 0、超时、超磁盘都是最终结果，**不重试**。
+- **状态随心跳对账**：探针在登记和每次心跳里带 `job`（`proto.JobStatus`），主控只认当前派到的节点、当前这一次（`attempt`）。回包丢了（探针下一次心跳没报这个任务）就再发一次，不算失联。
+
+任务状态：`queued` → `assigned`（发出去了，探针还没报）→ `fetching` → `running` → `uploading` → `succeeded` / `failed`（退出码非 0、输出超限、回传失败、拉取超时、重试用完）/ `killed`（超时、超磁盘、撤销）/ `rejected`（探针或主控复核没过，一行代码都没跑）/ `cancelled`（撤销）。
+
+## 探针执行（第 2 步）
+
+`probe.json`：
+
+| 字段 | 默认 | 能力 | 说明 |
+|---|---|---|---|
+| `jobs` | `false` | 32 | 执行签名任务包。**上线前必须先做下面"上线前必须做"** |
+| `job_keyring` | `true` | 33 | 每 10 分钟拉一次钥匙环、记住最高版本号；关了就一个任务都验不了 |
+
+一次任务（`probe/jobs.go`）：
+
+1. **钥匙环**：`GET /v1/job-keyring`，用根公钥（和本体发布同一套 `loader.PublicKeys`）验签；版本比 `<artifact_root>/job-keyring.version` 记的旧就拒；验过后更高的版本号原子写回（临时文件 + Sync + 改名）。版本文件坏了就全拒，不当 0。
+2. **任务包**：`jobsign.VerifyJob` 自己验（签名、钥匙过期、吊销、字段、`max_hours` 和联网不超钥匙权限）；参数再过一遍 `FillParams`，主控塞进去没声明的参数直接拒。
+3. **时钟**：判断过期用的"现在"取 本机时间、主控回包的 `Date`、钥匙环 `issued` 里**最晚**的。主控可以骗探针提早判过期，骗不了它放过过期的钥匙。
+4. **环境层**：钥匙环 `env_layers` 的摘要核对清单 → 分块/P2P 拉 → 拼 zip → 解压（`envlayer`）。已经装好就直接用。
+5. **代码包**：取清单 `code-<code_sha256>`，只许一个文件 `jobcode/<sha>.zip`、整文件哈希等于 `code_sha256`；拉块、拼好后**整个文件重算 SHA-256**（二次核对，不信清单也不信 `.epsilon-ok` 校验戳），不符就删掉、拒跑。
+6. 环境层和代码包 2 小时内没拉齐算失败，放出机器。
+7. **展开**到 `<artifact_root>/jobs/<id>/`（`jobrun.Prepare`）：旧目录整个删掉从头来；`code/`（zip 解压，路径穿越、链接、大小写冲突都拒）、`data/`（空）、`params.json`（核过的参数）、`output/`、`tmp/`、`job.log`。
+8. **执行**（`jobrun.Run`）：`<环境层>\python.exe -E -B <entry[1:]...>`，工作目录 `code\`，**不经 shell**；`TMP`/`TEMP` 指到 `tmp\`。Windows 上挂起启动 → 放进新建的作业对象 → 再恢复，任务起的子进程逃不出这棵树；超时（`max_hours`）、写盘超过 `disk_max_mb`（`output/` + `tmp/` + `job.log`，每 10 秒查）、撤销时整棵树一起杀；主进程正常退出后树里剩下的也杀掉。探针自己死了作业对象句柄关闭，Windows 也会杀整棵。
+9. **回传**：写 `output/_runner/summary.json`（任务号、第几次、节点、任务包、签名者、摘要、参数、退出码、被杀原因、秒数）和 `output/_runner/job.log`（`job.log` 末尾 1 MB），再用 `joboutput` 回传（失败隔 30 秒续传，最多 5 轮）。成功、失败、超时、超磁盘都回传；撤销的不回传；`output/` 超过 `output_max_mb` 的算失败、不回传。
+10. 开始和结束各发一条 `job` 事件（任务号、第几次、任务包、签名者、摘要前 12 位、参数），钥匙环升版本发 `keyring` 事件。
+
+## 上线前必须做（issue #1 第 4 步，这一版没有）
+
+- **专用低权限账户**：任务进程现在以探针的账户运行，教室机自动登录的是 `Administrator`，等于签过名的代码拿到管理员。必须改成 `epsilon-job`（`CreateProcessWithLogonW` 或指定账户的计划任务，每台密码由安装脚本生成存数据盘）。
+- **写执行分离**：`code\` 只读，`output\`、`tmp\` 可写但拒绝 `FILE_EXECUTE`（NTFS ACL）；环境层审计钩子（设计书 22.6.1）。
+- **出站防火墙**：只许连主控和同教室；钥匙 `network: true` 才放开。现在声明了 `network` 的任务只记一条日志。
+
+`probe.json` 默认 `jobs: false`，这三条做完之前不要在教室机上打开。
+
 ## 还没做（按 issue #1）
 
-- 探针：拉钥匙环、持久化最高版本号（`job-keyring.version`，原子写）、拉任务包和代码包、二次核对哈希、执行；
-- 主控：分发钥匙环、`/v1/jobs` 队列、按 `max_nodes` / `rooms` 派活；
-- `sign-job` 签名前强制跑静态审核工具（另一个分支在写）；
-- 时钟：过期判断依赖本机时间。学生机时间来自 Windows 自动对时；没对上时宁可误拒，不要误放。
+- 上面"上线前必须做"三条（第 4 步）；
+- 网页"任务"页（第 5 步），现在只有 API；
+- 数据集（`data`）：清单还没被根钥匙钉住，带 `data` 的任务包主控和探针都拒；
+- 让位、检查点、多机并行、允许时段（`windows`）：第一版不做；
+- 磁盘空间管理：任务目录本地保留和 24 小时回收（设计书 22.4）还没做，现在留着不删；
+- 任务显存实测：`tools/job-runner.py` 有，执行器还没接（心跳和运行摘要里都没有）；`EPSILON-PROGRESS` 进度行不解析；
+- 一次提交只能"一组参数 × N 份"，不支持参数列表；
+- `sign-job` 签名前强制跑静态审核工具（另一个分支在写）。
