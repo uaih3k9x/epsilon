@@ -193,7 +193,7 @@ def scan_contents(files):
                 out.append(Finding(EXPLAIN, "encoding", name, message="不是 UTF-8 文本", hint="存成 UTF-8；不是文本的送审单里说明"))
             continue
         if ext == ".py":
-            fs, u = scan_python(name, text)
+            fs, u = scan_python(name, text, data)
             out += fs
             uses += u
         elif "\x00" in text:
@@ -479,6 +479,10 @@ for _m in ("subprocess", "_posixsubprocess", "asyncio.subprocess", "pty", "popen
     MODULE_RULES.append((_m, EXPLAIN, "process-call", f"导入了 {_m}：会起子进程", "送审单里说明起什么进程、参数从哪来"))
 for _m in ("multiprocessing", "concurrent.futures.process"):
     MODULE_RULES.append((_m, INFO, "process-call", f"{_m} 起的是环境层自己的 python，一般没问题", ""))
+MODULE_RULES.append(("multiprocessing.reduction", REJECT, "pickle-use",
+                     "用了 multiprocessing.reduction（ForkingPickler 就是 pickle）", _PICKLE_HINT))
+for _m in ("code", "codeop"):
+    MODULE_RULES.append((_m, EXPLAIN, "exec-call", f"导入了 {_m}：能把字符串当代码执行", "送审单里说明执行的是什么"))
 for _m in ("ctypes", "_ctypes", "cffi", "winreg", "_winreg", "_winapi", "msvcrt", "pywintypes", "pythoncom", "_overlapped"):
     MODULE_RULES.append((_m, EXPLAIN, "native-api", f"导入了 {_m}：直接碰系统 API", "送审单里说明调了什么、为什么非用不可"))
 for _m in ("socket", "_socket", "requests", "urllib", "urllib2", "urllib3", "http.client", "http.server", "httplib",
@@ -491,6 +495,9 @@ _DECODE_HINT = "解出来的东西去了哪？送审单里要说明；不要把�
 _PROCESS_ATTRS = {"system", "popen", "startfile", "Popen", "run", "call", "check_call", "check_output", "getoutput",
                   "getstatusoutput", "fork", "forkpty", "posix_spawn", "posix_spawnp"}
 _PROCESS_RE = re.compile(r"os\.(system|popen[234]?|startfile|exec[lv]p?e?|spawn[lv]p?e?|posix_spawnp?|fork|forkpty)\Z")
+# 接收者认不出来时（模块经函数参数传进来）也报的属性名。run / call 太常见（trainer.run()），不算
+_OPAQUE_PROCESS = re.compile(r"(system|popen[234]?|startfile|Popen|check_output|check_call|getoutput|getstatusoutput"
+                             r"|exec[lv]p?e?|spawn[lv]p?e?|posix_spawnp?|fork|forkpty)\Z")
 
 # 引用即命中的限定名（正则全匹配）。值：(级别, 规则, 说明, 建议)
 FUNC_RULES = [
@@ -502,6 +509,10 @@ FUNC_RULES = [
     (r"pandas\.read_pickle", REJECT, "pickle-use", "pandas.read_pickle 是 pickle 反序列化", _PICKLE_HINT),
     (r"torch\.save", EXPLAIN, "pickle-use", "torch.save 底层是 pickle，产物别人加载时会执行代码",
      "用 safetensors 的 save_file"),
+    (r"multiprocessing\.reduction\..*|.*\.ForkingPickler(\..*)?", REJECT, "pickle-use", "{q} 是 pickle", _PICKLE_HINT),
+    (r"yaml\.(unsafe_load|unsafe_load_all)", REJECT, "unsafe-load", "{q} 能构造任意 Python 对象", "用 yaml.safe_load"),
+    (r"logging\.config\.(dictConfig|fileConfig|listen)|hydra\.utils\.(instantiate|call|get_method|get_class|get_object)",
+     EXPLAIN, "reflect-nonliteral", "{q} 会按配置里写的名字导入并调用对象", "送审单里说明配置从哪来、会构造什么"),
     (r"sys\.addaudithook", REJECT, "audit-hook", "任务代码不该碰审计钩子（平台用它做运行时兜底）", "删掉"),
     (r"asyncio\.create_subprocess_(exec|shell)|platform\.popen", EXPLAIN, "process-call", "{q} 会起子进程",
      "送审单里说明起什么进程、参数从哪来"),
@@ -525,11 +536,25 @@ _REFLECT = {  # 限定名 → 名字参数的位置
     "builtins.getattr": 1, "builtins.setattr": 1, "builtins.delattr": 1, "builtins.hasattr": 1,
     "builtins.__import__": 0, "importlib.import_module": 0, "importlib.__import__": 0,
     "runpy.run_module": 0, "runpy.run_path": 0,
-    "pkgutil.resolve_name": 0, "imp.load_source": 0, "imp.load_module": 0,
+    "pkgutil.resolve_name": 0, "pydoc.locate": 0, "imp.load_source": 0, "imp.load_module": 0,
 }
+_NAME_RESOLVERS = {"pkgutil.resolve_name", "pydoc.locate"}   # "os.system" 这样的名字 → 对象
+# 按路径加载代码：限定名 → (路径参数位置, 关键字名, 是否只能是字节码)
+_PATH_LOADERS = {
+    "runpy.run_path": (0, "path_name", False), "imp.load_source": (1, "pathname", False),
+    "imp.load_module": (2, "pathname", False), "imp.load_compiled": (1, "pathname", True),
+    "importlib.machinery.SourceFileLoader": (1, "path", False),
+    "importlib.machinery.SourcelessFileLoader": (1, "path", True),
+    "importlib.util.spec_from_file_location": (1, "location", False),
+    "zipimport.zipimporter": (0, "path", False),
+}
+# 要查参数的反序列化函数：不是被直接调用（赋给变量、塞进元组、传给 partial）就查不了参数
+_CHECKED_LOADERS = {"torch.load", "torch.serialization.load", "numpy.load", "numpy.lib.npyio.load",
+                    "numpy.lib.format.read_array", "yaml.load", "yaml.load_all", "yaml.full_load", "yaml.full_load_all"}
+_ALLOW_PICKLE_POS = {"numpy.load": 2, "numpy.lib.npyio.load": 2, "numpy.lib.format.read_array": 1}
 _DYN_IMPORT = {"builtins.__import__", "importlib.import_module", "importlib.__import__"}
 _IMPORT_MECH = re.compile(r"(importlib\.(import_module|__import__|util\..*|machinery\..*)|runpy\..*|builtins\.__import__"
-                          r"|imp\..*|zipimport\..*|pkgutil\..*)\Z")
+                          r"|imp\..*|zipimport\..*|pkgutil\..*|pydoc\.locate)\Z")
 _IMPORT_STATE = {"sys.path", "sys.modules", "sys.meta_path", "sys.path_hooks", "sys.path_importer_cache"}
 _MUTATORS = {"insert", "append", "extend", "remove", "pop", "clear", "update", "setdefault", "popitem",
              "__setitem__", "__delitem__", "__iadd__"}
@@ -541,7 +566,7 @@ _DUNDERS = {"__dict__", "__code__", "__globals__", "__subclasses__", "__reduce__
             "__mro__", "__bases__", "__base__", "__closure__", "__builtins__"}
 _DECODE_CODECS = {"rot13", "rot_13", "hex", "hex_codec", "base64", "base64_codec", "zlib", "zlib_codec", "bz2",
                   "bz2_codec", "uu", "uu_codec", "unicode_escape", "raw_unicode_escape", "punycode"}
-_OPENERS = {"builtins.open", "io.open", "codecs.open", "os.fdopen"}
+_OPENERS = {"builtins.open", "io.open", "codecs.open", "os.fdopen", "io.FileIO", "_io.FileIO"}
 _TEMPFILE = {"mkstemp": 2, "mkdtemp": 2, "TemporaryDirectory": 2, "NamedTemporaryFile": 6, "TemporaryFile": 6,
              "SpooledTemporaryFile": 7, "gettempdir": None}
 _DOWNLOADERS = {"from_pretrained", "load_dataset", "snapshot_download", "hf_hub_download",
@@ -550,7 +575,7 @@ _OUTSIDE = re.compile(r"([A-Za-z]:|/|\\\\|~|.*%[A-Za-z_]+%|.*\$(HOME|TMP|TEMP|AP
 _SAFE_YAML_LOADERS = {"SafeLoader", "CSafeLoader", "BaseLoader", "CBaseLoader"}
 _BUILTINS = set(dir(builtins))
 _MODE = re.compile(r"[rwxabtU+]{1,4}\Z")
-_COOKIE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)", re.M)
+_COOKIE = re.compile(r"[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 
 
 def _entropy(s):
@@ -603,6 +628,9 @@ class _PyScan:
                 if s is None:
                     return {"?"}
                 return {s.split(".")[0] if "builtins.__import__" in fq else s}
+            if fq & _NAME_RESOLVERS:
+                s = _const_str(arg)
+                return {"?"} if s is None else {s.replace(":", ".")}
             if "builtins.vars" in fq and node.args:
                 return self.resolve(node.args[0], depth + 1)
             if fq & {"builtins.globals", "builtins.locals"}:
@@ -615,7 +643,10 @@ class _PyScan:
             r = set()
             for b in self.resolve(node.value, depth + 1):
                 b = b[:-len(".__dict__")] if b.endswith(".__dict__") else b
-                r |= self.resolve(ast.Name(id=s), depth + 1) if b == "" else {f"{b}.{s}"}
+                if b == "sys.modules":
+                    r.add(s)
+                else:
+                    r |= self.resolve(ast.Name(id=s), depth + 1) if b == "" else {f"{b}.{s}"}
             return r
         if isinstance(node, ast.NamedExpr):
             return self.resolve(node.value, depth + 1)
@@ -671,8 +702,16 @@ class _PyScan:
                 return []
             scope = self._scope(scope)
 
-    def _mentions_py(self, node):
-        return node is not None and any(s.lower().endswith((".py", ".pyw", ".pth", ".pyc")) for s in self._consts(node))
+    def _py_written(self, node):
+        """路径表达式里像 .py 的字符串常量 → 模块名集合（.pth / .pyc 记成空串）；不像就返回空集合。"""
+        out = set()
+        for s in self._consts(node) if node is not None else ():
+            low = s.lower()
+            if low.endswith((".py", ".pyw")):
+                out.add(re.split(r"[/\\]", s)[-1].rsplit(".", 1)[0])
+            elif low.endswith((".pth", ".pyc")):
+                out.add("")
+        return out
 
     # ---------------------------------------------------------------- 预处理
     def prepare(self, tree):
@@ -758,11 +797,15 @@ class _PyScan:
                 first = node.body[0]
                 if isinstance(first, ast.Expr) and _const_str(first.value) is not None:
                     docstrings.add(id(first.value))
-        writes_py, import_mech = [], False
+        writes_py, import_mech, static_imports = [], False, set()
         for node in self.nodes:
             parent = self.parent.get(node)
+            if isinstance(node, ast.ImportFrom):     # 写 .py 再静态导入：记下所有导入里出现的名字
+                static_imports.update((node.module or "").split("."))
+                static_imports.update(a.name for a in node.names)
             if isinstance(node, ast.Import):
                 for a in node.names:
+                    static_imports.update(a.name.split("."))
                     if self.check_module(a.name, node):
                         self.flagged_imports.add(a.asname or a.name.split(".")[0])
                     import_mech |= bool(_IMPORT_MECH.match(a.name + ".x"))
@@ -794,9 +837,20 @@ class _PyScan:
                         quals = self.resolve(node)
                         self.check_qualified(quals, node)
                         import_mech |= any(_IMPORT_MECH.match(q) for q in quals)
+                        hidden = quals & _CHECKED_LOADERS
+                        if hidden and not (isinstance(parent, ast.Call) and parent.func is node):
+                            self.add(EXPLAIN, "unsafe-load", node,
+                                     f"间接引用了 {min(hidden)}（赋值、放进容器、传给别的函数）：工具查不了调用时的参数",
+                                     "直接调用，并写明 weights_only=True / allow_pickle=False / Loader=yaml.SafeLoader")
+            if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load) \
+                    and "sys.modules" in self.resolve(node):
+                self._check_sys_modules(node, parent)
             if isinstance(node, ast.Name) and node.id in ("__builtins__", "__builtin__"):
                 self.add(EXPLAIN, "dunder-access", node, f"碰了 {node.id}", "直接写要用的函数，别经过内部属性")
             elif isinstance(node, ast.Attribute):
+                if _OPAQUE_PROCESS.match(node.attr) and isinstance(node.ctx, ast.Load) and not self.resolve(node.value):
+                    self.add(EXPLAIN, "process-call", node, f"对认不出来的对象取 .{node.attr}：可能是 os / subprocess 经参数传进来",
+                             "直接写 os.xxx / subprocess.xxx；送审单里说明")
                 if node.attr in _DUNDERS:
                     self.add(EXPLAIN, "dunder-access", node, f"碰了内部属性 {node.attr}", "直接写要用的属性，别经过内部属性")
                 if isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -812,9 +866,11 @@ class _PyScan:
             elif isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)) and id(node) not in docstrings:
                 self._check_literal(node)
 
-        for w in writes_py:
-            if import_mech:
-                self.add(REJECT, "write-then-import", w, "写了 .py 文件，同一个文件里又有动态导入 / 改导入路径：运行的代码审核人没看过",
+        for w, mods in writes_py:
+            imported = sorted(m for m in mods if m and m in static_imports)
+            if import_mech or imported:
+                why = f"又 import 了 {imported[0]}" if imported else "又有动态导入 / 改导入路径"
+                self.add(REJECT, "write-then-import", w, f"写了 .py 文件，同一个文件里{why}：运行的代码审核人没看过",
                          "生成的代码审核人读不到；把它写成代码包里的普通模块")
             else:
                 self.add(EXPLAIN, "write-then-import", w, "写了 .py 文件（同一个文件里没看到导入，别的文件可能导入）",
@@ -838,6 +894,16 @@ class _PyScan:
                 self._check_env_key(key, node)
         return touched
 
+    def _check_sys_modules(self, node, parent):
+        """sys.modules["os"] 能认出来；下标不是字面量、.get(name) 之类就认不出取的是哪个模块。"""
+        if isinstance(parent, ast.Subscript) and parent.value is node and (
+                _const_str(parent.slice) is not None or isinstance(parent.ctx, (ast.Store, ast.Del))):
+            return
+        if isinstance(parent, ast.Attribute) and parent.value is node and parent.attr in _MUTATORS:
+            return     # 改 sys.modules 由 import-machinery 报
+        self.add(EXPLAIN, "reflect-nonliteral", node, "按名字从 sys.modules 取模块，工具认不出是哪个",
+                 "直接 import 要用的模块")
+
     def _check_env_key(self, key, node):
         keys = [s for s in self._consts(key)]
         if not keys:
@@ -852,6 +918,11 @@ class _PyScan:
         import_mech = self._check_reflect(node, fq)
         self._check_namespace(node, fq, parent)
         self._check_deserialize(node, fq, term)
+        if fq & {"functools.partial", "functools.partialmethod"} and node.args:
+            inner = ast.Call(func=node.args[0], args=node.args[1:], keywords=node.keywords)
+            ast.copy_location(inner, node)
+            self._check_deserialize(inner, self.resolve(node.args[0]), "", partial=True)
+        self._check_path_loader(node, fq)
         self._check_decode(node, fq, term)
         self._check_writes(node, fq, term, writes_py)
         self._check_download_kw(node, fq, term)
@@ -870,9 +941,12 @@ class _PyScan:
                 self.add(INFO, "reflect-literal", node, f"{short}({s!r})：名字是字面量", "能直接写属性 / import 就直接写")
                 if s in _DUNDERS:
                     self.add(EXPLAIN, "dunder-access", node, f"经 {short} 碰了内部属性 {s}", "别经过内部属性")
-                if q in _DYN_IMPORT or q == "runpy.run_module":
-                    self.check_module(s, node)
-            if q in _DYN_IMPORT or q.startswith(("runpy.", "imp.")):
+                if q in _DYN_IMPORT or q in _NAME_RESOLVERS or q == "runpy.run_module":
+                    self.check_module(s.replace(":", "."), node)
+                if q == "builtins.getattr" and _OPAQUE_PROCESS.match(s) and node.args and not self.resolve(node.args[0]):
+                    self.add(EXPLAIN, "process-call", node, f"对认不出来的对象取 {s!r}：可能是 os / subprocess 经参数传进来",
+                             "直接写 os.xxx / subprocess.xxx；送审单里说明")
+            if q in _DYN_IMPORT or q in _NAME_RESOLVERS or q.startswith(("runpy.", "imp.")):
                 import_mech = True
         for q in fq:
             if q.startswith("importlib.util.") and q not in _REFLECT:
@@ -892,11 +966,11 @@ class _PyScan:
                 self.add(EXPLAIN, "namespace-access", node, "按名字访问命名空间（globals/locals/vars）",
                          "写死的字典分派，别按名字取全局对象")
 
-    def _check_deserialize(self, node, fq, term):
-        """反序列化"""
+    def _check_deserialize(self, node, fq, term, partial=False):
+        """反序列化。partial=True：查的是 functools.partial 里预先绑定的参数，没绑定的留给间接引用那条报"""
         if fq & {"torch.load", "torch.serialization.load"}:
             wo = self._kw(node, "weights_only")
-            if isinstance(wo, ast.Constant) and wo.value is True:
+            if isinstance(wo, ast.Constant) and wo.value is True or wo is None and partial:
                 pass
             elif wo is None and not any(k.arg is None for k in node.keywords):
                 self.add(REJECT, "unsafe-load", node, "torch.load 没有 weights_only=True：会按 pickle 执行文件里的调用",
@@ -906,16 +980,14 @@ class _PyScan:
                          "改成 weights_only=True")
             else:
                 self.add(EXPLAIN, "unsafe-load", node, "torch.load 的 weights_only 看不出是不是 True", "写成字面量 weights_only=True")
-        if fq & {"numpy.load"}:
-            ap = self._arg(node, 2, "allow_pickle")
-            if isinstance(ap, ast.Constant):
-                if ap.value is True:
-                    self.add(REJECT, "unsafe-load", node, "np.load(allow_pickle=True) 会反序列化 pickle 对象", "去掉 allow_pickle")
-            elif ap is not None or any(k.arg is None for k in node.keywords):
-                self.add(EXPLAIN, "unsafe-load", node, "np.load 的 allow_pickle 看不出是不是 False", "去掉 allow_pickle")
-        if fq & {"yaml.unsafe_load", "yaml.unsafe_load_all"}:
-            self.add(REJECT, "unsafe-load", node, "yaml.unsafe_load 能构造任意 Python 对象", "用 yaml.safe_load")
-        if fq & {"yaml.full_load", "yaml.full_load_all"}:
+        np_pos = [_ALLOW_PICKLE_POS[q] for q in fq if q in _ALLOW_PICKLE_POS]
+        ap = self._arg(node, np_pos[0] if np_pos else None, "allow_pickle")   # 关键字不管是哪个函数都查
+        if isinstance(ap, ast.Constant):
+            if ap.value is True:
+                self.add(REJECT, "unsafe-load", node, "allow_pickle=True 会反序列化 pickle 对象", "去掉 allow_pickle")
+        elif np_pos and (ap is not None or any(k.arg is None for k in node.keywords)):
+            self.add(EXPLAIN, "unsafe-load", node, "np.load 的 allow_pickle 看不出是不是 False", "去掉 allow_pickle")
+        if fq & {"yaml.full_load", "yaml.full_load_all"} and not partial:
             self.add(EXPLAIN, "unsafe-load", node, "yaml.full_load 比 safe_load 宽", "用 yaml.safe_load")
         if fq & {"yaml.load", "yaml.load_all"}:
             loader = self._arg(node, 1, "Loader")
@@ -924,7 +996,7 @@ class _PyScan:
                 names.add(loader.attr)
             elif isinstance(loader, ast.Name):
                 names.add(loader.id)
-            if names and names <= _SAFE_YAML_LOADERS:
+            if names and names <= _SAFE_YAML_LOADERS or loader is None and partial:
                 pass
             elif loader is None or names & {"Loader", "UnsafeLoader", "FullLoader", "CLoader", "CUnsafeLoader", "CFullLoader"}:
                 self.add(REJECT, "unsafe-load", node, "yaml.load 没用 SafeLoader：能构造任意 Python 对象", "用 yaml.safe_load")
@@ -964,21 +1036,43 @@ class _PyScan:
                 writing = unknown_mode_writes and mode is not None
             if writing:
                 self._check_write_target(path, node)
-                if self._mentions_py(path):
-                    writes_py.append(node)
+                self._note_py(writes_py, node, path)
+        if fq & {"os.open"}:     # os.open(path, flags)：只有 flags 明确是 O_RDONLY 才算只读
+            path, flags = self._arg(node, 0, "path"), self._arg(node, 1, "flags")
+            if flags is None or self.resolve(flags) != {"os.O_RDONLY"}:
+                self._check_write_target(path, node)
+                self._note_py(writes_py, node, path)
         if term in ("write_text", "write_bytes", "touch") and isinstance(node.func, ast.Attribute):
             self._check_write_target(node.func.value, node)
-            if self._mentions_py(node.func.value):
-                writes_py.append(node)
+            self._note_py(writes_py, node, node.func.value)
         if fq & {"shutil.copy", "shutil.copy2", "shutil.copyfile", "shutil.move", "os.rename", "os.replace"}:
-            if self._mentions_py(self._arg(node, 1, "dst")):
-                writes_py.append(node)
+            self._note_py(writes_py, node, self._arg(node, 1, "dst"))
         for q in fq:
             if q.startswith("tempfile.") and q[9:] in _TEMPFILE:
                 pos = _TEMPFILE[q[9:]]
                 if pos is None or self._arg(node, pos, "dir") is None:
                     self.add(EXPLAIN, "write-outside", node, f"{q} 没给 dir：会写到系统临时目录 %TEMP%",
                              "加 dir=TMP（ROOT / \"tmp\"）")
+
+    def _note_py(self, writes_py, node, path):
+        mods = self._py_written(path)
+        if mods:
+            writes_py.append((node, mods))
+
+    def _check_path_loader(self, node, fq):
+        """按路径加载代码：路径不是 .py 的（或只能是字节码），工具没扫过它"""
+        for q in sorted(fq & set(_PATH_LOADERS)):
+            pos, kw, bytecode = _PATH_LOADERS[q]
+            s = _const_str(self._arg(node, pos, kw))
+            if bytecode:
+                self.add(REJECT, "load-source", node, f"{q} 加载的是字节码，审核人读不到", "把源码放进代码包，直接 import")
+            elif s is not None and not s.lower().endswith((".py", ".pyw")):
+                self.add(REJECT, "load-source", node, f"{q} 按路径加载 {s!r}：不是 .py，工具没按代码扫它",
+                         "代码写成 .py 模块放进代码包，直接 import")
+            else:
+                where = f"{s!r}" if s is not None else "运行时才知道的路径"
+                self.add(EXPLAIN, "load-source", node, f"{q} 按路径加载代码（{where}）",
+                         "包内模块直接 import；送审单里说明加载的是哪个文件")
 
     def _check_download_kw(self, node, fq, term):
         """框架下载"""
@@ -1089,18 +1183,29 @@ def _param_uses(scan, tree):
     return uses
 
 
-def scan_python(name, text):
-    """扫一个 .py 文件的源码。返回 (findings, 参数读取点)。只 ast.parse，不执行。"""
-    for m in _COOKIE.finditer("\n".join(text.splitlines()[:2])):
+def _cookie_lines(text):
+    """解释器只认前两行的编码声明。直接运行脚本时 \r 和 \n 都算换行，import 时只按 \n 分行；
+    str.splitlines 还会在 \x0c \x1c \x85 这些字符处分行，不能用。两种分法都查。"""
+    for lines in (text.split("\n", 2)[:2], re.split(r"\r\n|\r|\n", text, maxsplit=2)[:2]):
+        yield from enumerate(lines, 1)
+
+
+def scan_python(name, text, raw=None):
+    """扫一个 .py 文件的源码。返回 (findings, 参数读取点)。只 ast.parse，不执行。
+    raw：文件原始字节。给了就按字节解析，解码方式和解释器完全一样。"""
+    for lineno, line in _cookie_lines(text):
+        m = _COOKIE.match(line)
+        if not m:
+            continue
         enc = m.group(1).lower().replace("_", "-")
         if enc not in ("utf-8", "utf8") and not enc.startswith("utf-8-"):
-            return [Finding(REJECT, "source-encoding", name, m.string[:m.start()].count("\n") + 1, 1, m.group(0).strip(),
+            return [Finding(REJECT, "source-encoding", name, lineno, 1, m.group(0).strip()[:120],
                             f"声明了源码编码 {m.group(1)}：解释器按它解码，审核人和工具按 UTF-8 读，看到的可能不是同一份代码",
                             "删掉编码声明，存成 UTF-8")], []
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            tree = ast.parse(text, filename=name)
+            tree = ast.parse(raw if raw is not None else text, filename=name)
     except SyntaxError as e:
         return [Finding(ERROR, "parse-error", name, e.lineno or 0, e.offset or 0, (e.text or "").strip()[:120],
                         f"语法错误（Python 2 代码？）：{e.msg}", "工具按 Python 3 解析；修好再送审")], []
@@ -1152,6 +1257,12 @@ def _counts(fs):
     return c
 
 
+def _safe(s):
+    """控制字符、零宽和双向控制符换成 \\xNN / \\uNNNN，免得被审代码里的转义序列改写审核人的终端。"""
+    return "".join(c if unicodedata.category(c) not in ("Cc", "Cf", "Zl", "Zp")
+                   else (f"\\x{ord(c):02x}" if ord(c) < 256 else f"\\u{ord(c):04x}") for c in s)
+
+
 def render_text(pkg, fs, strict=False):
     meta = getattr(fs, "meta", {})
     c = _counts(fs)
@@ -1171,7 +1282,7 @@ def render_text(pkg, fs, strict=False):
         lines.append(f"[{LABEL[f.level]}] {loc}  {body}  ({f.rule})")
         if f.hint:
             lines.append(f"         建议：{f.hint}")
-    return "\n".join(lines) + "\n"
+    return "\n".join(_safe(x) for x in lines) + "\n"
 
 
 def render_json(pkg, fs, strict=False):
