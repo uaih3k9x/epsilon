@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -317,4 +318,117 @@ func TestWrittenBytes(t *testing.T) {
 	if n := OutputBytes(dir); n != 1000 {
 		t.Fatalf("output 应该 1000 字节（不算 _runner），是 %d", n)
 	}
+}
+
+func TestPrepareRejectsSiteCustomize(t *testing.T) {
+	// 环境层的审计钩子就是 sitecustomize；代码包里同名文件虽然导入顺序上抢不到，也一律不收
+	for _, name := range []string{"sitecustomize.py", "lib/SiteCustomize.py", "usercustomize.py", "a/b/usercustomize.py"} {
+		dir := filepath.Join(t.TempDir(), "j")
+		if err := Prepare(dir, makeZip(t, map[string]string{"main.py": "ok", name: "x"}), []byte(`{}`)); err == nil {
+			t.Errorf("%q 应该拒", name)
+		}
+	}
+	dir := filepath.Join(t.TempDir(), "j")
+	if err := Prepare(dir, makeZip(t, map[string]string{"main.py": "ok", "my_sitecustomize.py": "x"}), []byte(`{}`)); err != nil {
+		t.Errorf("名字只是包含它的可以: %v", err)
+	}
+}
+
+type fakeProc struct {
+	pid    int
+	code   int
+	done   chan struct{}
+	killed bool
+	closed bool
+}
+
+func (p *fakeProc) Pid() int { return p.pid }
+func (p *fakeProc) Wait() (int, error) {
+	<-p.done
+	if p.killed {
+		return -1, nil
+	}
+	return p.code, nil
+}
+func (p *fakeProc) Kill() {
+	if !p.killed {
+		p.killed = true
+		close(p.done)
+	}
+}
+func (p *fakeProc) Close() { p.closed = true }
+
+type fakeStarter struct {
+	got  Launch
+	proc *fakeProc
+	err  error
+}
+
+func (f *fakeStarter) Start(l Launch) (Proc, error) {
+	f.got = l
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.proc, nil
+}
+
+func TestRunUsesStarterWithBaseEnv(t *testing.T) {
+	dir := prepared(t, "ok")
+	p := &fakeProc{pid: 4242, code: 3, done: make(chan struct{})}
+	close(p.done)
+	f := &fakeStarter{proc: p}
+	s := spec(dir)
+	s.Start = f
+	s.BaseEnv = []string{"SystemRoot=C:\\Windows", "TMP=x"}
+	var started int
+	s.OnStart = func(pid int) { started = pid }
+	res, err := Run(context.Background(), s)
+	if err != nil || res.ExitCode != 3 {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if started != 4242 || !p.closed {
+		t.Fatalf("OnStart 拿到 pid、结束后 Close: %d %v", started, p.closed)
+	}
+	if f.got.Path != os.Args[0] || strings.Join(f.got.Args, " ") != "-E -s -B main.py --flag" || f.got.Dir != filepath.Join(dir, "code") || f.got.Log == nil {
+		t.Fatalf("%+v", f.got)
+	}
+	// 给了 BaseEnv 就不继承探针的环境
+	if strings.Join(f.got.Env, "|") != "SystemRoot=C:\\Windows|TMP=x|JOBRUN_FAKE_PY=1" {
+		t.Fatalf("环境: %v", f.got.Env)
+	}
+}
+
+type startErr struct{}
+
+func (startErr) Error() string { return "1326" }
+
+func TestRunStartErrorIsWrapped(t *testing.T) {
+	s := spec(prepared(t, "ok"))
+	s.Start = &fakeStarter{err: startErr{}}
+	_, err := Run(context.Background(), s)
+	var se startErr
+	if !errors.As(err, &se) {
+		t.Fatalf("起不来的原因要能取出来（判断要不要停接任务）: %v", err)
+	}
+}
+
+func TestRunAbortKillsTree(t *testing.T) {
+	dir := prepared(t, "tree")
+	s := spec(dir)
+	abort := make(chan string, 1)
+	s.Abort = abort
+	go func() {
+		for {
+			if _, err := os.Stat(filepath.Join(dir, "output", "child.pid")); err == nil {
+				abort <- "audit"
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	res, err := Run(context.Background(), s)
+	if err != nil || res.Killed != "audit" {
+		t.Fatalf("要按中止原因杀: %+v %v", res, err)
+	}
+	waitDead(t, dir)
 }

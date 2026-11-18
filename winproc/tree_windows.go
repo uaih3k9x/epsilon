@@ -99,3 +99,49 @@ func Alive(pid int) bool {
 	r, _, _ := getExitCodeProcess.Call(p, uintptr(unsafe.Pointer(&code)))
 	return r != 0 && code == stillActive
 }
+
+var (
+	resumeThread     = kernel32job.NewProc("ResumeThread")
+	terminateProcess = kernel32job.NewProc("TerminateProcess")
+)
+
+const jobObjectBasicUIRestrictions = 4
+
+// AdoptSuspended 把别人挂起建好的进程（CreateProcessWithLogonW + CREATE_SUSPENDED）放进新建的作业对象，
+// 加上 lim 的限制，再恢复主线程。任何一步失败都结束这个进程（它一行都还没跑）。句柄归调用方关。
+func AdoptSuspended(hProcess, hThread syscall.Handle, lim Limits) (*Tree, error) {
+	fail := func(what string, err error) (*Tree, error) {
+		terminateProcess.Call(uintptr(hProcess), 1)
+		return nil, fmt.Errorf("%s: %v", what, err)
+	}
+	h, _, err := createJobObject.Call(0, 0)
+	if h == 0 {
+		return fail("CreateJobObject", err)
+	}
+	t := &Tree{job: syscall.Handle(h)}
+	failJob := func(what string, err error) (*Tree, error) {
+		syscall.CloseHandle(t.job)
+		return fail(what, err)
+	}
+	ext, ui := lim.flags()
+	var el jobLimits
+	el.LimitFlags = ext
+	el.ActiveProcessLimit = lim.ActiveProcesses
+	if r, _, err := setInformationJobObject.Call(h, jobObjectExtendedLimitIn, uintptr(unsafe.Pointer(&el)), unsafe.Sizeof(el)); r == 0 {
+		return failJob("SetInformationJobObject(限制)", err)
+	}
+	if ui != 0 {
+		u := ui
+		if r, _, err := setInformationJobObject.Call(h, jobObjectBasicUIRestrictions, uintptr(unsafe.Pointer(&u)), unsafe.Sizeof(u)); r == 0 {
+			return failJob("SetInformationJobObject(UI)", err)
+		}
+	}
+	if r, _, err := assignProcessToJobObject.Call(h, uintptr(hProcess)); r == 0 {
+		return failJob("AssignProcessToJobObject", err)
+	}
+	if r, _, err := resumeThread.Call(uintptr(hThread)); r == 0xffffffff {
+		t.Kill()
+		return failJob("ResumeThread", err)
+	}
+	return t, nil
+}

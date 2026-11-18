@@ -9,8 +9,8 @@
 //	tmp/         临时文件，不回传
 //	job.log      stdout + stderr
 //
-// 上线前必须做（issue #1 第 4 步，这里还没有）：任务进程现在以探针的账户运行（教室机上是 Administrator），
-// 要改成专用低权限账户 epsilon-job；code/ 只读、output/ tmp/ 可写不可执行（NTFS ACL）；出站防火墙。
+// 怎么起进程由 Spec.Start 决定：探针在 Windows 上用 jobbox 的沙箱（专用账户、ACL、独立桌面、作业对象，
+// docs/jobs-sandbox.md）；Plain 是不受限的 exec + 作业对象，只给测试和 Mac 上的假沙箱用。
 package jobrun
 
 import (
@@ -97,6 +97,10 @@ func checkZip(files []*zip.File) error {
 		if f.Mode()&os.ModeType != 0 && !f.Mode().IsDir() {
 			return fmt.Errorf("代码包里不许有链接或特殊文件: %q", f.Name)
 		}
+		switch strings.ToLower(name[strings.LastIndex(name, "/")+1:]) {
+		case "sitecustomize.py", "usercustomize.py": // 审计钩子的位置（docs/jobs-sandbox.md 第 5 节）
+			return fmt.Errorf("代码包里不许有 %q", f.Name)
+		}
 		key := strings.ToLower(name) // Windows 不分大小写，同名不同写法会互相覆盖
 		if seen[key] {
 			return fmt.Errorf("代码包里有大小写冲突的路径: %q", f.Name)
@@ -123,6 +127,57 @@ func writeEntry(f *zip.File, path string) error {
 	return err
 }
 
+// Launch 是起一个进程要的东西。Args 不含 argv[0]。
+type Launch struct {
+	Path string
+	Args []string
+	Dir  string
+	Env  []string
+	Log  *os.File // stdout 和 stderr 都写这里
+}
+
+// Proc 是起来的进程（连同它以后起的整棵树）。
+type Proc interface {
+	Pid() int
+	Wait() (exitCode int, err error) // 主进程结束
+	Kill()                           // 杀整棵树，可以重复调
+	Close()                          // 主进程结束后调：杀掉树里剩下的、释放句柄
+}
+
+// Starter 起进程。
+type Starter interface {
+	Start(Launch) (Proc, error)
+}
+
+// Plain 不受限：exec.Cmd + winproc.StartTree（以探针自己的账户运行）。探针在 Windows 上不用它。
+var Plain Starter = plainStarter{}
+
+type plainStarter struct{}
+
+type plainProc struct {
+	cmd  *exec.Cmd
+	tree *winproc.Tree
+}
+
+func (plainStarter) Start(l Launch) (Proc, error) {
+	cmd := exec.Command(l.Path, l.Args...)
+	cmd.Dir, cmd.Env = l.Dir, l.Env
+	cmd.Stdout, cmd.Stderr = l.Log, l.Log
+	tree, err := winproc.StartTree(cmd)
+	if err != nil {
+		return nil, err
+	}
+	return &plainProc{cmd: cmd, tree: tree}, nil
+}
+
+func (p *plainProc) Pid() int { return p.cmd.Process.Pid }
+func (p *plainProc) Wait() (int, error) {
+	err := p.cmd.Wait()
+	return p.cmd.ProcessState.ExitCode(), err
+}
+func (p *plainProc) Kill()  { p.tree.Kill() }
+func (p *plainProc) Close() { p.tree.Close() }
+
 // Spec 是一次运行。Entry 是 job.json 的 entry（已经过 jobsign 校验）：entry[0] 换成环境层的解释器，
 // 前面固定加 envlayer.Flags（-E -s -B）。
 type Spec struct {
@@ -133,6 +188,11 @@ type Spec struct {
 	DiskMaxMB  int           // output/ + tmp/ + job.log 超过就杀；0 = 不查
 	Env        []string      // 追加的环境变量
 	CheckEvery time.Duration // 多久查一次磁盘；0 = 10 秒
+
+	Start   Starter       // nil = Plain
+	BaseEnv []string      // 非 nil 时用它打底（沙箱从零拼的环境块），不继承探针的环境
+	OnStart func(pid int) // 进程起来（已恢复运行）后调一次
+	Abort   <-chan string // 收到原因就杀整棵树，Result.Killed = 这个原因（审计管道断了之类）
 }
 
 // Result 是运行结果。Killed 非空表示被杀：timeout / disk / cancelled，这时 ExitCode 没有意义。
@@ -158,21 +218,29 @@ func Run(ctx context.Context, s Spec) (Result, error) {
 	defer logf.Close()
 	args := append(append([]string{}, envlayer.Flags...), s.Entry[1:]...)
 	fmt.Fprintf(logf, "===== %s 启动 %s %q\n", time.Now().Format("2006-01-02 15:04:05"), s.Interp, args)
-	cmd := exec.Command(s.Interp, args...)
-	cmd.Dir = filepath.Join(s.Dir, "code")
-	tmp := filepath.Join(s.Dir, "tmp")
-	cmd.Env = append(os.Environ(), "TMP="+tmp, "TEMP="+tmp, "TMPDIR="+tmp, "PYTHONDONTWRITEBYTECODE=1")
-	cmd.Env = append(cmd.Env, s.Env...)
-	cmd.Stdout, cmd.Stderr = logf, logf
+	env := s.BaseEnv
+	if env == nil {
+		tmp := filepath.Join(s.Dir, "tmp")
+		env = append(os.Environ(), "TMP="+tmp, "TEMP="+tmp, "TMPDIR="+tmp, "PYTHONDONTWRITEBYTECODE=1")
+	}
+	env = append(append([]string{}, env...), s.Env...)
+	starter := s.Start
+	if starter == nil {
+		starter = Plain
+	}
 	start := time.Now()
-	tree, err := winproc.StartTree(cmd)
+	p, err := starter.Start(Launch{Path: s.Interp, Args: args, Dir: filepath.Join(s.Dir, "code"), Env: env, Log: logf})
 	if err != nil {
 		fmt.Fprintf(logf, "===== 起不来: %v\n", err)
-		return Result{}, fmt.Errorf("起不来: %v", err)
+		return Result{}, fmt.Errorf("起不来: %w", err)
 	}
-	defer tree.Close()
+	defer p.Close()
+	if s.OnStart != nil {
+		s.OnStart(p.Pid())
+	}
 	done := make(chan struct{})
-	go func() { cmd.Wait(); close(done) }()
+	code := -1
+	go func() { code, _ = p.Wait(); close(done) }()
 
 	timeout := time.NewTimer(s.Timeout)
 	defer timeout.Stop()
@@ -182,20 +250,22 @@ func Run(ctx context.Context, s Spec) (Result, error) {
 	for killed == "" {
 		select {
 		case <-done:
-			res := Result{ExitCode: cmd.ProcessState.ExitCode(), Seconds: time.Since(start).Seconds()}
+			res := Result{ExitCode: code, Seconds: time.Since(start).Seconds()}
 			fmt.Fprintf(logf, "===== 退出码 %d，%.1f 秒\n", res.ExitCode, res.Seconds)
 			return res, nil
 		case <-ctx.Done():
 			killed = "cancelled"
 		case <-timeout.C:
 			killed = "timeout"
+		case r := <-s.Abort:
+			killed = r
 		case <-check.C:
 			if s.DiskMaxMB > 0 && WrittenBytes(s.Dir) > int64(s.DiskMaxMB)<<20 {
 				killed = "disk"
 			}
 		}
 	}
-	tree.Kill()
+	p.Kill()
 	<-done
 	res := Result{ExitCode: -1, Killed: killed, Seconds: time.Since(start).Seconds()}
 	fmt.Fprintf(logf, "===== 被杀（%s），%.1f 秒\n", killed, res.Seconds)
