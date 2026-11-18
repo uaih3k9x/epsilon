@@ -576,19 +576,30 @@ def test_text_starting_with_mz_is_not_pe():
 
 def _zip(path, entries):
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-        for e in entries:
-            if isinstance(e, zipfile.ZipInfo):
-                z.writestr(e, b"x = 1\n")
-            else:
-                z.writestr(e[0], e[1])
+        for name, data in entries:
+            z.writestr(name, data)
     return str(path)
 
 
+def _mark_encrypted(path, name):
+    # zipfile 写不出加密条目, 直接在本地头和中央目录里置加密标志位 (bit 0)
+    data = bytearray(path.read_bytes())
+    with zipfile.ZipFile(path) as z:
+        data[z.getinfo(name).header_offset + 6] |= 0x1
+    i = data.find(b"PK\x01\x02")
+    while i >= 0:
+        n = int.from_bytes(data[i + 28:i + 30], "little")
+        if data[i + 46:i + 46 + n] == name.encode():
+            data[i + 8] |= 0x1
+        i = data.find(b"PK\x01\x02", i + 4)
+    path.write_bytes(bytes(data))
+
+
 def test_encrypted_entry_rejected(tmp_path):
-    info = zipfile.ZipInfo("secret.py")
-    info.flag_bits |= 0x1                                            # 加密标志位
-    p = _zip(tmp_path / "code.zip", [("a.py", "x = 1"), info])
-    assert "zip-encrypted" in rules(er.scan_package(p), REJECT)
+    p = tmp_path / "code.zip"
+    _zip(p, [("a.py", "x = 1"), ("secret.py", "import os")])
+    _mark_encrypted(p, "secret.py")
+    assert "zip-encrypted" in rules(er.scan_package(str(p)), REJECT)
 
 
 def test_duplicate_entry_rejected(tmp_path):
@@ -761,3 +772,27 @@ def test_package_scan_never_executes_code(tmp_path):
     er.scan_package(root)
     _cli(root, "--json")
     assert not marker.exists()
+
+
+@pytest.mark.parametrize("src", ["from os import *\nsystem('x')", "from subprocess import *"])
+def test_star_import_from_risky_module(src):
+    assert "star-import" in rules(scan_py(src), EXPLAIN)
+
+
+def test_attrgetter_needs_explanation():
+    fs = scan_py("import operator, os\noperator.attrgetter('system')(os)('x')")
+    assert "reflect-nonliteral" in rules(fs, EXPLAIN)
+
+
+@pytest.mark.parametrize("src,rule,level", [
+    ("e = __builtins__.__dict__['exec']", "exec-call", EXPLAIN),
+    ("import sys\ngetattr(sys, 'addaudithook')(h)", "audit-hook", REJECT),
+    ("from torch import load\nload('w.pt')", "unsafe-load", REJECT),
+    ("np = __import__('numpy')\nnp.load(p, allow_pickle=True)", "unsafe-load", REJECT),
+    ("import importlib\nimportlib.import_module('pickle')", "pickle-use", REJECT),
+    ("from pathlib import Path\nPath('tmp/gen.py').write_text(c)\nimport runpy\nrunpy.run_path('tmp/gen.py')",
+     "write-then-import", REJECT),
+    ("class X:\n    def __reduce__(self):\n        return (print, ())", "dunder-access", EXPLAIN),
+])
+def test_more_bypasses(src, rule, level):
+    assert level in levels_of(scan_py(src), rule)
