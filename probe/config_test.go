@@ -4,7 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
+
+	"epsilon/proto"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -131,5 +134,27 @@ func TestLoadConfigP2PExplicit(t *testing.T) {
 	}
 	if c.P2PPort != 47200 || c.ArtifactRoot != filepath.Join(dir, "models") || c.ChunkDir != filepath.Join(dir, "models", "cache") {
 		t.Errorf("%+v", c)
+	}
+}
+
+func TestJobsSwitchIsRenamedSoOldProbesNeverSeeIt(t *testing.T) {
+	// 回滚到这一版之前的探针（A/B 槽）读的是 "jobs"，会以登录用户不受限地跑任务：新开关换个名字，旧开关写了就不跑
+	dir := t.TempDir()
+	p := filepath.Join(dir, "probe.json")
+	os.WriteFile(p, []byte(`{"controller":"http://ctl.example:8090","workloads":{},"jobs_sandboxed":true}`), 0o600)
+	c, err := LoadConfig(p)
+	if err != nil || !c.Jobs || c.LegacyJobs {
+		t.Fatalf("%+v %v", c, err)
+	}
+	os.WriteFile(p, []byte(`{"controller":"http://ctl.example:8090","workloads":{},"jobs":true,"jobs_sandboxed":true}`), 0o600)
+	c, _ = LoadConfig(p)
+	a := NewAgent(c, &fakeSys{}, "t")
+	defer a.Shutdown()
+	a.JobBox = &passBox{}
+	if !c.LegacyJobs || a.jobsOK() {
+		t.Fatal("还留着旧开关 jobs:true 就不报 jobs（旧探针看得到它）")
+	}
+	if st := a.runJob(t.Context(), &jobRun{assign: proto.JobAssign{ID: "x-1", Attempt: 1}}); st.State != proto.JobRejected || !strings.Contains(st.Detail, "jobs_sandboxed") || !st.Retry {
+		t.Fatalf("要拒、说清楚怎么改、让主控换一台: %+v", st)
 	}
 }

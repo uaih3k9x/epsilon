@@ -482,6 +482,9 @@ func (c *Controller) reconcile(node string, st *proto.JobStatus, restarted bool)
 	}
 	changed := j.State != st.State || j.Detail != st.Detail
 	switch {
+	case st.State == proto.JobRejected && st.Retry: // 本机的问题：换一台重跑（算一次重试，pickNode 先避开这台）
+		c.requeue(j, fmt.Sprintf("%s 本机的问题: %s", node, st.Detail))
+		return true
 	case proto.JobFinal(st.State):
 		j.State, j.Detail, j.ExitCode, j.Seconds, j.Finished = st.State, st.Detail, st.ExitCode, st.Seconds, c.now()
 		log.Printf("任务 %s 在 %s 上结束: %s %s", j.ID, node, st.State, st.Detail)
@@ -494,10 +497,10 @@ func (c *Controller) reconcile(node string, st *proto.JobStatus, restarted bool)
 	return changed
 }
 
-// nodeFree：开了能力 32、心跳没过期、探针手上没有没结束的任务（包括正在被杀的旧任务）。
-// 主控这边派给它的任务由调用方另查。调用方持 c.mu。
+// nodeFree：开了能力 32、经沙箱跑（jobs_sandboxed，回滚到之前的探针不报它）且沙箱没停接任务（最近一次心跳或登记）、心跳没过期、
+// 探针手上没有没结束的任务（包括正在被杀的旧任务）。主控这边派给它的任务由调用方另查。调用方持 c.mu。
 func (c *Controller) nodeFree(n *node, now time.Time) bool {
-	if !n.hb.Jobs && !n.reg.Jobs || now.Sub(n.seen) >= time.Duration(c.cfg.StaleSeconds)*time.Second {
+	if !n.hb.Jobs || !n.hb.JobsSandboxed || now.Sub(n.seen) >= time.Duration(c.cfg.StaleSeconds)*time.Second { // 登记时已经把 jobs 抄进 hb
 		return false
 	}
 	return n.hb.Job == nil || proto.JobFinal(n.hb.Job.State)

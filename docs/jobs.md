@@ -1,7 +1,7 @@
 # 批任务签名契约（钥匙环 + 任务包）
 
-对应 issue #1 第 1–2 步。代码在 `jobsign/`（格式和校验）、`cmd/epsilon-release/jobcmd.go`（签名命令）、
-`controller/jobs.go`（主控队列）、`probe/jobs.go` + `jobrun/`（探针执行）。格式一旦发布只增不改。
+对应 issue #1 第 1–2 步和第 4 步。代码在 `jobsign/`（格式和校验）、`cmd/epsilon-release/jobcmd.go`（签名命令）、
+`controller/jobs.go`（主控队列）、`probe/jobs.go` + `jobrun/`（探针执行）、`jobbox/`（沙箱，见 [jobs-sandbox.md](jobs-sandbox.md)）。格式一旦发布只增不改。
 
 ## 信任链
 
@@ -36,7 +36,7 @@
     }
   ],
   "revoked_jobs": ["<任务包摘要>"],
-  "env_layers": {"py311-torch2.5-cu124@1": "<环境层清单的 SHA-256>"}
+  "env_layers": {"py311-torch2.5-cu124@2": "<环境层清单的 SHA-256>"}
 }
 ```
 
@@ -50,7 +50,7 @@
 | `keys[].limits.max_hours` | > 0；任务包的 `max_hours` 不能超过它（探针核对） |
 | `keys[].limits.max_nodes` / `rooms` | 主控派活时执行：这把钥匙签的任务同时最多占几台（**0 = 不限制**，负数钥匙环验不过）；`rooms` 空 = 不限。`keyring` 命令要求源文件里每把钥匙**显式写出** `max_nodes`（漏写或键名写错会被当成 0 = 不限制，所以直接拒签），写 0 会打 warning。**含义变更**：本 PR 之前的草稿里 0 是"一台都不派"，手头钥匙环要是按旧含义用 0 停用某把钥匙，先改成删掉这把钥匙（或写具体数字）再升版本重签 |
 | `keys[].limits.network` | false 时，要联网的任务包（`network: true`）一律不跑 |
-| `revoked_jobs` | 任务包摘要（`job.signed.json` 里 `job` 字段原文的 SHA-256，小写十六进制） |
+| `revoked_jobs` | 任务包摘要（`job.signed.json` 里 `job` 字段原文的 SHA-256，小写十六进制）。这就是能力 36 的吊销表；设计书 22.6.1 设想审核人钥匙也能签，现在只有根钥匙能签 |
 | `env_layers` | `名字@版本` → 环境层清单原文的 SHA-256。探针只用表里的环境层，拉到清单后核对摘要；主控换不了环境层 |
 
 - **吊销钥匙** = 发一份不含它的新版本钥匙环。
@@ -113,13 +113,15 @@ epsilon-release sign-job -key dist/keys/reviewer-a.key -name reviewer-a \
 
 ```sh
 python3 tools/build-env-layer.py deploy/envs/py311-torch2.5-cu124 --out dist/envs   # 打印要写进钥匙环的摘要
-epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清单> -chunks <块目录> -root D:\epsilon
+epsilon-env install -name py311-torch2.5-cu124@2 -digest <摘要> -manifest <清单> -chunks <块目录> -root D:\epsilon
 ```
 
 两个容易踩的点，执行器必须照做：
 
 1. **层里没有 `._pth`，执行时固定加 `-E -s -B`（`envlayer.Flags`）。** embeddable 自带的 `._pth` 会打开 `safe_path`（CPython `getpath.py`），脚本目录不进 `sys.path`，多文件任务一 `import` 就失败。没有 `._pth` 就是普通的 `site.py`，所以：`-E` 不读 `PYTHON*` 环境变量；**`-s` 不加用户 site-packages**（`%APPDATA%\Python\Python3xx\site-packages`）——`-E` 管不到它，那里的 `.pth` 每次启动都会执行，一个任务埋下的代码会跑进以后每个任务，签名和环境层摘要都管不到，而且比环境层的审计钩子（`sitecustomize`）还先跑。不能用 `-I`：它连脚本目录也从 `sys.path` 拿掉。
 2. **层内 pyc 是预编译的（`unchecked-hash`）。** 任务不写字节码，解压也不保留修改时间；不预编译的话，每次启动都要重新编译 torch。
+3. **从 `@2` 起层里带审计钩子**（`Lib/site-packages/sitecustomize.py`，源文件 `jobbox/py/sitecustomize.py`，能力 35，见 [jobs-sandbox.md](jobs-sandbox.md) 第 5 节）。
+   `@1` 没有，沙箱的金丝雀会拒跑。依赖包自带 `sitecustomize` / `usercustomize` 的，构建时就拒。
 
 真机验证：`<层目录>\python.exe -E -s -B deploy\envs\smoke\smoke.py`。
 
@@ -182,13 +184,14 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 - **代码包约定**：清单 ID `code-<code_sha256>`，里面只有一个文件 `jobcode/<code_sha256>.zip`。`sign-job` 签名时顺手生成（`-chunks` 目录，默认 `dist/chunks`，整个传到主控 `chunks_dir`）；那里已有 `code-<sha>.json` 的，按它的块大小重切 `code.zip` 比对，对不上就报错、不覆盖、不写块、不出签名文件，对得上原样不动。块目录里已有的块文件也逐个重算哈希，坏了（rsync 中断、拷贝出错）报错并指出是哪个块，删掉它重签即可。手工做也行：把 `code.zip` 改名放到 `<目录>/jobcode/<sha>.zip`，`epsilon-chunk build -id code-<sha> -root <目录> -out <chunks_dir> jobcode/<sha>.zip`。
 - 任务号 `<任务名>-<序号>`，序号存在 `queue.json` 里接着往下排，不和 `jobs_dir` 里已有的目录撞。`count` 份就是 `count` 个任务号，各自回传输出。
 - **派活**（每次心跳和每 5 秒）：按提交顺序，给每个排队的任务挑一台节点（按名字排）：
-  - 节点开了能力 32（心跳 `jobs: true`）、心跳没过期、手上没有没结束的任务（正在杀的旧任务也算占着）；
+  - 节点开了能力 32 且经沙箱（心跳 `jobs: true` 和 `jobs_sandboxed: true`；回滚到之前的探针不报后者，不派）、心跳没过期、手上没有没结束的任务（正在杀的旧任务也算占着）；
   - 在提交的 `nodes` / `rooms` 里；钥匙限了 `rooms` 的，节点必须在拓扑表里且在这些教室；
   - GPU 任务：心跳里第一张卡的显存总量 ≥ `gpu_mem_mb`；
   - 这把钥匙现在占着的节点数 < `max_nodes`（**`max_nodes` 为 0 = 不限制**）。"占着"除了主控派出去没结束的，还算探针还报着没结束的：撤销了正在杀的、失联了可能还在跑的（失联的最多算到它最后一次心跳后 `max_hours`，探针自己到时也会杀）；
   - 派之前用当前钥匙环复核一次：已吊销、钥匙过期的任务直接 `rejected`。复核只在真要派的时候做（有空节点、钥匙有名额、挑得出节点），排队再多，每次心跳也只验要派出去的那几份。
 - **派了任务的节点先停推理**：心跳回包里 `job` 有值时 `workload` 置空；探针这边也会自己停（双保险）。
-- **失联从头重跑**：派到的节点心跳超过 `stale_seconds`，或探针重新登记时手上没有这次任务（重启过），任务放回队列，`attempt` 加一，丢掉上次没传完的输出块。重派先避开失联过的节点，实在没别的再用。超过 `job_max_retries` 次算 `failed`。退出码非 0、超时、超磁盘都是最终结果，**不重试**。
+- **失联从头重跑**：派到的节点心跳超过 `stale_seconds`，或探针重新登记时手上没有这次任务（重启过），任务放回队列，`attempt` 加一，丢掉上次没传完的输出块。重派先避开失联过的节点，实在没别的再用。超过 `job_max_retries` 次算 `failed`。
+  探针报 `rejected` 且带 `retry: true`（本机的问题：沙箱停接任务、系统控制金丝雀不符、登录失败……，docs/jobs-sandbox.md 第 6 节）也按这条放回队列、换一台。退出码非 0、超时、超磁盘都是最终结果，**不重试**。
 - **输出已经传完的不重跑**：探针传完输出（`manifest.json` 冻结）到下一次心跳报结束状态之间重启或失联的，按回传的 `_runner/summary.json` 记结束状态（退出码 0 → `succeeded`，非 0 → `failed`，超时/超磁盘 → `killed`），`detail` 里注明"输出已传完，结束状态没报上来"。重跑的话新一次的摘要不同，回传必然 409。
 - **状态随心跳对账**：探针在登记和每次心跳里带 `job`（`proto.JobStatus`），主控只认当前派到的节点、当前这一次（`attempt`）。回包丢了（探针下一次心跳没报这个任务）就再发一次，不算失联。
 
@@ -200,7 +203,7 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 
 | 字段 | 默认 | 能力 | 说明 |
 |---|---|---|---|
-| `jobs` | `false` | 32 | 执行签名任务包。**上线前必须先做下面"上线前必须做"** |
+| `jobs_sandboxed` | `false` | 32 | 执行签名任务包，一律经沙箱。键名故意不叫 `jobs`：A/B 槽回滚到之前的探针读 `jobs`、不经沙箱跑；旧开关 `jobs: true` 还留着时本机不接任务。**上线前必须先做下面"上线前必须做"**。没有沙箱或沙箱停接任务时心跳报 `jobs:false`（主控以最近一次心跳为准） |
 | `job_keyring` | `true` | 33 | 每 10 分钟拉一次钥匙环、记住最高版本号；关了就一个任务都验不了。主控没配批任务（404）只记一次日志 |
 
 一次任务（`probe/jobs.go`）：
@@ -211,22 +214,29 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 4. **环境层**：钥匙环 `env_layers` 的摘要核对清单 → 分块/P2P 拉 → 拼 zip → 解压（`envlayer`）。已经装好就直接用。
 5. **代码包**：取清单 `code-<code_sha256>`，只许一个文件 `jobcode/<sha>.zip`、整文件哈希等于 `code_sha256`；拉块、拼好后**整个文件重算 SHA-256**（二次核对，不信清单也不信 `.epsilon-ok` 校验戳），不符就删掉、拒跑。
 6. 第 1、4、5 步主控一时出错（连不上、超时、5xx）就退避重试（5 秒起翻倍，最多 2 分钟一次）；钥匙环、环境层和代码包 2 小时内没拉齐算失败，放出机器。验签、摘要、哈希不对直接 `rejected`，不重试。
-7. **展开**到 `<artifact_root>/jobs/<id>/`（`jobrun.Prepare`）：旧目录整个删掉从头来；`code/`（zip 解压前整包查一遍，有一条不过就拒：路径穿越、链接、大小写冲突、Windows 保留名 `CON` `NUL` `COM1` `LPT9` 等（带扩展名也算）、段尾的点和空格、展开后路径超过 259 字符、解压后合计超过 256 MB）、`data/`（空）、`params.json`（核过的参数）、`output/`、`tmp/`、`job.log`。
-8. **执行**（`jobrun.Run`）：`<环境层>\python.exe -E -s -B <entry[1:]...>`，工作目录 `code\`，**不经 shell**；`TMP`/`TEMP` 指到 `tmp\`。Windows 上挂起启动 → 放进新建的作业对象 → 再恢复，任务起的子进程逃不出这棵树；超时（`max_hours`）、写盘超过 `disk_max_mb`（`output/` + `tmp/` + `job.log`，每 10 秒查）、撤销时整棵树一起杀；主进程正常退出后树里剩下的也杀掉。探针自己死了作业对象句柄关闭，Windows 也会杀整棵。
-9. **回传**：写 `output/_runner/summary.json`（任务号、第几次、节点、任务包、签名者、摘要、参数、退出码、被杀原因、秒数）和 `output/_runner/job.log`（`job.log` 末尾 1 MB），再用 `joboutput` 回传（失败隔 30 秒续传，最多 5 轮）。成功、失败、超时、超磁盘都回传；撤销的不回传；`output/` 超过 `output_max_mb` 的算失败、不回传。**`output/_runner/` 只许平台写**：任务结束（整棵树已杀）后里面有任何东西，就是任务自己写的（伪造摘要、绕过 `output_max_mb`），算失败、不回传；摘要写不进去也算失败、不回传。
-10. 开始发一条 `job` 事件（任务号、第几次、任务包、签名者、摘要前 12 位、参数）；结束发一条（任务号、第几次、结束状态、签名者、摘要前 12 位、原因；验签之前就被拒的没有签名者，写明"没验过签"）。钥匙环升版本发 `keyring` 事件。
+7. **展开**到 `<artifact_root>/jobs/<id>/`（`jobrun.Prepare`）：旧目录整个删掉从头来；`code/`（zip 解压前整包查一遍，有一条不过就拒：路径穿越、链接、大小写冲突、Windows 保留名 `CON` `NUL` `COM1` `LPT9` 等（带扩展名也算）、段尾的点和空格、展开后路径超过 259 字符、解压后合计超过 256 MB、任何位置的 `sitecustomize.py` / `usercustomize.py`）、`data/`（空）、`params.json`（核过的参数）、`output/`、`tmp/`、`job.log`。
+8. **执行**（`jobbox` → `jobrun.Run`，详见 [jobs-sandbox.md](jobs-sandbox.md)）：`network: true` 的这一版直接拒。设任务目录 ACL → 两次金丝雀 → 以 `epsilon-job` 账户、独立桌面
+   `<环境层>\python.exe -E -s -B <entry[1:]...>`，工作目录 `code\`，**不经 shell**，环境块从零拼（`TMP` 等指到 `tmp\`）。挂起启动 → 放进新建的作业对象 → 再恢复，任务起的子进程逃不出这棵树；超时（`max_hours`）、写盘超过 `disk_max_mb`（`output/` + `tmp/` + `job.log`，每 10 秒查）、撤销、审计管道断开时整棵树一起杀；主进程正常退出后树里剩下的也杀掉，再查一遍任务账户还有没有进程（逃出作业的停接任务直到重启），最后收回 ACL。探针自己死了作业对象句柄关闭，Windows 也会杀整棵。
+9. **回传**：写 `output/_runner/summary.json`（任务号、第几次、节点、任务包、签名者、摘要、参数、退出码、被杀原因、秒数、审计汇总 `audit`）、`output/_runner/audit.log`（审计记录，上限 8 MB）和 `output/_runner/job.log`（`job.log` 末尾 1 MB），再用 `joboutput` 回传（失败隔 30 秒续传，最多 5 轮）。成功、失败、超时、超磁盘都回传；撤销的不回传；`output/` 超过 `output_max_mb` 的算失败、不回传。**`output/_runner/` 只许平台写**：任务结束（整棵树已杀）后里面有任何东西，就是任务自己写的（伪造摘要、绕过 `output_max_mb`），算失败、不回传；摘要写不进去也算失败、不回传。
+10. 开始发一条 `job` 事件（任务号、第几次、任务包、签名者、摘要前 12 位、参数）；结束发一条（任务号、第几次、结束状态、签名者、摘要前 12 位、原因、有拦截时"有拦截 N 次"；验签之前就被拒的没有签名者，写明"没验过签"）。钥匙环升版本发 `keyring` 事件；沙箱停接任务、恢复、有进程逃出作业发 `jobbox` 事件。心跳的 `job` 里带 `audit_blocked`。
 
-## 上线前必须做（issue #1 第 4 步，这一版没有）
+## 上线前必须做（issue #1 第 4 步：代码已写，真机没验证）
 
-- **专用低权限账户**：任务进程现在以探针的账户运行，教室机自动登录的是 `Administrator`，等于签过名的代码拿到管理员。必须改成 `epsilon-job`（`CreateProcessWithLogonW` 或指定账户的计划任务，每台密码由安装脚本生成存数据盘）。
-- **写执行分离**：`code\` 只读，`output\`、`tmp\` 可写但拒绝 `FILE_EXECUTE`（NTFS ACL）；环境层审计钩子（设计书 22.6.1）。
-- **出站防火墙**：只许连主控和同教室；钥匙 `network: true` 才放开。现在声明了 `network` 的任务只记一条日志。
+下面三条的代码都在这一版里（`jobbox/`、`deploy/install.ps1` 第 4/8 步，设计和细节见 [jobs-sandbox.md](jobs-sandbox.md)），
+但 Windows 一侧只在 Mac 上编译过、**一次都没在真机上跑过**，所以还留在这里：
 
-`probe.json` 默认 `jobs: false`，这三条做完之前不要在教室机上打开。
+- **专用低权限账户**：`epsilon-job`，`CreateProcessWithLogonW` 起进程，每台密码由安装脚本生成、DPAPI 加密存 `D:\epsilon\secrets\`；
+  独立窗口站和桌面、Low IL、作业对象 UI 限制。安装脚本里是**显式开启**（`EPS_JOB_SANDBOX=1`）。
+- **写执行分离（能力 34）和审计钩子（能力 35）**：`code\` 只读、`output\` `tmp\` 可写但拒绝 `FILE_EXECUTE`、OWNER RIGHTS；
+  环境层 `@2` 的 `sitecustomize` 审计钩子，拦截记录随输出回传。
+- **出站防火墙**：按任务账户 SID 出站、入站全拦（比原计划"只许连主控和同教室"更严，待拍板）；`network: true` 的任务包这一版直接拒。
+
+每个任务开跑前用任务账户跑两次金丝雀实测这些控制，不符就拒跑（系统控制不符还会停接任务）。
+真机要验证的单子和步骤见 [jobs-sandbox.md](jobs-sandbox.md) 第 7 节；全部过了才把这一节改成"已做"。在那之前 `probe.json` 默认 `jobs: false`，不要在教室机上打开。
 
 ## 还没做（按 issue #1）
 
-- 上面"上线前必须做"三条（第 4 步）；
+- 上面"上线前必须做"三条的真机验证（第 4 步，[jobs-sandbox.md](jobs-sandbox.md) 第 7 节）；
 - 网页"任务"页（第 5 步），现在只有 API；
 - 数据集（`data`）：清单还没被根钥匙钉住，带 `data` 的任务包主控和探针都拒；
 - 让位、检查点、多机并行、允许时段（`windows`）：第一版不做；

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -12,6 +13,7 @@ var (
 	ntdll              = syscall.NewLazyDLL("ntdll.dll")
 	ntResumeProcess    = ntdll.NewProc("NtResumeProcess")
 	terminateJobObject = kernel32job.NewProc("TerminateJobObject")
+	queryJobObject     = kernel32job.NewProc("QueryInformationJobObject")
 	getExitCodeProcess = kernel32job.NewProc("GetExitCodeProcess")
 )
 
@@ -79,13 +81,34 @@ func (t *Tree) Kill() {
 	}
 }
 
-// Close 在主进程结束后调：杀掉树里剩下的进程，释放作业对象。
+// Close 在主进程结束后调：杀掉树里剩下的进程，等它们真的退出（TerminateJobObject 是异步的，最多 5 秒），释放作业对象。
+// 不等的话紧接着的清场会把正在退出的进程当成逃出作业的。
 func (t *Tree) Close() {
 	if t.job != 0 {
 		t.Kill()
+		for deadline := time.Now().Add(5 * time.Second); t.active() > 0 && time.Now().Before(deadline); {
+			time.Sleep(20 * time.Millisecond)
+		}
 		syscall.CloseHandle(t.job)
 		t.job = 0
 	}
+}
+
+// jobAccounting 是 JOBOBJECT_BASIC_ACCOUNTING_INFORMATION。
+type jobAccounting struct {
+	TotalUserTime, TotalKernelTime                     int64
+	ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime int64
+	TotalPageFaultCount, TotalProcesses                uint32
+	ActiveProcesses, TotalTerminatedProcesses          uint32
+}
+
+// active 是作业里还活着的进程数；查不了按 0 算（不卡住 Close）。
+func (t *Tree) active() uint32 {
+	var info jobAccounting
+	if r, _, _ := queryJobObject.Call(uintptr(t.job), 1, uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info), 0); r == 0 { // JobObjectBasicAccountingInformation
+		return 0
+	}
+	return info.ActiveProcesses
 }
 
 // Alive 判断进程还在不在（测试用）。
@@ -98,4 +121,50 @@ func Alive(pid int) bool {
 	var code uint32
 	r, _, _ := getExitCodeProcess.Call(p, uintptr(unsafe.Pointer(&code)))
 	return r != 0 && code == stillActive
+}
+
+var (
+	resumeThread     = kernel32job.NewProc("ResumeThread")
+	terminateProcess = kernel32job.NewProc("TerminateProcess")
+)
+
+const jobObjectBasicUIRestrictions = 4
+
+// AdoptSuspended 把别人挂起建好的进程（CreateProcessWithLogonW + CREATE_SUSPENDED）放进新建的作业对象，
+// 加上 lim 的限制，再恢复主线程。任何一步失败都结束这个进程（它一行都还没跑）。句柄归调用方关。
+func AdoptSuspended(hProcess, hThread syscall.Handle, lim Limits) (*Tree, error) {
+	fail := func(what string, err error) (*Tree, error) {
+		terminateProcess.Call(uintptr(hProcess), 1)
+		return nil, fmt.Errorf("%s: %v", what, err)
+	}
+	h, _, err := createJobObject.Call(0, 0)
+	if h == 0 {
+		return fail("CreateJobObject", err)
+	}
+	t := &Tree{job: syscall.Handle(h)}
+	failJob := func(what string, err error) (*Tree, error) {
+		syscall.CloseHandle(t.job)
+		return fail(what, err)
+	}
+	ext, ui := lim.flags()
+	var el jobLimits
+	el.LimitFlags = ext
+	el.ActiveProcessLimit = lim.ActiveProcesses
+	if r, _, err := setInformationJobObject.Call(h, jobObjectExtendedLimitIn, uintptr(unsafe.Pointer(&el)), unsafe.Sizeof(el)); r == 0 {
+		return failJob("SetInformationJobObject(限制)", err)
+	}
+	if ui != 0 {
+		u := ui
+		if r, _, err := setInformationJobObject.Call(h, jobObjectBasicUIRestrictions, uintptr(unsafe.Pointer(&u)), unsafe.Sizeof(u)); r == 0 {
+			return failJob("SetInformationJobObject(UI)", err)
+		}
+	}
+	if r, _, err := assignProcessToJobObject.Call(h, uintptr(hProcess)); r == 0 {
+		return failJob("AssignProcessToJobObject", err)
+	}
+	if r, _, err := resumeThread.Call(uintptr(hThread)); r == 0xffffffff {
+		t.Kill()
+		return failJob("ResumeThread", err)
+	}
+	return t, nil
 }

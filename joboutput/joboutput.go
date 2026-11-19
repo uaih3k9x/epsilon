@@ -15,7 +15,6 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -79,7 +78,7 @@ func Upload(ctx context.Context, hc *http.Client, base, token, id, dir string, c
 
 func (c *client) uploadFile(path string, buf []byte) (proto.ManifestFile, error) {
 	mf := proto.ManifestFile{Chunks: []string{}}
-	in, err := os.Open(path)
+	in, err := openRegular(path)
 	if err != nil {
 		return mf, err
 	}

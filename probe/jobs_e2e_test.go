@@ -194,6 +194,7 @@ func (e *e2e) probe(name string, mod func(*Agent)) *probeRig {
 	a.jobFetchRetry = 50 * time.Millisecond
 	a.jobInterp = func(string) string { return os.Args[0] }
 	a.jobEnv = []string{"EPSILON_FAKE_PY=1"}
+	a.JobBox = &passBox{}
 	if mod != nil {
 		mod(a)
 	}

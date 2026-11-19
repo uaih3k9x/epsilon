@@ -82,7 +82,7 @@ func gpu(total int) []proto.GPU { return []proto.GPU{{Name: "RTX 4060", MemTotal
 
 func (r *jobRig) register(node string, jobs bool, st *proto.JobStatus) {
 	r.t.Helper()
-	if w := r.do("POST", "/v1/register", "tok", proto.Register{Node: node, Jobs: jobs, GPUs: gpu(8188), Job: st}); w.Code != 200 {
+	if w := r.do("POST", "/v1/register", "tok", proto.Register{Node: node, Jobs: jobs, JobsSandboxed: jobs, GPUs: gpu(8188), Job: st}); w.Code != 200 {
 		r.t.Fatalf("register %s: %d", node, w.Code)
 	}
 }
@@ -92,7 +92,7 @@ func (r *jobRig) beat(node string, jobs bool, st *proto.JobStatus, gpus ...proto
 	if gpus == nil {
 		gpus = gpu(8188)
 	}
-	w := r.do("POST", "/v1/heartbeat", "tok", proto.Heartbeat{Node: node, Jobs: jobs, GPUs: gpus, Job: st})
+	w := r.do("POST", "/v1/heartbeat", "tok", proto.Heartbeat{Node: node, Jobs: jobs, JobsSandboxed: jobs, GPUs: gpus, Job: st})
 	if w.Code != 200 {
 		r.t.Fatalf("heartbeat %s: %d", node, w.Code)
 	}
@@ -286,8 +286,8 @@ func TestJobFailedIsFinal(t *testing.T) {
 
 func TestJobGPUMem(t *testing.T) {
 	r := newJobRig(t, nil)
-	r.do("POST", "/v1/register", "tok", proto.Register{Node: "pc-01", Jobs: true, GPUs: gpu(4096)})
-	r.do("POST", "/v1/register", "tok", proto.Register{Node: "pc-02", Jobs: true})
+	r.do("POST", "/v1/register", "tok", proto.Register{Node: "pc-01", Jobs: true, JobsSandboxed: true, GPUs: gpu(4096)})
+	r.do("POST", "/v1/register", "tok", proto.Register{Node: "pc-02", Jobs: true, JobsSandboxed: true})
 	yes := true
 	r.mustSubmit(map[string]any{"package": r.pkg(func(j *jobsign.Job) { j.GPU = &yes; j.GPUMemMB = 6000 })})
 	if d := r.beat("pc-01", true, nil, gpu(4096)...); d.Job != nil {
@@ -725,5 +725,64 @@ func TestJobMaxNodesZeroSubmitAccepted(t *testing.T) {
 	r.f.WriteKeyring(t, ring)
 	if code, _, raw := r.submit(map[string]any{"package": pkg}); code != 200 {
 		t.Fatalf("max_nodes 0 = 不限制，提交该收: %d %s", code, raw)
+	}
+}
+
+func TestJobNotAssignedWhenHeartbeatStopsAccepting(t *testing.T) {
+	// 探针登记时 jobs:true，之后沙箱停接任务（C: 被还原、金丝雀不符），心跳报 jobs:false：以心跳为准，不再派
+	r := newJobRig(t, nil)
+	r.register("pc-01", true, nil)
+	r.beat("pc-01", false, nil)
+	id := r.mustSubmit(map[string]any{"package": r.pkg(nil)})[0]
+	if d := r.beat("pc-01", false, nil); d.Job != nil {
+		t.Fatalf("心跳说停接任务就不能派: %+v", d.Job)
+	}
+	if v := r.job(id); v.State != "queued" {
+		t.Fatalf("要留在队列里: %+v", v)
+	}
+	if d := r.beat("pc-01", true, nil); d.Job == nil || d.Job.ID != id {
+		t.Fatalf("恢复后照常派: %+v", d.Job)
+	}
+}
+
+func TestJobNotAssignedToProbeWithoutSandbox(t *testing.T) {
+	// A/B 槽回滚到这一版之前的探针：它也报 jobs:true，但不经沙箱、以登录用户跑任务。没报 jobs_sandboxed 的一律不派
+	r := newJobRig(t, nil)
+	r.do("POST", "/v1/register", "tok", proto.Register{Node: "pc-01", Jobs: true, GPUs: gpu(8188)})
+	id := r.mustSubmit(map[string]any{"package": r.pkg(nil)})[0]
+	w := r.do("POST", "/v1/heartbeat", "tok", proto.Heartbeat{Node: "pc-01", Jobs: true, GPUs: gpu(8188)})
+	var d proto.DesiredState
+	json.Unmarshal(w.Body.Bytes(), &d)
+	if d.Job != nil || r.job(id).State != "queued" {
+		t.Fatalf("老探针不派: %+v", d.Job)
+	}
+}
+
+func TestJobRejectedForMachineReasonIsRequeued(t *testing.T) {
+	// 探针说是本机的问题（停接任务、系统金丝雀不符……）：换一台重跑，不算这个任务失败
+	r := newJobRig(t, nil)
+	r.join("pc-01", true)
+	id := r.mustSubmit(map[string]any{"package": r.pkg(nil)})[0]
+	r.beat("pc-01", true, nil)
+	bad := st(id, 1, proto.JobRejected)
+	bad.Detail, bad.Retry = "系统控制金丝雀不符", true
+	r.beat("pc-01", false, bad)
+	v := r.job(id)
+	if v.State != "queued" || len(v.Lost) != 1 || v.Lost[0] != "pc-01" {
+		t.Fatalf("要放回队列、记下这台: %+v", v)
+	}
+	r.join("pc-02", true)
+	if d := r.beat("pc-02", true, nil); d.Job == nil || d.Job.ID != id || d.Job.Attempt != 2 {
+		t.Fatalf("换一台重跑: %+v", d.Job)
+	}
+
+	// 任务自己的问题（验签、钩子金丝雀不符）照旧是最终结果
+	r = newJobRig(t, nil)
+	r.join("pc-01", true)
+	id = r.mustSubmit(map[string]any{"package": r.pkg(nil)})[0]
+	r.beat("pc-01", true, nil)
+	r.beat("pc-01", true, st(id, 1, proto.JobRejected))
+	if v := r.job(id); v.State != proto.JobRejected {
+		t.Fatalf("不带 retry 的拒绝是最终的: %+v", v)
 	}
 }

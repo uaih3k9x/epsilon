@@ -70,6 +70,24 @@ def test_assemble_records_provenance(parts):
     assert "--hash=sha256" in (layer / "requirements.lock").read_text(encoding="utf-8")
 
 
+def test_assemble_installs_audit_hook(parts):
+    # 能力 35：钩子随层走（docs/jobs-sandbox.md 第 5 节）；没有它，金丝雀按"钩子没装上"拒跑
+    embed, site, spec, layer = parts
+    bl.assemble(embed, site, spec, layer)
+    got = (layer / "Lib" / "site-packages" / "sitecustomize.py").read_bytes()
+    assert got == open(bl.AUDIT_HOOK, "rb").read()
+    assert b"sys.addaudithook" in got
+
+
+@pytest.mark.parametrize("name", ["sitecustomize.py", "usercustomize.py"])
+def test_assemble_refuses_package_shipping_its_own_customize(parts, name):
+    # 依赖包自带 sitecustomize 会和钩子抢位置
+    embed, site, spec, layer = parts
+    write(site / name, "import os")
+    with pytest.raises(bl.BuildError):
+        bl.assemble(embed, site, spec, layer)
+
+
 def test_zip_is_reproducible(parts, tmp_path):
     embed, site, spec, layer = parts
     bl.assemble(embed, site, spec, layer)

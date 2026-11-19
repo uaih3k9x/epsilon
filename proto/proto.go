@@ -16,8 +16,11 @@ type Register struct {
 	Workload []string   `json:"workloads"`          // 本机配置里允许跑的工作负载名
 	P2PPort  int        `json:"p2p_port,omitempty"` // 本机分块服务端口；0 = 不提供
 	Chunks   []string   `json:"chunks,omitempty"`   // 登记时本地已有的全部块（之后用 /v1/have 增量报）
-	Jobs     bool       `json:"jobs,omitempty"`     // 能力 32：本机开了批任务执行（probe.json "jobs": true）
+	Jobs     bool       `json:"jobs,omitempty"`     // 能力 32：本机开了批任务执行（probe.json "jobs_sandboxed": true）
 	Job      *JobStatus `json:"job,omitempty"`      // 手上的批任务（主控重启后靠它对账）
+	// JobsSandboxed：任务经沙箱跑（docs/jobs-sandbox.md）。只有带沙箱的探针才报；主控只派给报了它的
+	// （A/B 槽回滚到之前的探针也报 jobs:true，但它以登录用户不受限地跑任务）
+	JobsSandboxed bool `json:"jobs_sandboxed,omitempty"`
 }
 
 // Heartbeat 是周期上报；主控的回复是 DesiredState。
@@ -35,6 +38,8 @@ type Heartbeat struct {
 	Disk        *Disk      `json:"disk,omitempty"`
 	Jobs        bool       `json:"jobs,omitempty"` // 能力 32 开着
 	Job         *JobStatus `json:"job,omitempty"`  // 手上的批任务；结束了也一直报，直到期望状态里不再有它
+	// JobsSandboxed 同 Register.JobsSandboxed
+	JobsSandboxed bool `json:"jobs_sandboxed,omitempty"`
 }
 
 // Disk 是 artifact_root（D:\epsilon）所在盘的情况（设计书 21.3）。总量 / 剩余每次心跳现取；分项占用后台每 10 分钟算一次。
@@ -179,4 +184,8 @@ type JobStatus struct {
 	Seconds  float64 `json:"seconds,omitempty"` // 已经跑了多久 / 跑了多久
 	Signer   string  `json:"signer,omitempty"`  // 验签通过后填：签名钥匙名
 	Digest   string  `json:"digest,omitempty"`  // 任务包摘要（jobsign.JobDigest）
+	// AuditBlocked 是审计钩子拦下的次数（能力 35）；有拦截不自动判失败，交给人复查、吊销（设计书 22.6.1）
+	AuditBlocked int `json:"audit_blocked,omitempty"`
+	// Retry：rejected 是本机的问题（停接任务、系统控制金丝雀不符……），不是这个任务的；主控换一台重跑
+	Retry bool `json:"retry,omitempty"`
 }
