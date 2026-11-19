@@ -1,6 +1,6 @@
 """一次性任务运行器：执行器做出来之前，用来在真机上按手册布局跑一个任务单元（随签名发布下发）。
 
-用层里的解释器跑: python -E -B job-runner.py --job-dir ... --code-zip ... --code-sha256 ... --params ... --script train.py
+用层里的解释器跑: python -E -s -B job-runner.py --job-dir ... --code-zip ... --code-sha256 ... --params ... --script train.py
 核对 code.zip 哈希 → 展开成 code/ params.json output/ tmp/ → 跑脚本并采显存 → 汇总写 runner-done.json 并打印。
 跑过就不再跑；给了 --job-id 就把 output/ 传回主控。打印完默认挂着不退出，免得探针把它当崩溃反复拉起。
 """
@@ -97,7 +97,7 @@ def run_job(job, code_zip, code_sha256, params, script, gpu_sampler=nvidia_smi_u
     job_mem = []
     stop = threading.Event()
     start = time.perf_counter()
-    proc = subprocess.Popen([sys.executable, "-E", "-B", str(job / "code" / script)], cwd=job / "code")
+    proc = subprocess.Popen([sys.executable, "-E", "-s", "-B", str(job / "code" / script)], cwd=job / "code")
 
     def sample():
         while not stop.is_set():

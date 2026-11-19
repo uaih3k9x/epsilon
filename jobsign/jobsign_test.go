@@ -131,12 +131,13 @@ func TestKeyringFromFutureRejected(t *testing.T) {
 func TestKeyringStructuralChecks(t *testing.T) {
 	f := setup(t)
 	cases := map[string]func(*Keyring){
-		"版本号为 0":     func(k *Keyring) { k.Version = 0 },
-		"钥匙名重复":      func(k *Keyring) { k.Keys = append(k.Keys, k.Keys[0]) },
-		"公钥不是 32 字节": func(k *Keyring) { k.Keys[0].Pub = base64.StdEncoding.EncodeToString([]byte("short")) },
-		"过期时间格式坏":    func(k *Keyring) { k.Keys[0].Expires = "明年" },
-		"钥匙名非法":      func(k *Keyring) { k.Keys[0].Name = "../x" },
-		"权限时长非正":     func(k *Keyring) { k.Keys[0].Limits.MaxHours = 0 },
+		"版本号为 0":       func(k *Keyring) { k.Version = 0 },
+		"钥匙名重复":        func(k *Keyring) { k.Keys = append(k.Keys, k.Keys[0]) },
+		"公钥不是 32 字节":   func(k *Keyring) { k.Keys[0].Pub = base64.StdEncoding.EncodeToString([]byte("short")) },
+		"过期时间格式坏":      func(k *Keyring) { k.Keys[0].Expires = "明年" },
+		"钥匙名非法":        func(k *Keyring) { k.Keys[0].Name = "../x" },
+		"权限时长非正":       func(k *Keyring) { k.Keys[0].Limits.MaxHours = 0 },
+		"max_nodes 为负": func(k *Keyring) { k.Keys[0].Limits.MaxNodes = -1 },
 	}
 	for name, mut := range cases {
 		ring := f.ring
@@ -146,6 +147,17 @@ func TestKeyringStructuralChecks(t *testing.T) {
 		if _, err := VerifyKeyring(s, f.roots, 0, t0); err == nil {
 			t.Errorf("%s: 竟然验过了", name)
 		}
+	}
+}
+
+func TestKeyringMaxNodesZeroAllowed(t *testing.T) {
+	f := setup(t) // max_nodes 0 = 不限制，钥匙环要收
+	ring := f.ring
+	ring.Keys = append([]Key(nil), f.ring.Keys...)
+	ring.Keys[0].Limits.MaxNodes = 0
+	s, _ := SignKeyring(ring, f.rootPriv)
+	if _, err := VerifyKeyring(s, f.roots, 0, t0); err != nil {
+		t.Fatalf("max_nodes 0 应该能收: %v", err)
 	}
 }
 

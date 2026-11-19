@@ -26,9 +26,10 @@ const ClockSkew = 24 * time.Hour
 const MaxGPUMemMB = 7168
 
 // Limits 是一把钥匙能批的任务的上限。MaxNodes、Rooms 由主控派活时执行，探针只核对时长和联网。
+// MaxNodes 0 = 不限制，负数钥匙环验不过。
 type Limits struct {
 	MaxHours float64  `json:"max_hours"`
-	MaxNodes int      `json:"max_nodes"`
+	MaxNodes int      `json:"max_nodes"`       // 0 = 不限制
 	Rooms    []string `json:"rooms,omitempty"` // 空 = 不限
 	Network  bool     `json:"network"`
 }
@@ -64,7 +65,8 @@ type SignedKeyring struct {
 	Sig     string `json:"sig"`
 }
 
-// Job 是 job.json（提交手册第 5.2 节）。Params 只保留原文，参数值的类型校验是主控提交时的事。
+// Job 是 job.json（提交手册第 5.2 节）。Params 保留原文：声明格式在验签时查（CheckParamDecls），
+// 参数值在主控提交时和探针拿到时查（FillParams）。
 type Job struct {
 	Schema      int                        `json:"schema"`
 	Name        string                     `json:"name"`
@@ -351,5 +353,5 @@ func checkJob(j Job) error {
 			return fmt.Errorf("数据集名要是 名字@版本: %q", d)
 		}
 	}
-	return nil
+	return CheckParamDecls(j.Params)
 }

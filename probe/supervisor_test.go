@@ -14,6 +14,9 @@ import (
 
 // 测试二进制自己冒充 llama-server：EPSILON_FAKE_PORT 设了就起一个 /health 服务。
 func TestMain(m *testing.M) {
+	if os.Getenv("EPSILON_FAKE_PY") == "1" { // 冒充环境层的 python.exe（jobs_e2e_test.go）
+		os.Exit(fakePython(os.Args[1:]))
+	}
 	if port := os.Getenv("EPSILON_FAKE_PORT"); port != "" {
 		if os.Getenv("EPSILON_FAKE_CRASH") == "1" {
 			fmt.Fprintln(os.Stderr, "fake crashing")

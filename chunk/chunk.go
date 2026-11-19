@@ -50,6 +50,30 @@ func SafePath(p string) bool {
 	return true
 }
 
+// WindowsSafe 判断相对路径（已过 SafePath）在 Windows 上能不能原样落盘（设计书 20.5）：
+// 不许保留设备名（CON、NUL、COM1、LPT9…，带扩展名也算，不分大小写），段尾不许是点或空格
+// （Win32 会悄悄去掉，"x.py." 落盘成 x.py）。
+func WindowsSafe(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if strings.HasSuffix(seg, ".") || strings.HasSuffix(seg, " ") {
+			return false
+		}
+		base, _, _ := strings.Cut(seg, ".")
+		if winReserved[strings.ToLower(strings.TrimRight(base, " "))] {
+			return false
+		}
+	}
+	return true
+}
+
+var winReserved = func() map[string]bool {
+	m := map[string]bool{"con": true, "prn": true, "aux": true, "nul": true, "conin$": true, "conout$": true}
+	for _, d := range []string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "¹", "²", "³"} {
+		m["com"+d], m["lpt"+d] = true, true
+	}
+	return m
+}()
+
 // validID 判断清单 ID 能不能当文件名用（<id>.json）。
 func validID(id string) bool {
 	return id != "" && !strings.Contains(id, "/") && SafePath(id)
@@ -108,7 +132,7 @@ func Build(id, root string, paths []string, chunkSize int64, outDir string) (pro
 		return m, err
 	}
 	for _, p := range paths {
-		f, err := buildFile(s, filepath.Join(root, filepath.FromSlash(p)), chunkSize)
+		f, err := buildFile(s.ingest, filepath.Join(root, filepath.FromSlash(p)), chunkSize)
 		if err != nil {
 			return m, fmt.Errorf("%s: %w", p, err)
 		}
@@ -122,7 +146,56 @@ func Build(id, root string, paths []string, chunkSize int64, outDir string) (pro
 	return m, writeAtomic(filepath.Join(outDir, id+".json"), raw)
 }
 
-func buildFile(s *Store, path string, chunkSize int64) (proto.ManifestFile, error) {
+// BuildFile 把单个文件 src 切块写进 outDir，返回清单里的这一项（Path 留给调用方填，不写清单）。
+// chunkSize<=0 用 DefaultChunkSize。
+func BuildFile(outDir, src string, chunkSize int64) (proto.ManifestFile, error) {
+	if chunkSize <= 0 {
+		chunkSize = DefaultChunkSize
+	}
+	s, err := NewStore(outDir, 0)
+	if err != nil {
+		return proto.ManifestFile{}, err
+	}
+	return buildFile(s.ingest, src, chunkSize)
+}
+
+// HashFile 和 BuildFile 算出同样的清单项，但只算哈希、不写块。用来先比对、对上了再写。
+func HashFile(src string, chunkSize int64) (proto.ManifestFile, error) {
+	if chunkSize <= 0 {
+		chunkSize = DefaultChunkSize
+	}
+	return buildFile(func(r io.Reader, _ string) (string, int64, error) {
+		h := sha256.New()
+		n, err := io.Copy(h, r)
+		return hex.EncodeToString(h.Sum(nil)), n, err
+	}, src, chunkSize)
+}
+
+// VerifyChunks 逐个重算 dir 里这些块文件的 SHA-256，缺了或对不上就报错（报错里带块哈希）。
+// Store 只按文件名认块，已有的坏块（截断、改过）要靠这个发现。
+func VerifyChunks(dir string, hashes []string) error {
+	for _, want := range hashes {
+		if !ValidHash(want) {
+			return fmt.Errorf("块哈希不合法: %q", want)
+		}
+		f, err := os.Open(chunkPath(dir, want))
+		if err != nil {
+			return fmt.Errorf("块 %s: %w", want, err)
+		}
+		h := sha256.New()
+		_, err = io.Copy(h, f)
+		f.Close()
+		if err != nil {
+			return fmt.Errorf("块 %s: %w", want, err)
+		}
+		if got := hex.EncodeToString(h.Sum(nil)); got != want {
+			return fmt.Errorf("块文件 %s 内容坏了（实际 SHA-256 %s）: %w", chunkPath(dir, want), got, ErrHashMismatch)
+		}
+	}
+	return nil
+}
+
+func buildFile(ingest func(io.Reader, string) (string, int64, error), path string, chunkSize int64) (proto.ManifestFile, error) {
 	mf := proto.ManifestFile{Chunks: []string{}}
 	f, err := os.Open(path)
 	if err != nil {
@@ -140,7 +213,7 @@ func buildFile(s *Store, path string, chunkSize int64) (proto.ManifestFile, erro
 	r := io.TeeReader(f, whole)
 	var total int64
 	for total < fi.Size() {
-		h, n, err := s.ingest(io.LimitReader(r, chunkSize), "")
+		h, n, err := ingest(io.LimitReader(r, chunkSize), "")
 		if err != nil {
 			return mf, err
 		}

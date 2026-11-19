@@ -32,10 +32,18 @@ type Result struct {
 	Files int
 }
 
-// Command 用层里的解释器跑脚本。层里没有 ._pth（它会让脚本目录进不了 sys.path），
-// 隔离靠 -E（不读 PYTHON* 环境变量和注册表），不写字节码靠 -B。
+// Flags 是层里解释器固定带的参数。层里没有 ._pth（它会让脚本目录进不了 sys.path），所以：
+//   - -E：不读 PYTHON* 环境变量；
+//   - -s：不加用户 site-packages（%APPDATA%\Python\...）。-E 管不到它，那里的 .pth 每次启动都会执行，
+//     一个任务埋下的代码会跑进以后每个任务，签名和环境层摘要都管不到；
+//   - -B：不写字节码。
+//
+// 不能用 -I：它会把脚本目录也从 sys.path 拿掉，多文件任务 import 不了自己的模块。
+var Flags = []string{"-E", "-s", "-B"}
+
+// Command 用层里的解释器跑脚本，固定带 Flags。
 func Command(dir string, args ...string) *exec.Cmd {
-	return exec.Command(filepath.Join(dir, Interpreter), append([]string{"-E", "-B"}, args...)...)
+	return exec.Command(filepath.Join(dir, Interpreter), append(append([]string{}, Flags...), args...)...)
 }
 
 // Dir 是环境层解压后的目录。
