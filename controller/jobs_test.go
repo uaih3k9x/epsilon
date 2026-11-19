@@ -351,16 +351,16 @@ func TestJobMaxNodes(t *testing.T) {
 	}
 }
 
-func TestJobMaxNodesZeroMeansNone(t *testing.T) {
+func TestJobMaxNodesZeroMeansUnlimited(t *testing.T) {
 	r := newJobRig(t, nil)
-	pkg := r.pkg(nil)
-	r.mustSubmit(map[string]any{"package": pkg})
 	ring := r.f.Ring
-	ring.Keys[0].Limits.MaxNodes = 0 // 提交以后钥匙环换了
+	ring.Keys[0].Limits.MaxNodes = 0
 	r.f.WriteKeyring(t, ring)
 	r.join("pc-01", true)
-	if d := r.beat("pc-01", true, nil); d.Job != nil {
-		t.Fatal("max_nodes 0 = 一台都不派（宁可误拒）")
+	r.join("pc-02", true)
+	r.mustSubmit(map[string]any{"package": r.pkg(nil), "count": 2})
+	if d1, d2 := r.beat("pc-01", true, nil), r.beat("pc-02", true, nil); d1.Job == nil || d2.Job == nil {
+		t.Fatalf("max_nodes 0 = 不限制，两台都该派: %v %v", d1.Job, d2.Job)
 	}
 }
 
@@ -716,19 +716,14 @@ func TestJobScheduleSkipsCryptoWhenNothingCanRun(t *testing.T) {
 	}
 }
 
-func TestJobMaxNodesZeroExplained(t *testing.T) {
+func TestJobMaxNodesZeroSubmitAccepted(t *testing.T) {
 	r := newJobRig(t, nil)
 	pkg := r.pkg(nil)
-	id := r.mustSubmit(map[string]any{"package": pkg})[0]
 	ring := r.f.Ring
 	ring.Version = 2
 	ring.Keys[0].Limits.MaxNodes = 0
 	r.f.WriteKeyring(t, ring)
-	if code, _, raw := r.submit(map[string]any{"package": pkg}); code != 400 || !strings.Contains(raw, "max_nodes") {
-		t.Fatalf("max_nodes 0 的钥匙提交时就拒: %d %s", code, raw)
-	}
-	r.join("pc-01", true)
-	if v := r.job(id); v.State != "queued" || !strings.Contains(v.Detail, "max_nodes") {
-		t.Fatalf("排队中的要说明为什么不派: %+v", v)
+	if code, _, raw := r.submit(map[string]any{"package": pkg}); code != 200 {
+		t.Fatalf("max_nodes 0 = 不限制，提交该收: %d %s", code, raw)
 	}
 }

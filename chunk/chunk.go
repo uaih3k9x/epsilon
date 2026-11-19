@@ -146,6 +146,19 @@ func Build(id, root string, paths []string, chunkSize int64, outDir string) (pro
 	return m, writeAtomic(filepath.Join(outDir, id+".json"), raw)
 }
 
+// BuildFile 把单个文件 src 切块写进 outDir，返回清单里的这一项（Path 留给调用方填，不写清单）。
+// chunkSize<=0 用 DefaultChunkSize。
+func BuildFile(outDir, src string, chunkSize int64) (proto.ManifestFile, error) {
+	if chunkSize <= 0 {
+		chunkSize = DefaultChunkSize
+	}
+	s, err := NewStore(outDir, 0)
+	if err != nil {
+		return proto.ManifestFile{}, err
+	}
+	return buildFile(s, src, chunkSize)
+}
+
 func buildFile(s *Store, path string, chunkSize int64) (proto.ManifestFile, error) {
 	mf := proto.ManifestFile{Chunks: []string{}}
 	f, err := os.Open(path)

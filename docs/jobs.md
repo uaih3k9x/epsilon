@@ -48,7 +48,7 @@
 | `keys[].pub` | base64 的 32 字节 ed25519 公钥 |
 | `keys[].expires` | RFC3339；过期后这把钥匙签的任务包一律不跑 |
 | `keys[].limits.max_hours` | > 0；任务包的 `max_hours` 不能超过它（探针核对） |
-| `keys[].limits.max_nodes` / `rooms` | 主控派活时执行：这把钥匙签的任务同时最多占几台（**0 = 一台都不派**）；`rooms` 空 = 不限 |
+| `keys[].limits.max_nodes` / `rooms` | 主控派活时执行：这把钥匙签的任务同时最多占几台（**0 = 不限制**，负数钥匙环验不过）；`rooms` 空 = 不限 |
 | `keys[].limits.network` | false 时，要联网的任务包（`network: true`）一律不跑 |
 | `revoked_jobs` | 任务包摘要（`job.signed.json` 里 `job` 字段原文的 SHA-256，小写十六进制） |
 | `env_layers` | `名字@版本` → 环境层清单原文的 SHA-256。探针只用表里的环境层，拉到清单后核对摘要；主控换不了环境层 |
@@ -93,9 +93,10 @@ epsilon-release keygen -out dist/keys/reviewer-a.key
 # 根钥匙持有人签钥匙环（out 已存在时，新版本号必须更大）
 epsilon-release keyring -key dist/keys/release-main.key -in keyring-src.json -out job-keyring.json
 
-# 审核人签任务包（核对 code.zip 哈希、私钥与钥匙环里同名钥匙一致，签完按探针规则自验）
+# 审核人签任务包（核对 code.zip 哈希、私钥与钥匙环里同名钥匙一致，签完按探针规则自验；
+# 顺手在 -chunks 下出代码包清单 code-<sha>.json 和块，已有清单只核对不覆盖）
 epsilon-release sign-job -key dist/keys/reviewer-a.key -name reviewer-a \
-    -keyring job-keyring.json -job job.json -code code.zip -out job.signed.json
+    -keyring job-keyring.json -job job.json -code code.zip -chunks dist/chunks -out job.signed.json
 ```
 
 不带子命令时 `epsilon-release` 照旧做本体发布签名，用法不变。
@@ -176,15 +177,15 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 | `DELETE /v1/jobs/{id}` | api key | 撤销：排队的不再派；派出去的从期望状态里去掉，探针看不到了就整树杀。已结束的回 409 |
 
 - **主控只能挑、填、选**：提交时用 `jobsign.VerifyJob` 核任务包（验签、过期、吊销、字段），`jobsign.FillParams` 按包里的 `params` 声明校验参数（类型、`min`/`max`、`enum`）并补 `default`。下发的是任务包原文，探针自己再验。
-- **提交时就拒**：任务包不存在 404；签名/钥匙/字段不过、带 `data`（数据集还没做）、`rooms` 超出钥匙权限、钥匙的 `max_nodes` 是 0、`chunks_dir` 里没有代码包或环境层的清单都是 400。
+- **提交时就拒**：任务包不存在 404；签名/钥匙/字段不过、带 `data`（数据集还没做）、`rooms` 超出钥匙权限、`chunks_dir` 里没有代码包或环境层的清单都是 400。
 - **`queue.json` 读坏了**：批任务停用，`POST` / `DELETE /v1/jobs` 回 503，主控**不再写** `queue.json`（坏文件里是旧任务和序号，等人修好或挪走再重启）。
-- **代码包约定**：清单 ID `code-<code_sha256>`，里面只有一个文件 `jobcode/<code_sha256>.zip`。在 Mac 上：把 `code.zip` 改名放到 `<目录>/jobcode/<sha>.zip`，`epsilon-chunk build -id code-<sha> -root <目录> -out <chunks_dir> jobcode/<sha>.zip`。
+- **代码包约定**：清单 ID `code-<code_sha256>`，里面只有一个文件 `jobcode/<code_sha256>.zip`。`sign-job` 签名时顺手生成（`-chunks` 目录，默认 `dist/chunks`，整个传到主控 `chunks_dir`）；那里已有 `code-<sha>.json` 的，按它的块大小重切 `code.zip` 比对，对不上就报错、不覆盖、不出签名文件，对得上原样不动。手工做也行：把 `code.zip` 改名放到 `<目录>/jobcode/<sha>.zip`，`epsilon-chunk build -id code-<sha> -root <目录> -out <chunks_dir> jobcode/<sha>.zip`。
 - 任务号 `<任务名>-<序号>`，序号存在 `queue.json` 里接着往下排，不和 `jobs_dir` 里已有的目录撞。`count` 份就是 `count` 个任务号，各自回传输出。
 - **派活**（每次心跳和每 5 秒）：按提交顺序，给每个排队的任务挑一台节点（按名字排）：
   - 节点开了能力 32（心跳 `jobs: true`）、心跳没过期、手上没有没结束的任务（正在杀的旧任务也算占着）；
   - 在提交的 `nodes` / `rooms` 里；钥匙限了 `rooms` 的，节点必须在拓扑表里且在这些教室；
   - GPU 任务：心跳里第一张卡的显存总量 ≥ `gpu_mem_mb`；
-  - 这把钥匙现在占着的节点数 < `max_nodes`。**`max_nodes` 为 0 = 一台都不派**（宁可误拒；提交后钥匙环才改成 0 的，排着的任务 `detail` 里写明原因）。"占着"除了主控派出去没结束的，还算探针还报着没结束的：撤销了正在杀的、失联了可能还在跑的（失联的最多算到它最后一次心跳后 `max_hours`，探针自己到时也会杀）；
+  - 这把钥匙现在占着的节点数 < `max_nodes`（**`max_nodes` 为 0 = 不限制**）。"占着"除了主控派出去没结束的，还算探针还报着没结束的：撤销了正在杀的、失联了可能还在跑的（失联的最多算到它最后一次心跳后 `max_hours`，探针自己到时也会杀）；
   - 派之前用当前钥匙环复核一次：已吊销、钥匙过期的任务直接 `rejected`。复核只在真要派的时候做（有空节点、钥匙有名额、挑得出节点），排队再多，每次心跳也只验要派出去的那几份。
 - **派了任务的节点先停推理**：心跳回包里 `job` 有值时 `workload` 置空；探针这边也会自己停（双保险）。
 - **失联从头重跑**：派到的节点心跳超过 `stale_seconds`，或探针重新登记时手上没有这次任务（重启过），任务放回队列，`attempt` 加一，丢掉上次没传完的输出块。重派先避开失联过的节点，实在没别的再用。超过 `job_max_retries` 次算 `failed`。退出码非 0、超时、超磁盘都是最终结果，**不重试**。

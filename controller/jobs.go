@@ -250,10 +250,6 @@ func (c *Controller) submitJob(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if key.Limits.MaxNodes == 0 {
-		writeErr(w, http.StatusBadRequest, fmt.Sprintf("钥匙 %s 的 max_nodes 是 0，一台都不能派", key.Name))
-		return
-	}
 	if job.Name+"@"+job.Version != req.Package {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf("任务包里写的是 %s@%s", job.Name, job.Version))
 		return
@@ -599,14 +595,8 @@ func (c *Controller) scheduleLocked(now time.Time) bool {
 		if len(free) == 0 {
 			break
 		}
-		key, ok := keys[j.Signer] // 不在钥匙环里的直接去验签，验不过就 rejected
-		if ok && key.Limits.MaxNodes == 0 {
-			if msg := fmt.Sprintf("钥匙 %s 的 max_nodes 是 0，一台都不派", key.Name); j.Detail != msg {
-				j.Detail, changed = msg, true
-			}
-			continue
-		}
-		if ok && busy[key.Name] >= key.Limits.MaxNodes {
+		key, ok := keys[j.Signer]                                                   // 不在钥匙环里的直接去验签，验不过就 rejected
+		if ok && key.Limits.MaxNodes > 0 && busy[key.Name] >= key.Limits.MaxNodes { // 0 = 不限制
 			continue
 		}
 		pick := ""

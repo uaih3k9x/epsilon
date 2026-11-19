@@ -26,9 +26,10 @@ const ClockSkew = 24 * time.Hour
 const MaxGPUMemMB = 7168
 
 // Limits 是一把钥匙能批的任务的上限。MaxNodes、Rooms 由主控派活时执行，探针只核对时长和联网。
+// MaxNodes 0 = 不限制，负数钥匙环验不过。
 type Limits struct {
 	MaxHours float64  `json:"max_hours"`
-	MaxNodes int      `json:"max_nodes"`
+	MaxNodes int      `json:"max_nodes"`       // 0 = 不限制
 	Rooms    []string `json:"rooms,omitempty"` // 空 = 不限
 	Network  bool     `json:"network"`
 }

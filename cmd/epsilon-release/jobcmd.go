@@ -5,7 +5,7 @@ package main
 //   epsilon-release keygen   -out dist/keys/reviewer-a.key
 //   epsilon-release keyring  -key dist/keys/release-main.key -in keyring-src.json -out job-keyring.json
 //   epsilon-release sign-job -key dist/keys/reviewer-a.key -name reviewer-a -keyring job-keyring.json \
-//                            -job job.json -code code.zip -out job.signed.json
+//                            -job job.json -code code.zip -chunks dist/chunks -out job.signed.json
 
 import (
 	"crypto/ed25519"
@@ -19,10 +19,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
+	"epsilon/chunk"
 	"epsilon/jobsign"
+	"epsilon/proto"
 )
 
 func loadKey(path string) (ed25519.PrivateKey, error) {
@@ -120,9 +124,48 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// codeManifest 出代码包清单：ID code-<sha>，只有一个文件 jobcode/<sha>.zip（探针 prepareCode、
+// 主控 CodeManifestID 的约定，格式就是 chunk.Build 的 proto.Manifest），块写进 chunksDir。
+// 已有清单：按它的块大小把 code.zip 重切一遍比对，对不上就报错、不覆盖；对得上原样不动。没有就写一份。
+func codeManifest(codePath, sha, chunksDir string) error {
+	id := "code-" + sha
+	path := filepath.Join(chunksDir, id+".json")
+	size := int64(chunk.DefaultChunkSize)
+	var old *proto.Manifest
+	if b, err := os.ReadFile(path); err == nil {
+		old = &proto.Manifest{}
+		if err := json.Unmarshal(b, old); err != nil {
+			return fmt.Errorf("已有代码包清单 %s 格式坏了（不覆盖，确认后删掉重签）: %v", path, err)
+		}
+		if old.ChunkSize <= 0 {
+			return fmt.Errorf("已有代码包清单 %s 的 chunk_size 不合法（不覆盖，确认后删掉重签）", path)
+		}
+		size = old.ChunkSize
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	f, err := chunk.BuildFile(chunksDir, codePath, size)
+	if err != nil {
+		return fmt.Errorf("代码包切块: %v", err)
+	}
+	if f.SHA256 != sha {
+		return fmt.Errorf("切块时 code.zip 变了: SHA-256 是 %s, 要的是 %s", f.SHA256, sha)
+	}
+	f.Path = "jobcode/" + sha + ".zip"
+	m := proto.Manifest{ID: id, ChunkSize: size, Files: []proto.ManifestFile{f}}
+	if old != nil {
+		if !reflect.DeepEqual(*old, m) {
+			return fmt.Errorf("已有代码包清单 %s 和 code.zip 对不上（不覆盖，确认后删掉重签）", path)
+		}
+		return nil
+	}
+	b, _ := json.MarshalIndent(m, "", "  ")
+	return writeFileAtomic(path, b)
+}
+
 // cmdSignJob 签任务包: code.zip 哈希要和 job.json 一致, 私钥要和钥匙环里同名钥匙的公钥一致,
-// 签完用钥匙环按探针的规则验一遍, 过了才写 out。
-func cmdSignJob(keyPath, name, ringPath, jobPath, codePath, out string) error {
+// 签完用钥匙环按探针的规则验一遍; 再出（或核对已有的）代码包清单, 都过了才写 out。
+func cmdSignJob(keyPath, name, ringPath, jobPath, codePath, out, chunksDir string) error {
 	priv, err := loadKey(keyPath)
 	if err != nil {
 		return err
@@ -164,6 +207,9 @@ func cmdSignJob(keyPath, name, ringPath, jobPath, codePath, out string) error {
 	}
 	if _, _, err := jobsign.VerifyJob(sj, kr, time.Now()); err != nil {
 		return fmt.Errorf("签完按探针规则验没过: %v", err)
+	}
+	if err := codeManifest(codePath, sum, chunksDir); err != nil {
+		return err
 	}
 	sj.Warnings = jobsign.JobWarnings(j)
 	for _, w := range sj.Warnings {
@@ -210,6 +256,7 @@ func runJobCommand(args []string) (bool, error) {
 		ring := fs.String("keyring", "job-keyring.json", "签好的钥匙环")
 		job := fs.String("job", "job.json", "任务包清单")
 		code := fs.String("code", "code.zip", "代码包")
+		chunks := fs.String("chunks", "dist/chunks", "代码包清单 code-<sha>.json 和块写到这里（整个传到主控 chunks_dir）；已有清单只核对不覆盖")
 		out := fs.String("out", "job.signed.json", "签好的任务包")
 		if err := fs.Parse(args[1:]); err != nil {
 			return true, err
@@ -217,7 +264,7 @@ func runJobCommand(args []string) (bool, error) {
 		if *key == "" || *name == "" {
 			return true, errors.New("要 -key 和 -name")
 		}
-		return true, cmdSignJob(*key, *name, *ring, *job, *code, *out)
+		return true, cmdSignJob(*key, *name, *ring, *job, *code, *out, *chunks)
 	}
 	return false, nil
 }
