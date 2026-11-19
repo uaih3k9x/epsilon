@@ -15,7 +15,11 @@ func readyLine(pid, ppid int) string {
 }
 
 func readyLineDir(pid, ppid int, jsonDir string) string {
-	return fmt.Sprintf(`{"t":1,"ev":"ready","pid":%d,"ppid":%d,"il":"low","job_dir":"%s","file":"D:\\e\\Lib\\site-packages\\sitecustomize.py","layer":"D:\\e"}`, pid, ppid, jsonDir)
+	return readyLineFull(pid, ppid, jsonDir, "low", `["SeChangeNotifyPrivilege"]`)
+}
+
+func readyLineFull(pid, ppid int, jsonDir, il, privs string) string {
+	return fmt.Sprintf(`{"t":1,"ev":"ready","pid":%d,"ppid":%d,"il":%q,"privs":%s,"job_dir":"%s","file":"D:\\e\\Lib\\site-packages\\sitecustomize.py","layer":"D:\\e"}`, pid, ppid, il, privs, jsonDir)
 }
 
 func TestLogParsesAndCounts(t *testing.T) {
@@ -220,4 +224,42 @@ func TestWatcherReadyJobDirMustMatch(t *testing.T) {
 	w.Start(10)
 	c.send(t, readyLineDir(10, 1, `d:/EPSILON/jobs/demo-1/`)) // 大小写、/ 和结尾的分隔符不算不同
 	expectNoAbort(t, w, 300*time.Millisecond)
+}
+
+func TestWatcherReadyMustBeLowILWithoutPrivileges(t *testing.T) {
+	// 审查 #17 第 2 条：降级、删特权全靠层里的 sitecustomize。它写错了（包了 try/except、调换了顺序），任务就以 Medium IL、
+	// 带着 SeShutdownPrivilege 跑。就绪记录里的 il / privs 不对：当篡改，整树杀
+	for _, c := range []struct{ il, privs string }{
+		{"0x2000", `["SeChangeNotifyPrivilege"]`},
+		{"", `["SeChangeNotifyPrivilege"]`},
+		{"low", `["SeChangeNotifyPrivilege","SeShutdownPrivilege"]`},
+		{"low", `[]`},
+		{"low", `null`},
+	} {
+		for _, child := range []bool{false, true} {
+			w := newWatcher(NewLog(1<<20), time.Second, time.Second, testJobDir)
+			main, sub := newConn(), newConn()
+			go w.Serve(main.r)
+			go w.Serve(sub.r)
+			w.Start(10)
+			if child {
+				main.send(t, readyLine(10, 1))
+				sub.send(t, readyLineFull(11, 10, `D:\\epsilon\\jobs\\demo-1`, c.il, c.privs))
+			} else {
+				main.send(t, readyLineFull(10, 1, `D:\\epsilon\\jobs\\demo-1`, c.il, c.privs))
+			}
+			expectAbort(t, w, AbortAudit, 2*time.Second)
+			w.Stop()
+		}
+	}
+}
+
+func TestLogReadiesAreCopies(t *testing.T) {
+	l := NewLog(1 << 20)
+	l.Add([]byte(readyLine(10, 1)))
+	l.Add([]byte(readyLineFull(11, 10, `D:\\epsilon\\jobs\\demo-1`, "0x2000", `[]`)))
+	rs := l.Readies()
+	if len(rs) != 2 || ReadyOK(rs[0]) == ReadyOK(rs[1]) {
+		t.Fatalf("%+v", rs)
+	}
 }

@@ -138,12 +138,13 @@ func TestCanaryListsCoverReviewedControls(t *testing.T) {
 		}
 		return false
 	}
-	for _, n := range []string{"privileges_dropped", "read_data_disk", "hardlink_probe_json", "chdir_tmp", "exec_artifact_root"} {
+	for _, n := range []string{"privileges_dropped", "read_data_disk", "hardlink_probe_json", "chdir_tmp", "exec_artifact_root",
+		"winsta0_denied", "token_groups"} { // 审查 #17 第 3、9 条
 		if !has(SysChecks, n) {
 			t.Fatalf("系统控制单子缺 %s", n)
 		}
 	}
-	for _, n := range []string{"unc_paths_blocked", "rename_py_blocked", "loopback_blocked", "socketpair_ok"} {
+	for _, n := range []string{"unc_paths_blocked", "rename_py_blocked", "loopback_blocked", "socketpair_ok", "tamper_globals_blocked"} {
 		if !has(HookChecks, n) {
 			t.Fatalf("钩子单子缺 %s", n)
 		}

@@ -74,7 +74,7 @@ const Desktop = `epsilon-job\Default`
 
 // SysChecks 是系统控制检查（python -I -S，不加载钩子）每一项都必须 ok 的单子；和 py/canary_sys.py 一一对应。
 var SysChecks = []string{
-	"integrity_low", "privileges_dropped", "desktop",
+	"integrity_low", "privileges_dropped", "desktop", "winsta0_denied", "token_groups",
 	"read_probe_json", "read_secrets", "read_data_disk", "exec_artifact_root", "hardlink_probe_json", "chdir_tmp",
 	"write_code", "write_params", "delete_params", "write_job_root", "write_sitecustomize", "write_env",
 	"write_tmp", "write_output",
@@ -88,7 +88,7 @@ var SysChecks = []string{
 var HookChecks = []string{
 	"hook_installed", "subprocess_blocked", "spawn_flags_blocked", "connect_blocked", "dns_blocked",
 	"unc_blocked", "unc_paths_blocked", "env_tamper_blocked", "tmp_py_blocked", "rename_py_blocked", "dlopen_tmp_blocked",
-	"loopback_blocked", "socketpair_ok", "mp_child",
+	"loopback_blocked", "socketpair_ok", "tamper_globals_blocked", "mp_child",
 }
 
 // CanaryLine 是金丝雀输出的一行。

@@ -203,11 +203,14 @@ def test_counted_not_blocked(ctx, event):
 def test_compile_and_exec_classified(ctx):
     assert sc.decide("compile", ("src", CODE + "\\model.py"), ctx) == ("count", "compile.import")
     assert sc.decide("compile", ("src", "<string>"), ctx)[0] == "log"
-    code = types.SimpleNamespace(co_filename="Lib/site-packages/torch/nn/__init__.py")
-    assert sc.decide("exec", (code,), ctx) == ("count", "exec.import")
-    assert sc.decide("exec", (types.SimpleNamespace(co_filename="<frozen os>"),), ctx) == ("count", "exec.import")
-    assert sc.decide("exec", (types.SimpleNamespace(co_filename="<string>"),), ctx)[0] == "log"
-    assert sc.decide("exec", (types.SimpleNamespace(co_filename=JOB + "\\tmp\\gen.py"),), ctx)[0] == "log"
+    def code(fn):
+        return compile("pass", fn, "exec")
+    assert sc.decide("exec", (code("Lib/site-packages/torch/nn/__init__.py"),), ctx) == ("count", "exec.import")
+    assert sc.decide("exec", (code("<frozen os>"),), ctx) == ("count", "exec.import")
+    assert sc.decide("exec", (code("<string>"),), ctx)[0] == "log"
+    assert sc.decide("exec", (code(JOB + "\\tmp\\gen.py"),), ctx)[0] == "log"
+    # 不是真的代码对象（任务自己 sys.audit("exec", ...)）：不读它的属性（可能是任务的 __getattr__），按动态执行记
+    assert sc.decide("exec", (types.SimpleNamespace(co_filename=CODE + "\\x.py"),), ctx)[0] == "log"
 
 
 def test_registry_writes_blocked(ctx):
@@ -257,23 +260,169 @@ def test_record_args_bounded_and_ascii(ctx):
     assert len(b) < 200  # 源码不进记录，只记文件名
 
 
-def test_reentrant_events_ignored(ctx):
+def test_events_inside_the_hook_are_checked(ctx):
+    # 钩子运行中也可能跑到任务的代码（GC 在钩子里触发的 __del__、弱引用回调）：以前一律跳过，等于钩子关掉。现在照样判
     calls = []
 
     def write(b):
         calls.append(b)
-        hook("os.system", ("nested",))  # 钩子自己触发的事件：不递归、不拦
+        if len(calls) == 1:
+            with pytest.raises(PermissionError):
+                hook("os.system", ("nested",))
 
     hook = sc.make_hook(ctx, write)
-    with pytest.raises(PermissionError):
-        hook("os.system", ("outer",))
-    assert len(calls) == 1
+    hook("ctypes.dlopen", ("kernel32",))
+    assert [json.loads(b)["ev"] for b in calls] == ["ctypes.dlopen", "os.system"]
+
+
+def test_hook_functions_cannot_be_rewired(ctx):
+    # 改钩子用到的函数的 __code__ / __defaults__ 有审计事件（object.__setattr__）：是我们的就拦
+    hook = sc.make_hook(ctx, lambda b: None)
+    for fn, attr in [(sc.decide, "__defaults__"), (sc.record, "__code__"), (sc.short_args, "__kwdefaults__")]:
+        with pytest.raises(PermissionError):
+            hook("object.__setattr__", (fn, attr, None))
+    hook("object.__setattr__", (lambda: 0, "__defaults__", ()))  # 任务自己的函数不管
+
+
+@pytest.mark.parametrize("event", ["gc.get_objects", "gc.get_referrers", "gc.get_referents", "sys._current_frames",
+                                   "sys._current_exceptions", "sys.settrace", "sys.setprofile"])
+def test_introspection_that_reaches_hook_objects_is_logged(ctx, event):
+    # 这几个能摸到钩子的对象（函数、默认参数里的字典）或正在跑的钩子帧：正常任务很少用，逐条记
+    assert act(ctx, event, None) == "log"
+
+
+def test_hook_path_reads_no_globals_and_holds_nothing_mutable():
+    # 审查 #17 第 1 条：钩子每次调用都按名字查模块全局，任务一句 sys.modules['sitecustomize'].decide = ... 就关掉了它，
+    # 而且不留记录。现在钩子用到的一切在装钩子时绑成位置默认参数：没有全局/内建查找、没有闭包（cell_contents 能改）、
+    # 没有 __kwdefaults__（那是能改的字典）；模块级函数的默认参数只许是不可变的东西
+    import dis
+    import socket
+    hook = sc.make_hook(sc.Ctx(JOB, ENV, EXE, "C:\\Windows"), lambda b: None)
+    immutable_types = (str, bytes, int, float, bool, type(None), frozenset, types.MappingProxyType,
+                       type(sc.QUOTED_ARGS), types.BuiltinFunctionType, types.MethodDescriptorType,
+                       types.WrapperDescriptorType, types.BuiltinMethodType)
+
+    def frozen(v):
+        if isinstance(v, tuple):
+            return all(frozen(x) for x in v)
+        if v is socket.socket:
+            return True  # note_bound 只拿它比 is，不读它的属性
+        if isinstance(v, type):
+            return bool(v.__flags__ & (1 << 8))  # Py_TPFLAGS_IMMUTABLETYPE：内建类型，类属性改不了
+        return type(v) in immutable_types or isinstance(v, types.FunctionType)
+
+    seen, todo = set(), [(hook, True)]
+    while todo:
+        f, top = todo.pop()
+        if id(f) in seen:
+            continue
+        seen.add(id(f))
+        assert f.__code__.co_freevars == (), f.__name__
+        assert not f.__kwdefaults__, f.__name__
+        assert not [c for c in f.__code__.co_consts if isinstance(c, types.CodeType)], f.__name__ + " 里有嵌套函数/推导式"
+        bad = [i.argval for i in dis.get_instructions(f) if i.opname in ("LOAD_GLOBAL", "LOAD_NAME", "LOAD_DEREF",
+                                                                          "LOAD_CLASSDEREF", "STORE_GLOBAL")]
+        assert not bad, (f.__name__, bad)
+        for d in f.__defaults__ or ():
+            if isinstance(d, types.FunctionType):
+                todo.append((d, False))
+            elif not top:  # hook 自己的默认参数里有 ctx、计数（本来就是状态，只有钩子帧摸得到）
+                assert frozen(d), (f.__name__, d)
+    assert len(seen) >= 8
+
+
+@pytest.mark.parametrize("name", ["x.py.", "x.py ", "x.py. . ", "x.py::$DATA", "x.PY", "x.pth:s"])
+def test_windows_strips_trailing_dots_and_streams(ctx, name):
+    # Windows 打开 "x.py." 就是 x.py；"x.py::$DATA" 是它的主数据流
+    assert act(ctx, "open", JOB + "\\tmp\\" + name, "w", 0) == "block"
+    assert act(ctx, "os.rename", JOB + "\\tmp\\a.txt", JOB + "\\tmp\\" + name) == "block"
+
+
+def test_path_objects_are_never_asked_for_their_path(ctx):
+    # 钩子不调任务的 __fspath__：它在钩子里跑（以前钩子里的事件一律跳过），而且第二次可以返回和系统调用用的不一样的路径
+    class P:
+        def __fspath__(self):
+            raise AssertionError("钩子调了 __fspath__")
+
+    import pathlib
+    for p in [P(), pathlib.PureWindowsPath("\\\\x.example\\s\\d")]:
+        assert sc.decide("os.mkdir", (p, 0o777, None), ctx) == ("count", "path.opaque")
+    assert act(ctx, "os.listdir", 3) is None and act(ctx, "os.listdir", None) is None
+
+
+def test_hook_never_runs_task_code(ctx):
+    # 参数是任务的对象：它的类、元类的 __hash__ / __eq__ / __repr__ / __getattr__ 都不能在钩子里被调到
+    class Meta(type):
+        def __hash__(cls):
+            raise AssertionError("钩子调了元类的 __hash__")
+
+        def __eq__(cls, other):
+            raise AssertionError("钩子调了元类的 __eq__")
+
+        __ne__ = __eq__
+
+        def __repr__(cls):
+            raise AssertionError("钩子调了元类的 __repr__")
+
+    class Evil(metaclass=Meta):
+        def __repr__(self):
+            raise AssertionError("钩子调了 __repr__")
+
+        def __eq__(self, other):
+            raise AssertionError("钩子调了 __eq__")
+
+        def __getattr__(self, name):
+            raise AssertionError("钩子调了 __getattr__ " + name)
+
+        __hash__ = None
+
+    out = []
+    hook = sc.make_hook(ctx, out.append)
+    e = Evil()
+    for event, args in [("socket.bind", (e, ("127.0.0.1", 0))), ("socket.connect", (e, ("127.0.0.1", e))),
+                        ("os.mkdir", (e, e, e)), ("open", (e, "r", 0)), ("exec", (e,)), ("compile", (e, e)),
+                        ("ctypes.dlopen", (e,)), ("import", ("m", e, [e], [], [])), ("os.putenv", (e, e)),
+                        ("_winapi.CreateProcess", (e, e, e)), ("sys.addaudithook", (e, Evil, [e], (e,)))]:
+        try:
+            hook(event, args)
+        except PermissionError:
+            pass
+    assert out
+
+
+def test_str_and_tuple_subclasses_are_read_like_c_reads_them(ctx):
+    # C 的路径转换和 getsockaddrarg 读的是底层的数据，不调子类重写的方法；钩子也一样
+    class S(str):
+        def replace(self, *a):
+            return JOB + "\\code\\x"
+
+        def lower(self):
+            return JOB.lower() + "\\code\\x"
+
+        def startswith(self, *a):
+            return False
+
+    assert act(ctx, "os.mkdir", S("\\\\x.example\\s\\d"), 0o777, None) == "block"
+    assert act(ctx, "open", S(JOB + "\\tmp\\x.py"), "w", 0) == "block"
+
+    class T(tuple):
+        def __getitem__(self, i):
+            return ("127.0.0.1", 4242)[i]
+
+        def __len__(self):
+            return 2
+
+    assert act(ctx, "socket.connect", object(), T(("10.0.0.1", 80))) == "block"
+    assert act(ctx, "socket.bind", object(), T(("0.0.0.0", 0))) == "block"
 
 
 def test_ready_record_carries_job_dir():
     # 子进程的任务目录从环境变量来，_winapi.CreateProcess 的审计参数不含环境：探针核对就绪记录里的 job_dir
-    r = json.loads(sc.ready_record(JOB, 0x1000, now=lambda: 1.0, pid=lambda: 7, ppid=lambda: 1))
+    r = json.loads(sc.ready_record(JOB, 0x1000, ["SeChangeNotifyPrivilege"], now=lambda: 1.0, pid=lambda: 7, ppid=lambda: 1))
     assert r["ev"] == "ready" and r["job_dir"] == JOB and r["il"] == "low" and r["pid"] == 7 and r["ppid"] == 1
+    # 审查 #17 第 2 条：探针核对完整性级别和剩下的特权（层里的 sitecustomize 写错了也测得出）
+    assert r["privs"] == ["SeChangeNotifyPrivilege"]
+    assert json.loads(sc.ready_record(JOB, 0x2000, [], now=lambda: 1.0))["il"] == "0x2000"
 
 
 def test_unc_helper():
@@ -323,3 +472,111 @@ def test_end_to_end_in_real_interpreter():
     assert r["socketpair"] == "ran"  # 回环要放行：Windows 上 socketpair 和 asyncio 都靠它
     assert r["own_listener"] == "ran" and r["loopback_other"] == "blocked" and r["unc_mkdir"] == "blocked"
     assert got["env"] == "orig" and got["n"] >= 5
+
+
+TAMPER = r"""
+import gc, importlib.util, json, ntpath, os, socket, sys, builtins, reprlib
+import encodings.idna  # getaddrinfo 懒加载它；这里的 sys.path 不在"环境层"里，装钩子以后导入会被拦
+_loads, _isinstance, _issubclass, _getattr = json.loads, isinstance, issubclass, getattr
+spec = importlib.util.spec_from_file_location("eps_sc", sys.argv[1])
+sc = importlib.util.module_from_spec(spec); spec.loader.exec_module(sc); sys.modules["sitecustomize"] = sc
+out = []
+ctx = sc.Ctx("D:\\j", "D:\\e", "D:\\e\\python.exe", "C:\\Windows", getcwd=lambda: "D:\\j\\code")
+sys.addaudithook(sc.make_hook(ctx, out.append))
+rfd, wfd = os.pipe()
+pipe_write = sc._writer(wfd)
+res = {}
+def probe(name, fn):
+    try:
+        fn(); res[name] = "ran"
+    except PermissionError as e:
+        res[name] = "blocked" if "epsilon" in str(e) else "perm"
+    except Exception as e:
+        res[name] = type(e).__name__
+own = socket.socket(); own.bind(("127.0.0.1", 0)); own.listen(1); port = own.getsockname()[1]
+n0 = len(out)
+# 纯 Python 篡改，不用 ctypes，也不触发审计事件：模块全局、标准库函数、类属性、内建
+mod = sys.modules["sitecustomize"]
+for k, v in list(vars(mod).items()):
+    if not k.startswith("__"):
+        setattr(mod, k, (lambda *a, **kw: None) if callable(v) else None)
+ntpath.normpath = lambda p: "d:\\j\\code\\x"
+ntpath.isabs = lambda p: True
+ntpath.join = lambda *a: "d:\\j\\code\\x"
+os.fspath = lambda p: "d:\\j\\code\\x"
+os.write = lambda fd, b: len(b)
+json.dumps = lambda *a, **k: "{}"
+reprlib.Repr.repr = lambda self, x: ""
+socket.socket.getsockname = lambda self: ("127.0.0.1", 9)
+builtins.isinstance = lambda a, b: False
+builtins.issubclass = lambda a, b: False
+builtins.getattr = lambda *a: None
+probe("os.system", lambda: os.system("true"))
+probe("unc_mkdir", lambda: os.mkdir("\\\\x.example\\s\\d"))
+probe("loopback", lambda: socket.socket().connect(("127.0.0.1", 9)))
+probe("own_port", lambda: socket.create_connection(("127.0.0.1", port), timeout=5).close())
+probe("tmp_py", lambda: open("D:\\j\\tmp\\x.py", "w"))
+builtins.isinstance, builtins.issubclass, builtins.getattr = _isinstance, _issubclass, _getattr
+pipe_write(b"rec\n")
+got = os.read(rfd, 100)
+
+class P:
+    calls = 0
+    def __fspath__(self):
+        P.calls += 1
+        if P.calls == 2:  # 第一次是 os.mkdir 自己转换路径；第二次只可能是钩子在调
+            try:
+                os.system("true"); res["inside_fspath"] = "ran"
+            except PermissionError:
+                res["inside_fspath"] = "blocked"
+        return "made-by-fspath"
+probe("pathlike", lambda: os.mkdir(P()))
+
+class S(str):
+    def replace(self, *a): return "d:\\j\\code\\x"
+    def lower(self): return "d:\\j\\code\\x"
+    def startswith(self, *a): return False
+probe("str_subclass_unc", lambda: os.mkdir(S("\\\\x.example\\s\\e")))
+
+class T(tuple):
+    def __getitem__(self, i): return ("127.0.0.1", port)[i]
+    def __len__(self): return 2
+probe("tuple_subclass_addr", lambda: socket.socket().connect(T(("127.0.0.1", 9))))
+
+# GC 在钩子里触发终结器：以前钩子里的事件一律跳过
+ran_in_del = []
+class D:
+    def __init__(self): self.me = self
+    def __del__(self):
+        try:
+            os.system("true"); ran_in_del.append(1)
+        except PermissionError:
+            pass
+gc.collect(); gc.set_threshold(1)
+for _ in range(300):
+    D()
+    try:
+        os.listdir(".")
+    except Exception:
+        pass
+gc.set_threshold(700); gc.collect()
+recs = [_loads(b) for b in out[n0:]]
+print(json.JSONEncoder().encode({"res": res, "n": len(recs), "evs": sorted({r["ev"] for r in recs}), "pipe": got.decode(),
+                                 "fspath_calls": P.calls, "ran_in_del": len(ran_in_del)}))
+"""
+
+
+def test_tampering_with_globals_does_not_switch_the_hook_off(tmp_path):
+    # 审查 #17 第 1 条的复现：改模块全局、标准库函数、类属性、内建，不用 ctypes、不触发任何审计事件
+    p = subprocess.run([sys.executable, "-I", "-c", TAMPER, SRC], capture_output=True, text=True, timeout=120, cwd=tmp_path,
+                       env={"PATH": os.environ.get("PATH", "")})
+    assert p.returncode == 0, p.stderr
+    got = json.loads(p.stdout.strip().splitlines()[-1])
+    r = got["res"]
+    for name in ("os.system", "unc_mkdir", "loopback", "tmp_py", "str_subclass_unc", "tuple_subclass_addr"):
+        assert r[name] == "blocked", (name, r)
+    assert r["own_port"] == "ran"  # 自己 bind 的回环端口照常
+    assert "inside_fspath" not in r and got["fspath_calls"] == 1  # 钩子没调任务的 __fspath__
+    assert got["ran_in_del"] == 0  # 钩子里跑到的终结器照样被拦
+    assert {"os.system", "os.mkdir", "socket.connect", "open"} <= set(got["evs"]), got  # 照样留记录
+    assert got["pipe"] == "rec\n"  # os.write 换掉了，审计管道照样写得进去

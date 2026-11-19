@@ -7,17 +7,31 @@
 装的过程中任何一步出错就 os._exit(97)，因为 site.py 只会打印一句 "Error in sitecustomize" 然后接着跑。
 顺序：连审计管道 -> 降到 Low IL -> 删掉特权 -> addaudithook -> 写就绪记录。之后才轮到用户代码。
 
-策略（decide）是纯函数，在 Mac 上用 tools/test_sandbox_hook.py 测；路径一律按 Windows 规则（ntpath）比较。
+**钩子运行时不查任何能被任务改掉的东西**（审查 #17 第 1 条）：用户代码可以随手改模块全局（sys.modules['sitecustomize'].decide = ...）、
+标准库函数（ntpath.normpath、os.write、json.dumps）、类属性（socket.socket.getsockname）和内建（builtins.isinstance），
+这些都不触发审计事件。所以钩子路径上的函数：
+  - 用到的一切在 import 时（用户代码之前）绑成**位置默认参数**：函数体里没有全局、内建查找，没有闭包（cell_contents 能改），
+    也不用 __kwdefaults__（那是一个能改的字典）。改 __defaults__ / __code__ 有审计事件，钩子认得自己的函数，拦下；
+  - 默认参数只放不可变的东西（frozenset、元组、只读映射、C 函数、内建类型）；
+  - 不调任务的代码：参数按类型取底层数据（str 子类用 str.__str__ 复制，元组子类用 tuple.__getitem__），不调 __fspath__、__repr__、
+    __eq__，pathlib 这类路径对象只计数（第二次调 __fspath__ 可以返回和系统调用用的不一样的路径）；
+  - 钩子运行中跑到的任务代码（GC 在钩子里触发的 __del__）照样判，不跳过。钩子自己不触发审计事件，不会递归。
+tools/test_sandbox_hook.py 的 test_hook_path_reads_no_globals_and_holds_nothing_mutable 逐个函数核对这几条。
+剩下的路：gc.get_objects / get_referrers / get_referents、sys._current_frames 能摸到钩子的对象，逐条记录（第 8 节）。
+
+策略（decide）是纯函数，在 Mac 上用 tools/test_sandbox_hook.py 测；路径一律按 Windows 规则比较。
 """
 
+import _json
+import _socket
 import json
 import ntpath
 import os
 import re
-import reprlib
 import sys
 import threading
 import time
+import types
 import weakref
 
 EXIT_HOOK_FAILED = 97
@@ -34,288 +48,435 @@ NET_EVENTS = frozenset({"socket.connect", "socket.sendto", "socket.sendmsg", "so
 DNS_EVENTS = frozenset({"socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr", "socket.getnameinfo"})
 # 带路径的事件 → 哪几个参数是路径。都要拦 UNC：mkdir、rename、chdir 也会让内核以 System 身份发 SMB（带任务账户的 NTLM），
 # 防火墙按 SID 管不到。os.stat / os.path.exists 没有审计事件，拦不住（docs/jobs-sandbox.md 第 8 节）。
-PATH_ARGS = {
+PATH_ARGS = types.MappingProxyType({
     "open": (0,), "os.listdir": (0,), "os.scandir": (0,), "os.mkdir": (0,), "os.rename": (0, 1), "os.remove": (0,),
     "os.rmdir": (0,), "os.chdir": (0,), "os.chmod": (0,), "os.chown": (0,), "os.utime": (0,), "os.link": (0, 1),
     "os.symlink": (0, 1), "os.truncate": (0,), "os.add_dll_directory": (0,),
     "shutil.copyfile": (0, 1), "shutil.copymode": (0, 1), "shutil.copystat": (0, 1), "shutil.copytree": (0, 1),
     "shutil.move": (0, 1), "shutil.rmtree": (0,), "shutil.unpack_archive": (0, 1), "shutil.make_archive": (0, 2, 3),
     "tempfile.mkstemp": (0,), "tempfile.mkdtemp": (0,), "glob.glob": (0,), "glob.glob/2": (0, 2),
-}
+})
 # 能凭空造出 .py / .pth 的（目标是第二个参数）：先写 x.txt 再改名绕过 open 的检查
 DEST_EVENTS = frozenset({"os.rename", "os.link", "os.symlink", "shutil.copyfile", "shutil.move"})
 REG_WRITE_EVENTS = frozenset({"winreg.CreateKey", "winreg.DeleteKey", "winreg.DeleteValue", "winreg.SetValue",
                               "winreg.SaveKey", "winreg.LoadKey", "winreg.ConnectRegistry",
                               "winreg.DisableReflectionKey", "winreg.EnableReflectionKey"})
 COUNT_EVENTS = frozenset({"ctypes.call_function", "pickle.find_class", "marshal.loads"})
+# 能摸到钩子的对象或正在跑的钩子帧（gc 枚举、别的线程的帧），以及跟踪函数：正常任务很少用，逐条记
 LOG_EVENTS = frozenset({"sys.addaudithook", "cpython.run_command", "cpython.run_module", "cpython.run_file",
-                        "cpython.run_interactivehook", "cpython.run_startup", "cpython.run_stdin"})
+                        "cpython.run_interactivehook", "cpython.run_startup", "cpython.run_stdin",
+                        "gc.get_objects", "gc.get_referrers", "gc.get_referents", "sys._current_frames",
+                        "sys._current_exceptions", "sys.settrace", "sys.setprofile"})
 CODE_SUFFIXES = (".py", ".pyc", ".pyw", ".pth")
 LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 PRIVATE_MKDIR = 0o700  # Python 3.12.4+ 在 Windows 上给它建受保护 DACL（只有 SY、BA、所有者）
 SPAWN_FLAGS = frozenset({"-B", "-E", "-s"})
 SPAWN_MAIN = re.compile(r"from multiprocessing\.spawn import spawn_main; spawn_main\(parent_pid=\d+, pipe_handle=\d+\)")
 QUOTED_ARGS = re.compile(r'"[^"]*"(?: "[^"]*")*')
+QUOTED_TOK = re.compile(r'"([^"]*)"')
 
 BLOCK = ("block", None)
 LOG = ("log", None)
-
-_repr = reprlib.Repr()
-_repr.maxstring = 200
-_repr.maxother = 120
-_repr.maxlong = 40
+OPAQUE = ("count", "path.opaque")
+CATCH = (OSError, TypeError, ValueError, AttributeError, IndexError, RuntimeError)
 
 
-def norm(p, cwd=None):
-    """Windows 规则的规范化：转 str、/ 换 \\、相对路径接上 cwd、去掉 \\\\?\\ 前缀、小写。"""
-    if isinstance(p, bytes):
-        p = os.fsdecode(p)
-    p = os.fspath(p).replace("/", "\\")
-    if p[:4] == "\\\\?\\" and len(p) > 6 and p[5] == ":":
+# ---- 钩子路径上的函数：只用参数和默认参数（见模块说明）。默认参数在这里、用户代码之前求值 ----
+
+def as_str(x, _type=type, _str=str, _bytes=bytes, _issub=issubclass, _copy=str.__str__, _decode=bytes.decode):
+    """x 底层的字符串（和 C 的路径转换读到的一样），不调 x 的任何方法。不是 str/bytes（及子类）返回 None。
+    os.DirEntry 也不认：它的类属性能改（__fspath__ 换掉以后 C 转换用新的，钩子用旧的就对不上）。"""
+    t = _type(x)
+    if t is _str:
+        return x
+    if t is _bytes or _issub(t, _bytes):
+        return _decode(x, "utf-8", "replace")
+    if _issub(t, _str):
+        return _copy(x)
+    return None
+
+
+def isabs(p):
+    """ntpath.isabs 的规则（含它的老毛病："\\x" 也算绝对路径）。p 是 str。"""
+    q = p[:3].replace("/", "\\")
+    return q.startswith("\\") or q[1:3] == ":\\"
+
+
+def normpath(p):
+    """ntpath.normpath 的规则：合并分隔符、去掉 . 和 ..；\\\\.\\ 和 \\\\?\\ 开头的原样返回。p 是 str。"""
+    p = p.replace("/", "\\")
+    if p.startswith("\\\\.\\") or p.startswith("\\\\?\\"):
+        return p
+    if p[1:2] == ":":
+        prefix, p = p[:2], p[2:]
+    elif p.startswith("\\\\"):  # UNC：\\server\share 算盘符
+        i = p.find("\\", 2)
+        j = p.find("\\", i + 1) if i >= 0 else -1
+        if i < 0:
+            prefix, p = p, ""
+        elif j < 0:
+            prefix, p = p, ""
+        else:
+            prefix, p = p[:j], p[j:]
+    else:
+        prefix = ""
+    if p.startswith("\\"):
+        prefix += "\\"
+        p = p.lstrip("\\")
+    out = []
+    for c in p.split("\\"):
+        if c == "" or c == ".":
+            continue
+        if c == "..":
+            if out and out[-1] != "..":
+                out.pop()
+                continue
+            if prefix.endswith("\\"):
+                continue
+        out.append(c)
+    if not prefix and not out:
+        return "."
+    return prefix + "\\".join(out)
+
+
+def norm(p, cwd=None, _as_str=as_str, _isabs=isabs, _normpath=normpath, _len=len):
+    """Windows 规则的规范化：/ 换 \\、相对路径接上 cwd、去掉 \\\\?\\X: 前缀、小写。p 不是路径返回 None。"""
+    p = _as_str(p)
+    if p is None:
+        return None
+    p = p.replace("/", "\\")
+    if p[:4] == "\\\\?\\" and _len(p) > 6 and p[5] == ":":
         p = p[4:]
-    if cwd is not None and not ntpath.isabs(p) and p[:2] != "\\\\":
-        p = ntpath.join(cwd, p)
-    return ntpath.normpath(p).lower()
+    if cwd is not None and not _isabs(p) and p[1:2] != ":" and p[:2] != "\\\\":
+        p = cwd.rstrip("\\") + "\\" + p
+    return _normpath(p).lower()
 
 
 def within(p, d):
     return p == d or p.startswith(d.rstrip("\\") + "\\")
 
 
-def unc_or_device(p):
+def unc_or_device(p, _as_str=as_str, _len=len):
     """UNC（\\\\host\\share、\\\\?\\UNC\\）和设备路径（\\\\.\\）。命名管道 \\\\.\\pipe\\ 和 \\\\?\\X:\\ 长路径除外。"""
-    if isinstance(p, bytes):
-        p = os.fsdecode(p)
-    s = os.fspath(p).replace("/", "\\").lower()
+    s = _as_str(p)
+    if s is None:
+        return False
+    s = s.replace("/", "\\").lower()
     if not s.startswith("\\\\"):
         return False
     if s.startswith("\\\\.\\pipe\\"):
         return False
-    if s.startswith("\\\\?\\") and len(s) > 6 and s[5] == ":" and s[4].isalpha():
+    if s.startswith("\\\\?\\") and _len(s) > 6 and s[5] == ":" and s[4].isalpha():
         return False
     return True
 
 
-class Ctx:
-    """一次任务的路径：code\\、环境层、解释器、System32。cwd 默认现取（任务可以 chdir）。"""
+def code_file(p, _suffixes=CODE_SUFFIXES):
+    """规范化后的 p 打开的是不是代码文件。Windows 去掉最后一段末尾的点和空格，"x.py::$DATA" 是 x.py 的主数据流。"""
+    name = p[p.rfind("\\") + 1:]
+    i = name.find(":")
+    if i >= 0:
+        name = name[:i]
+    return name.rstrip(". ").endswith(_suffixes)
 
-    def __init__(self, job_dir, env_dir, executable, system_root, getcwd=os.getcwd):
-        self.code_dir = norm(ntpath.join(job_dir, "code"))
-        self.env_dir = norm(env_dir)
-        self.executable = norm(executable)
-        self.system32 = norm(ntpath.join(system_root, "System32"))
-        self.getcwd = getcwd
-        self._cache = {}
-        self._bound = weakref.WeakSet()  # 本进程 bind 在回环上的 socket
-        self._lock = threading.Lock()
 
-    def note_bound(self, sock):
-        try:
-            with self._lock:
-                self._bound.add(sock)
-        except TypeError:
-            pass  # 不能弱引用的（测试里的替身）
+def Ctx(job_dir, env_dir, executable, system_root, getcwd=os.getcwd, _norm=norm):
+    """一次任务的路径，冻结成元组：(code\\, 环境层, 解释器, System32, getcwd, 本进程 bind 过的回环 socket)。
+    cwd 默认现取（任务可以 chdir）。最后一项是 {id: weakref}，只有钩子帧摸得到，往里塞东西也冒充不了端口（见 own_port）。"""
+    return (_norm(job_dir.rstrip("\\/") + "\\code"), _norm(env_dir), _norm(executable),
+            _norm(system_root.rstrip("\\/") + "\\System32"), getcwd, {})
 
-    def own_port(self, port):
-        """port 是不是本进程自己 bind 的回环端口（socketpair、asyncio 的自连）。"""
-        with self._lock:
-            socks = list(self._bound)
-        for s in socks:
-            try:
-                if s.fileno() != -1 and s.getsockname()[1] == port:
-                    return True
-            except (OSError, AttributeError, IndexError, TypeError):
-                pass
+
+def trusted(p, ctx, _within=within):
+    """p（已规范化）在 code\\ 或环境层里。"""
+    return _within(p, ctx[0]) or _within(p, ctx[1])
+
+
+def ctx_path(p, ctx, _norm=norm):
+    return _norm(p, ctx[4]())
+
+
+def sockaddr(a, _type=type, _tuple=tuple, _issub=issubclass, _len=tuple.__len__, _get=tuple.__getitem__,
+             _int=int, _index=int.__index__, _as_str=as_str):
+    """(host 小写, port) —— 和 C 的 getsockaddrarg 读到的一样（元组子类读底层元素，int 子类读底层值）；不是 (host, port, ...) 返回 None。
+    port 不是 int 的返回 (host, None)：C 会调它的 __index__，钩子不调。"""
+    if not _issub(_type(a), _tuple) or _len(a) < 2:
+        return None
+    host = _as_str(_get(a, 0))
+    if host is None:
+        return None
+    port = _get(a, 1)
+    port = _index(port) if _issub(_type(port), _int) else None
+    return host.lower(), port
+
+
+def note_bound(ctx, sock, _type=type, _S1=_socket.socket, _S2=__import__("socket").socket, _ref=weakref.ref,
+               _id=id, _len=len, _list=list, _catch=CATCH):
+    """socket.bind 到回环：记下这个 socket（只认标准库的 socket 类型，不是任务的子类）。
+    类型一律用 is 比：放进集合里查要算类型的哈希，任务的元类可以重写 __hash__。"""
+    t = _type(sock)
+    if t is not _S1 and t is not _S2:
+        return
+    bound = ctx[5]
+    try:
+        if _len(bound) > 1024:
+            for k, r in _list(bound.items()):
+                if r() is None:
+                    del bound[k]
+        bound[_id(sock)] = _ref(sock)
+    except _catch:
+        pass
+
+
+def own_port(ctx, port, _list=list, _fileno=_socket.socket.fileno, _name=_socket.socket.getsockname, _catch=CATCH):
+    """port 是不是本进程自己 bind 的回环端口（socketpair、asyncio 的自连）。端口用 _socket 的 C 方法现查，
+    socket.socket.getsockname 被换掉也骗不了；塞进来的假对象 C 方法不认（TypeError）。"""
+    if port is None:
         return False
-
-    def path(self, p):
-        return norm(p, self.getcwd())
-
-    def trusted(self, p):
-        """p（已规范化）在 code\\ 或环境层里。"""
-        hit = self._cache.get(p)
-        if hit is None:
-            hit = within(p, self.code_dir) or within(p, self.env_dir)
-            if len(self._cache) < 4096:
-                self._cache[p] = hit
-        return hit
-
-
-def loopback_addr(addr):
-    if isinstance(addr, tuple) and addr:
-        host = addr[0]
-        if isinstance(host, bytes):
-            host = host.decode("ascii", "replace")
-        return isinstance(host, str) and host.lower() in LOOPBACK
+    try:
+        refs = _list(ctx[5].values())
+    except _catch:
+        return False
+    for r in refs:
+        s = r()
+        if s is None:
+            continue
+        try:
+            if _fileno(s) != -1 and _name(s)[1] == port:
+                return True
+        except _catch:
+            pass
     return False
 
 
-def loopback_lookup(event, args):
-    if not args:
+def loopback_lookup(event, args, _len=len, _as_str=as_str, _sockaddr=sockaddr, _loop=LOOPBACK):
+    if not _len(args):
         return False
     first = args[0]
     if event == "socket.getnameinfo":
-        return loopback_addr(first)
+        a = _sockaddr(first)
+        return a is not None and a[0] in _loop
     if first is None and event == "socket.getaddrinfo":  # 只填端口（bind 通配地址）：不查 DNS
         return True
-    if isinstance(first, bytes):
-        first = first.decode("ascii", "replace")
-    return isinstance(first, str) and first.lower() in LOOPBACK
+    s = _as_str(first)
+    return s is not None and s.lower() in _loop
 
 
-def spawn_ok(args, ctx):
+def spawn_ok(args, ctx, _len=len, _as_str=as_str, _norm=norm, _set=set, _flags=SPAWN_FLAGS, _main=SPAWN_MAIN,
+             _quoted=QUOTED_ARGS, _tok=QUOTED_TOK):
     """_winapi.CreateProcess 只放行 multiprocessing spawn 的那一种：本层 python.exe，参数一个字不差，不指定工作目录。
     多出 -S、-I 之类就能起一个没有钩子的子进程，所以别的一律拒。审计参数不含环境块：子进程的 EPSILON_JOB_DIR 由探针核对就绪记录。"""
-    if len(args) < 3 or not isinstance(args[0], str) or not isinstance(args[1], str) or args[2] is not None:
+    if _len(args) < 3 or args[2] is not None:
         return False
-    if norm(args[0]) != ctx.executable or not QUOTED_ARGS.fullmatch(args[1]):
+    app, cmd = _as_str(args[0]), _as_str(args[1])
+    if app is None or cmd is None or _norm(app) != ctx[2] or _quoted.fullmatch(cmd) is None:
         return False
-    toks = re.findall(r'"([^"]*)"', args[1])
-    if len(toks) != 7 or norm(toks[0]) != ctx.executable:
+    toks = _tok.findall(cmd)
+    if _len(toks) != 7 or _norm(toks[0]) != ctx[2]:
         return False
-    flags, rest = toks[1:4], toks[4:]
-    return (set(flags) == SPAWN_FLAGS and rest[0] == "-c" and SPAWN_MAIN.fullmatch(rest[1]) is not None
-            and rest[2] == "--multiprocessing-fork")
+    return (_set(toks[1:4]) == _flags and toks[4] == "-c" and _main.fullmatch(toks[5]) is not None
+            and toks[6] == "--multiprocessing-fork")
 
 
-def code_origin(filename, ctx):
+def code_origin(filename, ctx, _as_str=as_str, _isabs=isabs, _norm=norm, _trusted=trusted):
     """compile / exec 的来源：import（code\\、环境层、预编译时去掉前缀的相对路径、冻结模块）还是动态执行。"""
-    if not isinstance(filename, str):
+    filename = _as_str(filename)
+    if filename is None:
         return "dynamic"
     if filename.startswith("<frozen "):
         return "import"
     if filename.startswith("<"):
         return "dynamic"
-    if not ntpath.isabs(filename.replace("/", "\\")):
+    if not _isabs(filename) and filename[1:2] != ":":
         return "import"  # 层内 pyc 用 compileall -s/-p 编译，co_filename 是 Lib/site-packages/...
-    return "import" if ctx.trusted(norm(filename)) else "dynamic"
+    return "import" if _trusted(_norm(filename), ctx) else "dynamic"
 
 
-def decide(event, args, ctx):
+def decide(event, args, ctx, _len=len, _type=type, _int=int, _NoneType=type(None), _bool=bool, _list=list, _tuple=tuple,
+           _Code=types.CodeType, _as_str=as_str, _isabs=isabs, _norm=norm, _within=within, _unc=unc_or_device, _code_file=code_file,
+           _trusted=trusted, _path=ctx_path, _sockaddr=sockaddr, _note=note_bound, _own=own_port, _lookup=loopback_lookup,
+           _spawn_ok=spawn_ok, _origin=code_origin, _PROC=PROC_EVENTS, _NET=NET_EVENTS, _DNS=DNS_EVENTS,
+           _PATHS=PATH_ARGS, _DEST=DEST_EVENTS, _REG=REG_WRITE_EVENTS, _COUNT=COUNT_EVENTS, _LOGS=LOG_EVENTS,
+           _LOOP=LOOPBACK, _M700=PRIVATE_MKDIR, _BLOCK=BLOCK, _LOG=LOG, _OPAQUE=OPAQUE):
     """返回 None（不管）、("block", _)、("log", _) 或 ("count", 计数用的名字)。"""
-    if event in PROC_EVENTS:
-        return BLOCK
+    if event in _PROC:
+        return _BLOCK
     if event == "_winapi.CreateProcess":
-        return None if spawn_ok(args, ctx) else BLOCK
+        return None if _spawn_ok(args, ctx) else _BLOCK
     if event == "socket.bind":
-        if len(args) > 1 and loopback_addr(args[1]):
-            ctx.note_bound(args[0])
+        a = _sockaddr(args[1]) if _len(args) > 1 else None
+        if a is not None and a[0] in _LOOP:
+            _note(ctx, args[0])
             return None
-        return BLOCK
-    if event in NET_EVENTS:
+        return _BLOCK
+    if event in _NET:
         # 回环不过防火墙（本机 epsilon-boot、p2p、推理、rpc 都在听）：只许连本进程自己 bind 的端口
-        if len(args) > 1 and loopback_addr(args[1]) and len(args[1]) > 1 and ctx.own_port(args[1][1]):
+        a = _sockaddr(args[1]) if _len(args) > 1 else None
+        if a is not None and a[0] in _LOOP and _own(ctx, a[1]):
             return None
-        return BLOCK
-    if event in DNS_EVENTS:
-        return None if loopback_lookup(event, args) else BLOCK
-    if event in PATH_ARGS:
-        for i in PATH_ARGS[event]:
-            if i < len(args) and isinstance(args[i], (str, bytes, os.PathLike)) and unc_or_device(args[i]):
-                return BLOCK  # fd、None（当前目录）不管
-        if event == "open" and args and isinstance(args[0], (str, bytes, os.PathLike)):
-            p = ctx.path(args[0])
-            if p.endswith(CODE_SUFFIXES) and not ctx.trusted(p):
-                return BLOCK  # 写 .py 再导入、在别处埋 .pth
-        if event in DEST_EVENTS and len(args) > 1 and isinstance(args[1], (str, bytes, os.PathLike)):
-            p = ctx.path(args[1])
-            if p.endswith(CODE_SUFFIXES) and not ctx.trusted(p):
-                return BLOCK
-        if event == "os.mkdir" and len(args) > 1 and args[1] == PRIVATE_MKDIR:
+        return _BLOCK
+    if event in _DNS:
+        return None if _lookup(event, args) else _BLOCK
+    idx = _PATHS.get(event)
+    if idx is not None:
+        opaque = False
+        for i in idx:
+            if i < _len(args):
+                x = args[i]
+                if _as_str(x) is not None:
+                    if _unc(x):
+                        return _BLOCK
+                elif _type(x) is not _int and _type(x) is not _bool and x is not None:
+                    opaque = True  # pathlib 之类：不调它的 __fspath__（fd、None 是当前目录，不管）
+        if event == "open" and _len(args) and _as_str(args[0]) is not None:
+            p = _path(args[0], ctx)
+            if _code_file(p) and not _trusted(p, ctx):
+                return _BLOCK  # 写 .py 再导入、在别处埋 .pth
+        if event in _DEST and _len(args) > 1 and _as_str(args[1]) is not None:
+            p = _path(args[1], ctx)
+            if _code_file(p) and not _trusted(p, ctx):
+                return _BLOCK
+        if event == "os.mkdir" and _len(args) > 1 and _type(args[1]) is _int and args[1] == _M700:
             return ("count", "os.mkdir.0o700")
-        return None
+        return _OPAQUE if opaque else None
     if event == "import":
-        for entry in (args[2] if len(args) > 2 and args[2] else ()):
-            if not isinstance(entry, (str, bytes, os.PathLike)):
-                return BLOCK
-            if unc_or_device(entry) or not ctx.trusted(ctx.path(entry)):
-                return BLOCK
-        if len(args) > 1 and isinstance(args[1], str) and ntpath.isabs(args[1]) and not ctx.trusted(norm(args[1])):
-            return BLOCK
+        path = args[2] if _len(args) > 2 else None
+        if path:
+            if _type(path) is not _list and _type(path) is not _tuple:
+                return _BLOCK
+            for entry in path:
+                s = _as_str(entry)
+                if s is None or _unc(s) or not _trusted(_path(s, ctx), ctx):
+                    return _BLOCK
+        fn = _as_str(args[1]) if _len(args) > 1 else None
+        if fn is not None and _isabs(fn) and not _trusted(_norm(fn), ctx):
+            return _BLOCK
         return None
     if event == "ctypes.dlopen":
-        name = args[0] if args else None
-        if isinstance(name, (str, bytes)) and ("\\" in os.fsdecode(name) or "/" in os.fsdecode(name)):
-            p = ctx.path(name)
-            if unc_or_device(name) or not (within(p, ctx.env_dir) or within(p, ctx.system32)):
-                return BLOCK
-        return LOG
-    if event in COUNT_EVENTS:
+        name = _as_str(args[0]) if _len(args) else None
+        if name is not None and ("\\" in name or "/" in name):
+            p = _path(name, ctx)
+            if _unc(name) or not (_within(p, ctx[1]) or _within(p, ctx[3])):
+                return _BLOCK
+        return _LOG
+    if event in _COUNT:
         return ("count", event)
     if event == "compile":
-        if code_origin(args[1] if len(args) > 1 else None, ctx) == "import":
+        if _origin(args[1] if _len(args) > 1 else None, ctx) == "import":
             return ("count", "compile.import")
-        return LOG
+        return _LOG
     if event == "exec":
-        fn = getattr(args[0], "co_filename", None) if args else None
-        if code_origin(fn, ctx) == "import":
+        fn = args[0].co_filename if _len(args) and _type(args[0]) is _Code else None
+        if _origin(fn, ctx) == "import":
             return ("count", "exec.import")
-        return LOG
-    if event in REG_WRITE_EVENTS:
-        return BLOCK
-    if event in ("os.putenv", "os.unsetenv"):
-        key = args[0] if args else ""
-        if isinstance(key, bytes):
-            key = key.decode("ascii", "replace")
+        return _LOG
+    if event in _REG:
+        return _BLOCK
+    if event == "os.putenv" or event == "os.unsetenv":
+        key = _as_str(args[0]) if _len(args) else None
         # 改 EPSILON_JOB_DIR 再起 multiprocessing 子进程，子进程的钩子就按别的目录判了
-        if isinstance(key, str) and key.upper().startswith("EPSILON_"):
-            return BLOCK
+        if key is not None and key.upper().startswith("EPSILON_"):
+            return _BLOCK
         return None
-    if event in LOG_EVENTS:
-        return LOG
+    if event in _LOGS:
+        return _LOG
     return None
 
 
-def short_args(event, args):
-    if event in ("compile",):
-        return repr(args[1] if len(args) > 1 else None)
+def one_repr(x, _type=type, _str=str, _bytes=bytes, _repr=repr, _int=int, _float=float, _bool=bool, _None=type(None),
+             _as_str=as_str,
+             _obj_repr=object.__repr__, _type_repr=type.__repr__, _issub=issubclass, _catch=CATCH):
+    """一个参数的简短表示：内建类型原样（截断），别的只写类型和地址（不调任务的 __repr__）。"""
+    t = _type(x)
+    if t is _str or t is _bytes:
+        return _repr(x[:200])
+    if t is _int or t is _float or t is _bool or t is _None:
+        try:
+            return _repr(x)
+        except _catch:  # 超长的 int
+            return "<int>"
+    s = _as_str(x)
+    if s is not None:
+        return _repr(s[:200])
+    if _issub(t, _type):
+        return _type_repr(x)  # 类：<class 'x.Y'>（C 实现，不调元类的方法）
+    return _obj_repr(x)
+
+
+def short_args(event, args, _len=len, _type=type, _tuple=tuple, _list=list, _bytes=bytes, _bytearray=bytearray,
+               _Code=types.CodeType, _one=one_repr, _max=ARGS_MAX):
+    if event == "compile":
+        return _one(args[1] if _len(args) > 1 else None)
     if event == "exec":
-        return repr(getattr(args[0], "co_filename", None) if args else None)
+        return _one(args[0].co_filename if _len(args) and _type(args[0]) is _Code else None)
     if event == "marshal.loads":
-        return "len=%d" % (len(args[0]) if args and hasattr(args[0], "__len__") else -1)
-    s = _repr.repr(args)
-    return s.encode("ascii", "backslashreplace").decode("ascii")[:ARGS_MAX]
+        t = _type(args[0]) if _len(args) else None
+        return "len=%d" % (_len(args[0]) if t is _bytes or t is _bytearray else -1)
+    parts = []
+    for x in args[:8]:
+        t = _type(x)
+        if t is _tuple or t is _list:
+            inner = []
+            for y in x[:8]:
+                inner.append(_one(y))
+            parts.append(("(%s)" if t is _tuple else "[%s]") % ", ".join(inner))
+        else:
+            parts.append(_one(x))
+    s = "(" + ", ".join(parts) + ")"
+    return s.encode("ascii", "backslashreplace").decode("ascii")[:_max]
 
 
-def ready_record(job_dir, rid, now=time.time, pid=os.getpid, ppid=os.getppid):
-    """就绪记录。job_dir 是这个进程拿到的 EPSILON_JOB_DIR：探针核对，和任务目录不一致就当篡改（整树杀）。"""
-    r = {"t": round(now(), 3), "ev": "ready", "pid": pid(), "ppid": ppid(), "il": "low" if rid <= 0x1000 else hex(rid),
-         "job_dir": job_dir, "file": __file__, "layer": sys.prefix}
-    return (json.dumps(r, ensure_ascii=True) + "\n").encode("ascii")
-
-
-def record(event, act, args, n=None, now=time.time, pid=os.getpid):
-    r = {"t": round(now(), 3), "pid": pid(), "ev": event, "act": act, "args": short_args(event, args)}
+def record(event, act, args, n=None, _now=time.time, _pid=os.getpid, _enc=_json.encode_basestring_ascii, _repr=repr,
+           _round=round, _short=short_args):
+    """一条审计记录（一行 JSON，ASCII）。不用 json 模块：json.dumps 能被换掉。"""
+    s = ('{"t":' + _repr(_round(_now(), 3)) + ',"pid":' + _repr(_pid()) + ',"ev":' + _enc(event) + ',"act":' + _enc(act)
+         + ',"args":' + _enc(_short(event, args)))
     if n is not None:
-        r["n"] = n
+        s += ',"n":' + _repr(n)
+    return (s + "}\n").encode("ascii")
+
+
+def ready_record(job_dir, rid, privs, now=time.time, pid=os.getpid, ppid=os.getppid):
+    """就绪记录（装钩子时、用户代码之前写）。job_dir 是这个进程拿到的 EPSILON_JOB_DIR：探针核对，和任务目录不一致就当篡改（整树杀）。
+    il、privs 是降级、删特权之后的令牌：探针也核对（审查 #17 第 2 条：层里的 sitecustomize 写错了，金丝雀测得出来）。"""
+    r = {"t": round(now(), 3), "ev": "ready", "pid": pid(), "ppid": ppid(), "il": "low" if rid <= 0x1000 else hex(rid),
+         "privs": list(privs), "job_dir": job_dir, "file": __file__, "layer": sys.prefix}
     return (json.dumps(r, ensure_ascii=True) + "\n").encode("ascii")
+
+
+def _ours(roots, _FunctionType=types.FunctionType):
+    """roots 和它们默认参数里（递归）的函数：钩子认得它们，改 __code__ / __defaults__ 就拦。只在装钩子时用。"""
+    seen, todo = {}, list(roots)
+    while todo:
+        f = todo.pop()
+        if type(f) is _FunctionType and id(f) not in seen:
+            seen[id(f)] = f
+            todo.extend(f.__defaults__ or ())
+    return frozenset(seen)
 
 
 def make_hook(ctx, write):
-    """write(bytes) 一次写完一条；写不出去由 write 自己 os._exit。"""
-    local = threading.local()
-    counts = {}
+    """write(bytes) 一次写完一条；写不出去由 write 自己 os._exit。ctx 是 Ctx(...) 的元组。"""
+    ours = _ours([decide, record, write])
 
-    def hook(event, args):
-        if getattr(local, "busy", False):
-            return  # 钩子自己触发的事件
-        local.busy = True
-        try:
-            verdict = decide(event, args, ctx)
-            if verdict is None:
-                return
-            act, key = verdict
-            if act == "count":
-                n = counts.get(key, 0) + 1
-                counts[key] = n
-                if n <= COUNT_KEEP or n % COUNT_EVERY == 0:
-                    write(record(key, "count", args, n=n))
-                return
-            write(record(event, act, args))
-        finally:
-            local.busy = False
+    def hook(event, args, _ctx=ctx, _write=write, _counts={}, _decide=decide, _record=record, _ours=ours, _id=id,
+             _len=len, _Err=PermissionError, _keep=COUNT_KEEP, _every=COUNT_EVERY, _BLOCK=BLOCK):
+        if event == "object.__setattr__" and _len(args) and _id(args[0]) in _ours:
+            verdict = _BLOCK
+        else:
+            verdict = _decide(event, args, _ctx)
+        if verdict is None:
+            return
+        act, key = verdict
+        if act == "count":
+            n = _counts.get(key, 0) + 1
+            _counts[key] = n
+            if n <= _keep or n % _every == 0:
+                _write(_record(key, "count", args, n))
+            return
+        _write(_record(event, act, args))
         if act == "block":
-            raise PermissionError("epsilon 沙箱拦截: %s" % event)
+            raise _Err("epsilon 沙箱拦截: %s" % event)
 
     return hook
 
@@ -474,16 +635,18 @@ def _open_pipe():
         k32.WaitNamedPipeW(PIPE, 1000)
 
 
-def _writer(fd):
-    lock = threading.Lock()
+def _writer(fd, _w=os.write, _x=os._exit, _RLock=threading.RLock, _c=EXIT_HOOK_FAILED, _B=BaseException):
+    """write(bytes)：一次写完一条。依赖都绑成默认参数（os.write 被换掉也照样写管道）。
+    RLock：钩子运行中触发的终结器也会写记录（同一个线程）；不可重入的锁会死锁。"""
+    lock = _RLock()
 
-    def write(b):
+    def write(b, _fd=fd, _lock=lock, _write=_w, _exit=_x, _code=_c, _Base=_B):
         try:
-            with lock:
+            with _lock:
                 while b:
-                    b = b[os.write(fd, b):]
-        except BaseException:
-            os._exit(EXIT_HOOK_FAILED)  # 管道断了：探针那边已经当篡改处理，这边不能没有记录地接着跑
+                    b = b[_write(_fd, b):]
+        except _Base:
+            _exit(_code)  # 管道断了：探针那边已经当篡改处理，这边不能没有记录地接着跑
 
     return write
 
@@ -500,13 +663,13 @@ def _install():
     global INSTALLED
     fd = _open_pipe()
     rid = lower_integrity()
-    drop_privileges()
+    privs = drop_privileges()
     job_dir = os.environ["EPSILON_JOB_DIR"]
     ctx = Ctx(job_dir, ntpath.dirname(sys.executable), sys.executable, os.environ.get("SystemRoot", "C:\\Windows"))
     write = _writer(fd)
     sys.addaudithook(make_hook(ctx, write))
     INSTALLED = True
-    write(ready_record(job_dir, rid))
+    write(ready_record(job_dir, rid, privs))
 
 
 def _main():

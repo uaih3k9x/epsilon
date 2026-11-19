@@ -29,17 +29,18 @@ const (
 
 // Record 是审计管道里的一行（sitecustomize 写，一行一个 JSON）。
 type Record struct {
-	T     float64 `json:"t"`
-	Pid   int     `json:"pid"`
-	PPid  int     `json:"ppid,omitempty"`
-	Ev    string  `json:"ev"`
-	Act   string  `json:"act,omitempty"` // block / log / count；就绪记录没有
-	N     int     `json:"n,omitempty"`   // count 类：这个进程里累计多少次
-	Args  string  `json:"args,omitempty"`
-	IL    string  `json:"il,omitempty"`      // 就绪：完整性级别
-	Dir   string  `json:"job_dir,omitempty"` // 就绪：这个进程拿到的 EPSILON_JOB_DIR
-	File  string  `json:"file,omitempty"`    // 就绪：sitecustomize 的路径
-	Layer string  `json:"layer,omitempty"`   // 就绪：环境层（sys.prefix）
+	T     float64  `json:"t"`
+	Pid   int      `json:"pid"`
+	PPid  int      `json:"ppid,omitempty"`
+	Ev    string   `json:"ev"`
+	Act   string   `json:"act,omitempty"` // block / log / count；就绪记录没有
+	N     int      `json:"n,omitempty"`   // count 类：这个进程里累计多少次
+	Args  string   `json:"args,omitempty"`
+	IL    string   `json:"il,omitempty"`      // 就绪：完整性级别（"low" 或十六进制 RID）
+	Privs []string `json:"privs,omitempty"`   // 就绪：删完以后令牌里剩下的特权
+	Dir   string   `json:"job_dir,omitempty"` // 就绪：这个进程拿到的 EPSILON_JOB_DIR
+	File  string   `json:"file,omitempty"`    // 就绪：sitecustomize 的路径
+	Layer string   `json:"layer,omitempty"`   // 就绪：环境层（sys.prefix）
 }
 
 // Summary 写进 summary.json 的 audit（能力 35）。
@@ -154,6 +155,26 @@ func (l *Log) Summary(mainPid int) Summary {
 	return s
 }
 
+// KeepPrivilege 是任务令牌里唯一许剩下的特权（绕过遍历检查：没有它连自己的任务目录都走不进去）。
+const KeepPrivilege = "SeChangeNotifyPrivilege"
+
+// ReadyOK：就绪记录说这个进程已经降到 Low IL、特权只剩 SeChangeNotify。降级和删特权都在层里的 sitecustomize 里做，
+// 它写错了（包了 try/except、调换了顺序），系统控制金丝雀（自己调自己那份）测不出来，只有这里核对得到。
+func ReadyOK(r Record) bool {
+	return r.IL == "low" && len(r.Privs) == 1 && r.Privs[0] == KeepPrivilege
+}
+
+// Readies 返回所有进程的就绪记录（拷贝，按 pid 无序）。
+func (l *Log) Readies() []Record {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]Record, 0, len(l.ready))
+	for _, r := range l.ready {
+		out = append(out, r)
+	}
+	return out
+}
+
 // ReadyOf 返回某个进程的就绪记录。
 func (l *Log) ReadyOf(pid int) (Record, bool) {
 	l.mu.Lock()
@@ -185,7 +206,8 @@ func (l *Log) Bytes() []byte {
 //   - 主进程恢复运行后 readyTimeout 内没收到它的就绪 → AbortNoReady；
 //   - 主进程的连接断了、grace 内 Stop 没来（进程还在跑）→ AbortAudit；
 //   - 任何连接上记录格式不对、第一条不是就绪、pid 和就绪的对不上 → AbortAudit；
-//   - 就绪记录的 job_dir 不是这个任务的目录 → AbortAudit（子进程的环境块被换了，它的钩子按别的目录判）。
+//   - 就绪记录的 job_dir 不是这个任务的目录 → AbortAudit（子进程的环境块被换了，它的钩子按别的目录判）；
+//   - 就绪记录的 il 不是 low、特权没删干净 → AbortAudit（ReadyOK）。
 type watcher struct {
 	log          *Log
 	jobDir       string
@@ -259,7 +281,7 @@ func (w *watcher) Serve(r io.Reader) {
 		}
 		rec, perr := w.log.Add(bytes.TrimRight(line, "\r\n"))
 		switch {
-		case perr != nil, pid == 0 && (rec.Ev != "ready" || !sameDir(rec.Dir, w.jobDir)), pid != 0 && rec.Pid != pid:
+		case perr != nil, pid == 0 && (rec.Ev != "ready" || !sameDir(rec.Dir, w.jobDir) || !ReadyOK(rec)), pid != 0 && rec.Pid != pid:
 			w.send(auditEvent{kind: evBad})
 			return
 		case pid == 0:

@@ -233,6 +233,88 @@ def _():
     return got.lower() == CFG["desktop"].lower(), got
 
 
+@check("winsta0_denied")
+def _():
+    # 审查 #17 第 3 条：CreateProcessWithLogonW 可能把调用者（探针 = 登录桌面的学生会话）的登录 SID 放进任务令牌，
+    # 而 WinSta0 和 WinSta0\\Default 的 DACL 正是按这个登录 SID 授权的。lpDesktop 只决定进程起在哪个桌面，挡不住任务主动打开交互桌面
+    # 截屏、轮询按键。WINSTA_ENUMERATE|WINSTA_READSCREEN 在通用映射里算"读"，Low IL 不受 NW 标签限制：必须错误 5
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    u32.OpenWindowStationW.restype = wintypes.HANDLE
+    u32.OpenWindowStationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
+    u32.CloseWindowStation.argtypes = [wintypes.HANDLE]
+    u32.GetProcessWindowStation.restype = wintypes.HANDLE
+    u32.SetProcessWindowStation.argtypes = [wintypes.HANDLE]
+    u32.OpenDesktopW.restype = wintypes.HANDLE
+    u32.OpenDesktopW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    u32.CloseDesktop.argtypes = [wintypes.HANDLE]
+    h = u32.OpenWindowStationW("WinSta0", False, 0x0100 | 0x0200)  # WINSTA_ENUMERATE | WINSTA_READSCREEN
+    if not h:
+        err = ctypes.get_last_error()
+        return err == 5, "OpenWindowStationW(WinSta0) 错误 %d" % err
+    detail = "打开了 WinSta0（任务令牌里多半有交互会话的登录 SID，见 token_groups）"
+    old = u32.GetProcessWindowStation()
+    try:
+        if u32.SetProcessWindowStation(h):
+            try:
+                d = u32.OpenDesktopW("Default", 0, False, 0x0001)  # DESKTOP_READOBJECTS
+                if d:
+                    u32.CloseDesktop(d)
+                    detail += "；WinSta0\\Default 也打开了（能截学生的屏）"
+                else:
+                    detail += "；WinSta0\\Default 错误 %d" % ctypes.get_last_error()
+            finally:
+                u32.SetProcessWindowStation(old)
+    finally:
+        u32.CloseWindowStation(h)
+    return False, detail
+
+
+@check("token_groups")
+def _():
+    # 令牌里不许有 Users 以外的本机组（Administrators、Backup Operators……不管是直接还是经 Authenticated Users 之类嵌套进来的，
+    # 只当拒绝用的不算）。登录 SID（S-1-5-5-x-y）写进证据，winsta0_denied 不过时对照探针的
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.LocalFree.argtypes = [ctypes.c_void_p]
+    adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    adv.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                                        ctypes.POINTER(wintypes.DWORD)]
+    adv.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+
+    class SidAndAttributes(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+    token = wintypes.HANDLE()
+    if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        need = wintypes.DWORD()
+        adv.GetTokenInformation(token, 2, None, 0, ctypes.byref(need))  # TokenGroups
+        buf = ctypes.create_string_buffer(need.value)
+        if not adv.GetTokenInformation(token, 2, buf, need, ctypes.byref(need)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        k32.CloseHandle(token)
+    n = wintypes.DWORD.from_buffer(buf).value
+    groups = (SidAndAttributes * n).from_buffer(buf, ctypes.sizeof(ctypes.c_void_p))  # GroupCount 之后按指针对齐
+    out = []
+    for g in groups:
+        p = wintypes.LPWSTR()
+        if not adv.ConvertSidToStringSidW(g.Sid, ctypes.byref(p)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        out.append((p.value, g.Attributes))
+        k32.LocalFree(p)
+    bad = [s for s, a in out if s.startswith("S-1-5-32-") and s != "S-1-5-32-545" and not a & 0x10]  # SE_GROUP_USE_FOR_DENY_ONLY
+    logon = [s for s, a in out if a & 0xC0000000 == 0xC0000000]  # SE_GROUP_LOGON_ID
+    return not bad, "Users 以外的本机组 %s；登录 SID %s" % (",".join(bad) or "无", ",".join(logon) or "无")
+
+
 check("read_probe_json")(lambda: denied(lambda: open(CFG["probe_json"], "rb").close()))
 check("read_secrets")(lambda: denied(lambda: os.listdir(CFG["secrets_dir"])))
 # D: 不被还原，根上默认 Users 可读：学生、老师的文件和别的软件的配置都在那里

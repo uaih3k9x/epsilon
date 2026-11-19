@@ -116,6 +116,31 @@ def _():
     return blocked(lambda: ctypes.CDLL(dll))
 
 
+@check("tamper_globals_blocked")
+def _():
+    # 审查 #17 第 1 条：任务用纯 Python 改 sitecustomize 的模块全局、标准库函数，不触发审计事件；钩子不能因此失效
+    import ntpath
+    sc = sys.modules.get("sitecustomize")
+    if sc is None:
+        return False, "没有 sitecustomize"
+    saved, np, fsp = dict(vars(sc)), ntpath.normpath, os.fspath
+    try:
+        for k in saved:
+            if not k.startswith("__"):
+                setattr(sc, k, None)
+        ntpath.normpath = lambda p: CFG["job_dir"] + "\\code\\x"
+        os.fspath = lambda p: CFG["job_dir"] + "\\code\\x"
+        for name, fn in [("os.system", lambda: os.system("rem")), ("unc", lambda: os.mkdir(UNC)),
+                         ("loopback", lambda: socket.create_connection(("127.0.0.1", 9), timeout=5))]:
+            ok, detail = blocked(fn)
+            if not ok:
+                return False, name + ": " + detail
+        return True
+    finally:
+        vars(sc).update(saved)
+        ntpath.normpath, os.fspath = np, fsp
+
+
 @check("mp_child")
 def _():
     import multiprocessing

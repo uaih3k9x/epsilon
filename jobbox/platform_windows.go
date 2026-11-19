@@ -427,15 +427,11 @@ func (p *winPlatform) Start(l jobrun.Launch) (jobrun.Proc, error) {
 
 // ---- 审计管道 ----
 
-type pipeServer struct {
-	sd     uintptr
-	mu     sync.Mutex
-	next   syscall.Handle
-	closed bool
-}
+// winPipeOps 是 pipeServer（pipeserver.go）在 Windows 上的系统调用。
+type winPipeOps struct{ sd uintptr }
 
-func createPipe(sd uintptr, first bool) (syscall.Handle, error) {
-	sa := syscall.SecurityAttributes{Length: uint32(unsafe.Sizeof(syscall.SecurityAttributes{})), SecurityDescriptor: sd}
+func (o *winPipeOps) create(first bool) (uintptr, error) {
+	sa := syscall.SecurityAttributes{Length: uint32(unsafe.Sizeof(syscall.SecurityAttributes{})), SecurityDescriptor: o.sd}
 	mode := uint32(pipeAccessInbound)
 	if first {
 		mode |= fileFlagFirstPipeInstance // 有人先建了同名管道就建不出来：不跑
@@ -445,7 +441,39 @@ func createPipe(sd uintptr, first bool) (syscall.Handle, error) {
 	if syscall.Handle(h) == syscall.InvalidHandle {
 		return 0, fmt.Errorf("建审计管道: %v", err)
 	}
-	return syscall.Handle(h), nil
+	return h, nil
+}
+
+func (o *winPipeOps) connect(h uintptr) error {
+	r, _, err := procConnectNamedPipe.Call(h, 0)
+	if r == 0 && err != syscall.Errno(errorPipeConnected) {
+		return err
+	}
+	return nil
+}
+
+func (o *winPipeOps) wake() {
+	for i := 0; i < 5; i++ {
+		c, err := syscall.CreateFile(utf16p(AuditPipe), genericWrite, 0, nil, syscall.OPEN_EXISTING, 0, 0)
+		if err == nil {
+			syscall.CloseHandle(c)
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func (o *winPipeOps) closeHandle(h uintptr) { syscall.CloseHandle(syscall.Handle(h)) }
+
+func (o *winPipeOps) conn(h uintptr) io.ReadCloser {
+	return &pipeConn{File: os.NewFile(h, "audit"), h: syscall.Handle(h)}
+}
+
+func (o *winPipeOps) release() {
+	go func() { // 等 Accept 收尾再释放安全描述符
+		time.Sleep(time.Second)
+		procLocalFree.Call(o.sd)
+	}()
 }
 
 func (p *winPlatform) Audit() (AuditServer, error) {
@@ -457,12 +485,12 @@ func (p *winPlatform) Audit() (AuditServer, error) {
 	if err != nil {
 		return nil, err
 	}
-	h, err := createPipe(sd, true)
+	srv, err := newPipeServer(&winPipeOps{sd: sd})
 	if err != nil {
 		procLocalFree.Call(sd)
 		return nil, err
 	}
-	return &pipeServer{sd: sd, next: h}, nil
+	return srv, nil
 }
 
 type pipeConn struct {
@@ -478,61 +506,6 @@ func (c *pipeConn) Close() error {
 		procCancelIoEx.Call(uintptr(c.h), 0)
 	})
 	return c.File.Close()
-}
-
-func (s *pipeServer) Accept() (io.ReadCloser, error) {
-	s.mu.Lock()
-	h, closed := s.next, s.closed
-	s.mu.Unlock()
-	if closed || h == 0 {
-		return nil, errors.New("审计管道已关")
-	}
-	r, _, err := procConnectNamedPipe.Call(uintptr(h), 0)
-	if r == 0 && err != syscall.Errno(errorPipeConnected) {
-		s.mu.Lock()
-		s.next = 0
-		s.mu.Unlock()
-		syscall.CloseHandle(h)
-		return nil, fmt.Errorf("ConnectNamedPipe: %v", err)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed { // Close 自己连上来叫醒的
-		s.next = 0
-		syscall.CloseHandle(h)
-		return nil, errors.New("审计管道已关")
-	}
-	next, err := createPipe(s.sd, false) // 先建好下一个实例，子进程连得上
-	if err != nil {
-		s.next = 0
-	} else {
-		s.next = next
-	}
-	return &pipeConn{File: os.NewFile(uintptr(h), "audit"), h: h}, nil
-}
-
-func (s *pipeServer) Close() error {
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		return nil
-	}
-	s.closed = true
-	s.mu.Unlock()
-	// ConnectNamedPipe 阻塞着：自己当客户端连一下把它叫醒
-	for i := 0; i < 5; i++ {
-		c, err := syscall.CreateFile(utf16p(AuditPipe), genericWrite, 0, nil, syscall.OPEN_EXISTING, 0, 0)
-		if err == nil {
-			syscall.CloseHandle(c)
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	go func() { // 等 Accept 收尾再释放安全描述符
-		time.Sleep(time.Second)
-		procLocalFree.Call(s.sd)
-	}()
-	return nil
 }
 
 // ---- 清场 ----

@@ -344,8 +344,8 @@ func (b *Box) Run(ctx context.Context, j Job) (res Result, err error) {
 	return b.runJob(ctx, j, env) // 清场和收回在 defer 里，写进返回的 res
 }
 
-// hookWant 是钩子金丝雀的单子加上探针从审计管道核对的三项。
-var hookWant = append(append([]string{}, HookChecks...), "ready_main", "ready_in_layer", "ready_child")
+// hookWant 是钩子金丝雀的单子加上探针从审计管道核对的四项。
+var hookWant = append(append([]string{}, HookChecks...), "ready_main", "ready_in_layer", "ready_child", "ready_low_il")
 
 // resetScratch 清空 tmp\ 和 output\（金丝雀留下的），建好 home 和缓存目录。
 func (b *Box) resetScratch(dir string) error {
@@ -381,6 +381,16 @@ func (b *Box) startFailed(err error) error {
 	return rejectf("起不来: %v", err)
 }
 
+// canaryStartFailed：金丝雀的程序（环境层的 python.exe）、工作目录、参数全是探针自己生成的，任务改不了，
+// 所以起不来一律是本机的问题（层损坏、ACL 漂移……）：停接、换一台。startError 的"任务类"分类只给 runJob 用。
+func (b *Box) canaryStartFailed(err error) error {
+	var le *LogonError
+	if errors.As(err, &le) {
+		return b.machine(le.Error() + "，重跑 install.ps1")
+	}
+	return b.machine("金丝雀起不来（程序、目录、参数都是探针生成的，是本机的问题）: " + err.Error())
+}
+
 // launch 起一个金丝雀、等它结束（最多 CanaryTimeout），返回它写的 stdout。see 为真时核对清场看得见它。
 func (b *Box) launch(ctx context.Context, j Job, env, args []string, onStart func(int), see bool) ([]byte, error) {
 	path := filepath.Join(j.Dir, "canary.out")
@@ -395,7 +405,7 @@ func (b *Box) launch(ctx context.Context, j Job, env, args []string, onStart fun
 	}
 	p, err := b.P.Start(l)
 	if err != nil {
-		return nil, b.startFailed(err)
+		return nil, b.canaryStartFailed(err)
 	}
 	defer p.Close()
 	if onStart != nil {
@@ -478,6 +488,13 @@ func (b *Box) hookCanary(ctx context.Context, j Job, env []string, cf canaryPath
 	line("ready_main", ok, "主进程的就绪记录（没有 = 环境层没有审计钩子）")
 	line("ready_in_layer", ok && within(r.File, j.EnvDir), "sitecustomize 要在环境层里: "+r.File)
 	line("ready_child", log.ChildReady(main), "multiprocessing 子进程的就绪记录")
+	var bad []string
+	for _, rr := range log.Readies() {
+		if !ReadyOK(rr) {
+			bad = append(bad, fmt.Sprintf("pid %d il=%q privs=%v", rr.Pid, rr.IL, rr.Privs))
+		}
+	}
+	line("ready_low_il", ok && len(bad) == 0, "主进程和子进程都要 il=low、只剩 "+KeepPrivilege+" "+strings.Join(bad, "; "))
 	return append(out, extra.String()...), nil
 }
 

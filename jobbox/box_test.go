@@ -1,6 +1,7 @@
 package jobbox
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -79,6 +80,7 @@ type plat struct {
 	hookReady bool
 	hookFile  string
 	hookChild bool
+	childIL   string                                           // multiprocessing 子进程就绪记录里的 il；空 = "low"
 	job       func(l jobrun.Launch, a *fakeAudit, p *fakeProc) // 任务进程干什么（goroutine 里跑）
 	jobEnv    []string
 	tmpAtJob  []string
@@ -190,10 +192,10 @@ func (f *plat) Start(l jobrun.Launch) (jobrun.Proc, error) {
 		go func() {
 			if f.hookReady {
 				w := a.dial()
-				fmt.Fprintf(w, `{"t":1,"ev":"ready","pid":110,"ppid":1,"il":"low","job_dir":%q,"file":%q,"layer":"x"}`+"\n", jobDirOf(l), f.hookFile)
+				fmt.Fprintf(w, `{"t":1,"ev":"ready","pid":110,"ppid":1,"il":"low","privs":["SeChangeNotifyPrivilege"],"job_dir":%q,"file":%q,"layer":"x"}`+"\n", jobDirOf(l), f.hookFile)
 				if f.hookChild {
 					c := a.dial()
-					fmt.Fprintf(c, `{"t":1,"ev":"ready","pid":111,"ppid":110,"il":"low","job_dir":%q,"file":"x","layer":"x"}`+"\n", jobDirOf(l))
+					fmt.Fprintf(c, `{"t":1,"ev":"ready","pid":111,"ppid":110,"il":%q,"privs":["SeChangeNotifyPrivilege"],"job_dir":%q,"file":"x","layer":"x"}`+"\n", cmp.Or(f.childIL, "low"), jobDirOf(l))
 					c.Close()
 				}
 				w.Close()
@@ -221,7 +223,7 @@ func jobDirOf(l jobrun.Launch) string { return envMap(l.Env)["EPSILON_JOB_DIR"] 
 func readyJob(code int) func(jobrun.Launch, *fakeAudit, *fakeProc) {
 	return func(l jobrun.Launch, a *fakeAudit, p *fakeProc) {
 		w := a.dial()
-		fmt.Fprintf(w, `{"t":1,"ev":"ready","pid":200,"ppid":1,"il":"low","job_dir":%q,"file":"x","layer":"x"}`+"\n", jobDirOf(l))
+		fmt.Fprintf(w, `{"t":1,"ev":"ready","pid":200,"ppid":1,"il":"low","privs":["SeChangeNotifyPrivilege"],"job_dir":%q,"file":"x","layer":"x"}`+"\n", jobDirOf(l))
 		fmt.Fprintln(w, `{"t":2,"pid":200,"ev":"socket.connect","act":"block","args":"x"}`)
 		time.Sleep(20 * time.Millisecond)
 		w.Close()
@@ -540,7 +542,7 @@ func TestJobAuditDisconnectIsFailedNotRejected(t *testing.T) {
 	r := newRig(t, func(p *plat) {
 		p.job = func(l jobrun.Launch, a *fakeAudit, p *fakeProc) {
 			w := a.dial()
-			fmt.Fprintf(w, `{"t":1,"ev":"ready","pid":200,"ppid":1,"il":"low","job_dir":%q,"file":"x","layer":"x"}`+"\n", jobDirOf(l))
+			fmt.Fprintf(w, `{"t":1,"ev":"ready","pid":200,"ppid":1,"il":"low","privs":["SeChangeNotifyPrivilege"],"job_dir":%q,"file":"x","layer":"x"}`+"\n", jobDirOf(l))
 			w.Close() // 任务把审计管道关了，自己接着跑
 			<-p.done
 		}
@@ -732,5 +734,31 @@ func TestSelfTestPrintsTable(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(r.b.Root, "jobs", "_selftest")); err == nil {
 		t.Fatal("自检的目录要删掉")
+	}
+}
+
+func TestHookCanaryChildMustBeLowIL(t *testing.T) {
+	// 审查 #17 第 2 条：主进程、multiprocessing 子进程的就绪记录都要 il=low、只剩 SeChangeNotify
+	r := newRig(t, func(p *plat) { p.childIL = "0x2000" })
+	_, err := r.run()
+	expectReject(t, err, "ready_low_il")
+	if strings.Contains(r.calls(), "start-job") {
+		t.Fatal("钩子金丝雀不符就不起任务")
+	}
+}
+
+func TestCanaryStartFailureIsTheMachine(t *testing.T) {
+	// 审查 #17 第 7 条：金丝雀的程序、目录、参数全是探针自己生成的，起不来（2、193、267……）只可能是本机的问题：
+	// 停接、换一台；不能把每个派来的任务都永久判 rejected（本机成了黑洞）
+	for _, k := range []string{"sys", "hook"} {
+		r := newRig(t, func(p *plat) {
+			p.startErr[k] = errors.New("CreateProcessWithLogonW: 系统找不到指定的文件（2）")
+		})
+		_, err := r.run()
+		expectReject(t, err, "找不到")
+		expectRetry(t, err, true)
+		if !strings.Contains(r.b.Halted(), "金丝雀") {
+			t.Fatalf("%s 金丝雀起不来要停接: %q", k, r.b.Halted())
+		}
 	}
 }
