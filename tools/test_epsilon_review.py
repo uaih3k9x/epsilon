@@ -192,6 +192,92 @@ def test_native_false_positives(src):
     assert "native-api" not in rules(scan_py(src))
 
 
+# 2026-11-18 审查：相对导入、非字面 sys.modules 访问、AugAssign 折叠、nt._add_dll_directory、mmap prot 表达式
+NATIVE_REJECT_BYPASS = [
+    "import importlib\nk = importlib.import_module('.', 'ctypes').CDLL(None)",
+    "import importlib\nimportlib.import_module('.', package='ctypes').windll.kernel32.CreateFileW(1)",
+    "import importlib\nm = importlib.import_module('.wintypes', 'ctypes')",
+    "import importlib\nm = importlib.import_module('.util', package='ctypes')",
+    "import importlib\nm = importlib.import_module('..wintypes', 'ctypes.util')",
+    "m = __import__('', {'__package__': 'ctypes'}, None, ['CDLL'], 1).CDLL",
+    "m = __import__('util', {'__package__': 'ctypes'}, None, [], 1)",
+    "import importlib\nm = importlib.__import__('', {'__package__': 'ctypes'}, None, ['CDLL'], level=1)",
+    "import sys\nk = getattr(sys, 'modules')['ctypes'].CDLL('x')",
+    "import sys\nk = vars(sys)['modules']['ctypes'].CDLL('x')",
+    "import sys\nk = sys.__dict__['modules']['ctypes']",
+    "import os\nk = os.sys.modules.get('ctypes')",
+    "import os\nk = os.sys.modules['ctypes']",
+    "import sys\nk = getattr(sys, 'modules').get('ctypes')",
+    "import sys\nsm = getattr(sys, 'modules')\nk = sm['ctypes'].CDLL(None)",
+    "import nt\nnt._add_dll_directory(r'\\\\host\\share')",
+    "import os\nos._add_dll_directory('x')",
+    "import mmap\nm = mmap.mmap(-1, 4096, prot=1|2|4)",
+    "import mmap\nm = mmap.mmap(-1, 4096, prot=mmap.PROT_READ | 4)",
+]
+
+
+@pytest.mark.parametrize("src", NATIVE_REJECT_BYPASS)
+def test_native_bypass_rejected(src):
+    fs = scan_py(src)
+    assert "native-api" in rules(fs, REJECT), [(f.rule, f.level, f.message) for f in fs]
+
+
+@pytest.mark.parametrize("src", [
+    "import importlib\nm = importlib.import_module('.x', pkg)",
+    "m = __import__('x', g, None, [], 1)",
+    "m = __import__('x', {'__package__': p}, None, [], 1)",
+    "m = __import__('x', {}, None, [], n)",
+])
+def test_relative_import_unknown_package_needs_explanation(src):
+    assert "reflect-nonliteral" in rules(scan_py(src), EXPLAIN)
+
+
+def test_augassign_name_not_folded_to_wrong_value():
+    # += 之后的值随流程变，不折叠：按名字不是字面量报需解释，不能拿 'ctyp' 当模块名
+    fs = scan_py("m = 'ctyp'\nm += 'es'\n__import__(m)")
+    assert "reflect-nonliteral" in rules(fs, EXPLAIN)
+    assert not [f for f in fs if "'ctyp'" in f.message or "ctyp " in f.message]
+
+
+def test_augassign_name_not_folded_keeps_process_hint():
+    fs = scan_py("m = 'o'\nm += 's'\n__import__(m).system('x')")
+    assert "process-call" in rules(fs, EXPLAIN)
+    assert "reflect-nonliteral" in rules(fs, EXPLAIN)
+
+
+@pytest.mark.parametrize("src", [
+    "m = 'o'\ndef f():\n    global m\n    m = 'x'\n__import__(m).system('x')",
+    "m = 'o'\nm, n = 'x', 1\n__import__(m).system('x')",
+    "m = 'o'\nfor m in ('x',):\n    pass\n__import__(m).system('x')",
+])
+def test_rebound_name_not_folded(src):
+    assert "process-call" in rules(scan_py(src), EXPLAIN)
+
+
+def test_mmap_prot_nonliteral_needs_explanation():
+    fs = scan_py("import mmap\nm = mmap.mmap(-1, 4096, prot=p)")
+    assert "native-api" in rules(fs, EXPLAIN)
+    assert "native-api" not in rules(fs, REJECT)
+
+
+@pytest.mark.parametrize("src", [
+    "import mmap\nm = mmap.mmap(-1, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE)",
+    "import mmap\nm = mmap.mmap(-1, 4096, prot=1|2)",
+    "import importlib\nm = importlib.import_module('.models', 'mypkg')",
+    "import os\nos.sys.exit(0)",
+    "import sys\nv = getattr(sys, 'modules')['os'].getcwd()",
+])
+def test_native_bypass_fix_false_positives(src):
+    assert "native-api" not in rules(scan_py(src))
+
+
+def test_import_ctypes_reported_once_per_site():
+    fs = scan_py("import ctypes\nctypes.CDLL('a')\nctypes.CDLL('b')")
+    assert len([f for f in fs if f.rule == "native-api" and f.level == REJECT]) == 1
+    fs = scan_py("__import__('ctypes').CDLL('a')")
+    assert len([f for f in fs if f.rule == "native-api" and f.level == REJECT]) == 1
+
+
 def test_native_rule_bumped_rules_version():
     assert er.RULES_VERSION >= 2
 

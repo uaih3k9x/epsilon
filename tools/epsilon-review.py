@@ -498,7 +498,7 @@ for _m in ("winreg", "_winreg", "_overlapped"):
 _NATIVE_SEGMENTS = set(_NATIVE_MODULES) | {"ctypeslib"}
 # 接收者认不出来时（模块经参数传进来、numpy 数组的 .ctypes）取这些属性：需解释
 _OPAQUE_NATIVE = _NATIVE_SEGMENTS | {"windll", "oledll", "cdll", "pydll", "pythonapi", "CDLL", "WinDLL", "OleDLL",
-                                     "PyDLL", "add_dll_directory"}
+                                     "PyDLL", "add_dll_directory", "_add_dll_directory"}
 for _m in ("socket", "_socket", "requests", "urllib", "urllib2", "urllib3", "http.client", "http.server", "httplib",
            "ftplib", "smtplib", "poplib", "imaplib", "telnetlib", "nntplib", "xmlrpc", "socketserver", "paramiko",
            "aiohttp", "httpx", "websocket", "websockets", "pycurl", "wget"):
@@ -530,7 +530,7 @@ FUNC_RULES = [
     (r"sys\.addaudithook", REJECT, "audit-hook", "任务代码不该碰审计钩子（平台用它做运行时兜底）", "删掉"),
     (r"asyncio\.create_subprocess_(exec|shell)|platform\.popen", EXPLAIN, "process-call", "{q} 会起子进程",
      "送审单里说明起什么进程、参数从哪来"),
-    (r"os\.add_dll_directory|importlib\.machinery\.ExtensionFileLoader|mmap\.PROT_EXEC", REJECT, "native-api",
+    (r"os\._?add_dll_directory|importlib\.machinery\.ExtensionFileLoader|mmap\.PROT_EXEC", REJECT, "native-api",
      "{q}：加载本地二进制 / 可执行内存，" + _NATIVE_WHY, _NATIVE_HINT),
     (r"asyncio\.open_connection|asyncio\.start_server", EXPLAIN, "network", "{q} 会联网", "送审单里说明连哪、传什么"),
     (r"base64\.(b64decode|b32decode|b32hexdecode|b16decode|b85decode|a85decode|urlsafe_b64decode|standard_b64decode"
@@ -567,6 +567,9 @@ _CHECKED_LOADERS = {"torch.load", "torch.serialization.load", "numpy.load", "num
                     "numpy.lib.format.read_array", "yaml.load", "yaml.load_all", "yaml.full_load", "yaml.full_load_all"}
 _ALLOW_PICKLE_POS = {"numpy.load": 2, "numpy.lib.npyio.load": 2, "numpy.lib.format.read_array": 1}
 _DYN_IMPORT = {"builtins.__import__", "importlib.import_module", "importlib.__import__"}
+# mmap 的 prot 参数折叠用；ACCESS_* 是 Windows 版第 4 个位置参数（那里没有 prot），也认出来免得误报
+_MMAP_INTS = {"mmap.PROT_READ": 1, "mmap.PROT_WRITE": 2, "mmap.PROT_EXEC": 4, "mmap.ACCESS_DEFAULT": 0,
+              "mmap.ACCESS_READ": 1, "mmap.ACCESS_WRITE": 2, "mmap.ACCESS_COPY": 3}
 _IMPORT_MECH = re.compile(r"(importlib\.(import_module|__import__|util\..*|machinery\..*)|runpy\..*|builtins\.__import__"
                           r"|imp\..*|zipimport\..*|pkgutil\..*|pydoc\.locate)\Z")
 _IMPORT_STATE = {"sys.path", "sys.modules", "sys.meta_path", "sys.path_hooks", "sys.path_importer_cache"}
@@ -618,6 +621,8 @@ class _PyScan:
         self.bindings = {}      # (作用域, 名字) → 赋给它的表达式列表（一跳数据流，按函数分作用域）
         self.flagged_imports = set()
         self.parent = {}
+        self.rebound = set()    # 除了普通赋值还被改过的名字（+=、global、解包、del）：不做常量折叠
+        self.imported_tops = set()
 
     # ---------------------------------------------------------------- 工具
     def add(self, level, rule, node, message, hint=""):
@@ -636,8 +641,9 @@ class _PyScan:
             elif node.id in _BUILTINS:
                 r.add("builtins." + node.id)   # 就算被重新赋值也照样认：flow-insensitive，宁可多报
             return r
-        if isinstance(node, ast.Attribute):
-            return {f"{b}.{node.attr}" for b in self.resolve(node.value, depth + 1)}
+        if isinstance(node, ast.Attribute):    # os.sys 就是 sys
+            return {"sys" if node.attr == "sys" and b and not b.startswith("?") else f"{b}.{node.attr}"
+                    for b in self.resolve(node.value, depth + 1)}
         if isinstance(node, ast.Call):
             fq = self.resolve(node.func, depth + 1)
             arg = self._arg(node, 1 if "builtins.getattr" in fq else 0)
@@ -645,10 +651,11 @@ class _PyScan:
                 s = self._fold(arg)
                 return {f"{b}.{s}" for b in self.resolve(node.args[0], depth + 1)} if s and node.args else set()
             if fq & _DYN_IMPORT:
-                s = self._fold(arg)
+                q = min(fq & _DYN_IMPORT)
+                s, rel = self._dyn_name(node, q)
                 if s is None:
                     return {"?"}
-                return {s.split(".")[0] if "builtins.__import__" in fq else s}
+                return {s if rel or q == "importlib.import_module" else s.split(".")[0]}
             if fq & _NAME_RESOLVERS:
                 s = self._fold(arg)
                 return {"?"} if s is None else {s.replace(":", ".")}
@@ -700,10 +707,71 @@ class _PyScan:
             sep = self._fold(node.func.value, depth + 1)
             parts = [self._fold(e, depth + 1) for e in node.args[0].elts]
             return sep.join(parts) if sep is not None and None not in parts else None
-        if isinstance(node, ast.Name):
+        if isinstance(node, ast.Name) and node.id not in self.rebound:
             vals = {self._fold(v, depth + 1) for v in self._lookup(node)}
             return vals.pop() if len(vals) == 1 and None not in vals else None
         return None
+
+    def _fold_int(self, node, depth=0):
+        """mmap prot 用：整数字面量、| / + 组合、mmap.PROT_* 常量、只赋过一次值的变量。"""
+        if node is None or depth > 10:
+            return None
+        if isinstance(node, ast.Constant) and type(node.value) is int:
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.BitOr, ast.Add)):
+            a, b = self._fold_int(node.left, depth + 1), self._fold_int(node.right, depth + 1)
+            return None if a is None or b is None else (a | b if isinstance(node.op, ast.BitOr) else a + b)
+        q = self.resolve(node)
+        if len(q) == 1 and next(iter(q)) in _MMAP_INTS:
+            return _MMAP_INTS[next(iter(q))]
+        if isinstance(node, ast.Name) and node.id not in self.rebound:
+            vals = {self._fold_int(v, depth + 1) for v in self._lookup(node)}
+            return vals.pop() if len(vals) == 1 and None not in vals else None
+        return None
+
+    def _dyn_name(self, call, q):
+        """动态导入实际拿到的模块名和是否相对导入；相对导入把 package 拼进去。算不出来名字为 None。"""
+        name = self._fold(self._arg(call, 0, "name"))
+        if name is None:
+            return None, False
+        if q == "importlib.import_module":
+            level = len(name) - len(name.lstrip("."))
+            if not level:
+                return name, False
+            name, pkg = name[level:], self._fold(self._arg(call, 1, "package"))
+        else:   # __import__(name, globals, locals, fromlist, level)
+            lv = self._arg(call, 4, "level")
+            if lv is None:
+                return name, False
+            if not (isinstance(lv, ast.Constant) and type(lv.value) is int and lv.value >= 0):
+                return None, True
+            level = lv.value
+            if not level:
+                return name, False
+            pkg = self._globals_package(self._arg(call, 1, "globals"))
+        if not pkg:
+            return None, True
+        bits = pkg.rsplit(".", level - 1)
+        if len(bits) < level:
+            return None, True
+        return (f"{bits[0]}.{name}" if name else bits[0]), True
+
+    def _globals_package(self, g):
+        """__import__ 相对导入时从 globals 字典取包名：__package__，没有就按 __name__ / __path__ 推。"""
+        if not isinstance(g, ast.Dict) or None in g.keys:
+            return None
+        d = {}
+        for k, v in zip(g.keys, g.values):
+            ks = self._fold(k)
+            if ks is None:
+                return None
+            d[ks] = v
+        if "__package__" in d:
+            return self._fold(d["__package__"])
+        if "__spec__" in d or "__name__" not in d:
+            return None
+        n = self._fold(d["__name__"])
+        return n if n is None or "__path__" in d else n.rpartition(".")[0]
 
     @staticmethod
     def _arg(call, pos, kw=None):
@@ -774,6 +842,21 @@ class _PyScan:
                 self.parent[child] = node
         assigns = []
         for node in self.nodes:
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                p = self.parent.get(node)
+                simple = isinstance(node.ctx, ast.Store) and (
+                    (isinstance(p, ast.Assign) and node in p.targets)
+                    or (isinstance(p, (ast.AnnAssign, ast.NamedExpr, ast.For, ast.AsyncFor)) and p.target is node)
+                    or (isinstance(p, ast.withitem) and p.optional_vars is node))
+                if not simple:
+                    self.rebound.add(node.id)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                self.rebound.update(node.names)
+            if isinstance(node, ast.Import):
+                self.imported_tops.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                self.imported_tops.add(node.module.split(".")[0])
+        for node in self.nodes:
             if isinstance(node, ast.Import):
                 for a in node.names:
                     if a.asname:
@@ -820,21 +903,24 @@ class _PyScan:
             return False
         for prefix, level, rule, msg, hint in MODULE_RULES:
             if mod == prefix or mod.startswith(prefix + "."):
-                self.add(level, rule, node, msg, hint)
+                if level == REJECT and rule == "native-api":
+                    self._native_reject(mod, node, msg)
+                else:
+                    self.add(level, rule, node, msg, hint)
                 hit = True
         if mod.split(".")[0].startswith("win32"):
-            self.add(REJECT, "native-api", node, f"导入了 {mod}（pywin32）：{_NATIVE_WHY}", _NATIVE_HINT)
+            self._native_reject(mod, node, f"导入了 {mod}（pywin32）：{_NATIVE_WHY}")
             hit = True
         if _native_segment(mod):
             hit |= self._native_reject(mod, node)
         return hit
 
-    def _native_reject(self, q, node):
-        """同一个位置只报一次（from numpy import ctypeslib 会先后经过导入和引用两条路）。"""
+    def _native_reject(self, q, node, msg=None):
+        """同一个位置只报一次（from numpy import ctypeslib、__import__("ctypes").CDLL 会先后经过导入和引用两条路）。"""
         pos = (getattr(node, "lineno", 0), getattr(node, "col_offset", -1) + 1)
         if any(f.rule == "native-api" and f.level == REJECT and (f.line, f.col) == pos for f in self.out):
             return True
-        self.add(REJECT, "native-api", node, f"经 {q} 拿到了原生调用能力：{_NATIVE_WHY}", _NATIVE_HINT)
+        self.add(REJECT, "native-api", node, msg or f"经 {q} 拿到了原生调用能力：{_NATIVE_WHY}", _NATIVE_HINT)
         return True
 
     def check_qualified(self, quals, node):
@@ -846,7 +932,10 @@ class _PyScan:
                     self.add(EXPLAIN, "process-call", node, f"对动态导入的模块调用 .{q[2:]}：可能是起进程",
                              "模块名写死；送审单里说明")
                 continue
-            if _native_segment(q):
+            top = q.split(".")[0]
+            # 开头就是 ctypes 却没 import：经 getattr(sys, "modules")["ctypes"]、动态导入之类拿到的
+            if _native_segment(q) or ((top in _NATIVE_SEGMENTS or top.startswith("win32"))
+                                      and top not in self.imported_tops):
                 self._native_reject(q, node)
             if _PROCESS_RE.match(q):
                 self.add(EXPLAIN, "process-call", node, f"{q} 会起子进程", "送审单里说明起什么进程、参数从哪来")
@@ -907,8 +996,9 @@ class _PyScan:
                             self.add(EXPLAIN, "unsafe-load", node,
                                      f"间接引用了 {min(hidden)}（赋值、放进容器、传给别的函数）：工具查不了调用时的参数",
                                      "直接调用，并写明 weights_only=True / allow_pickle=False / Loader=yaml.SafeLoader")
-            if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load) \
-                    and "sys.modules" in self.resolve(node):
+            # getattr(sys, "modules")、vars(sys)["modules"]、os.sys.modules 也是 sys.modules
+            if isinstance(node, (ast.Name, ast.Attribute, ast.Call, ast.Subscript)) \
+                    and isinstance(getattr(node, "ctx", ast.Load()), ast.Load) and "sys.modules" in self.resolve(node):
                 self._check_sys_modules(node, parent)
             if isinstance(node, ast.Name) and node.id in ("__builtins__", "__builtin__"):
                 self.add(EXPLAIN, "dunder-access", node, f"碰了 {node.id}", "直接写要用的函数，别经过内部属性")
@@ -1003,7 +1093,10 @@ class _PyScan:
             self._check_deserialize(inner, self.resolve(node.args[0]), "", partial=True)
         if "mmap.mmap" in fq:
             prot = self._arg(node, 3, "prot")
-            if isinstance(prot, ast.Constant) and isinstance(prot.value, int) and prot.value & 4:   # PROT_EXEC
+            v = self._fold_int(prot)
+            if prot is not None and v is None:
+                self.add(EXPLAIN, "native-api", node, "mmap 的 prot 算不出来：可能申请可执行内存", "prot 写成常量")
+            elif v is not None and v & 4:   # PROT_EXEC
                 self.add(REJECT, "native-api", node, f"mmap 申请了可执行内存：{_NATIVE_WHY}", _NATIVE_HINT)
         self._check_path_loader(node, fq)
         self._check_decode(node, fq, term)
@@ -1017,6 +1110,21 @@ class _PyScan:
             arg = self._arg(node, _REFLECT[q])
             s = _const_str(arg)
             short = q.replace("builtins.", "")
+            if q in _DYN_IMPORT:
+                target, rel = self._dyn_name(node, q)
+                if s is None:
+                    self.add(EXPLAIN, "reflect-nonliteral", node, f"{short} 的名字参数不是字面量",
+                             "写死的字典分派 MODELS = {...}，参数声明成 enum")
+                elif target is None:
+                    self.add(EXPLAIN, "reflect-nonliteral", node, f"{short} 是相对导入，包名 / level 不是字面量，认不出导入的是哪个模块",
+                             "写绝对导入")
+                else:
+                    self.add(INFO, "reflect-literal", node, f"{short}({s!r})" + (f" → {target}" if rel else "") + "：名字是字面量",
+                             "能直接写 import 就直接写")
+                if target:      # "ct" + "ypes"、相对导入：照拼出来的名字再查一遍
+                    self.check_module(target, node)
+                import_mech = True
+                continue
             if s is None:
                 self.add(EXPLAIN, "reflect-nonliteral", node, f"{short} 的名字参数不是字面量",
                          "写死的字典分派 MODELS = {...}，参数声明成 enum")

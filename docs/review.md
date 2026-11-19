@@ -62,9 +62,10 @@ ML 任务代码本身几乎用不到；torch 等库内部用 ctypes 属于环境
 
 - `import x as y`、`from builtins import eval as e`、`e = eval`、`(eval)`；
 - `__builtins__.exec`、`__builtins__["exec"]`、`getattr(os, "system")`；
-- `__import__("socket")`、`importlib.import_module("pickle")`；
+- `__import__("socket")`、`importlib.import_module("pickle")`；相对导入把包名拼进去：`importlib.import_module(".util", "ctypes")`、`__import__("", {"__package__": "ctypes"}, None, [...], 1)` 按 `ctypes.util` / `ctypes` 算，包名或 `level` 不是字面量的报 `reflect-nonliteral`；
+- `getattr(sys, "modules")`、`vars(sys)["modules"]`、`sys.__dict__["modules"]`、`os.sys.modules` 都按 `sys.modules` 算；
 - `nt.system`、`posix.system`，这两个都按 `os.system` 算；
-- 能静态算出来的名字照算出来的查：`"ct" + "ypes"`、只含常量的 f-string、`"".join(["ct", "ypes"])`、只赋过一次值的变量。
+- 能静态算出来的名字照算出来的查：`"ct" + "ypes"`、只含常量的 f-string、`"".join(["ct", "ypes"])`、只赋过一次值的变量（`+=`、`global`、解包、`del` 改过的名字不算，按不是字面量处理）。
   `__import__` / `importlib.import_module` / `getattr` 的名字参数是这种写法时，照样报 `reflect-nonliteral`，同时按拼出来的名字再查一遍。
 
 别名跟踪不分流程：一个名字只要在文件里任何地方可能指向危险函数，就照危险函数算；内置函数被重新赋值也照样认。
@@ -79,7 +80,7 @@ ML 任务代码本身几乎用不到；torch 等库内部用 ctypes 属于环境
 | `source-encoding` | 拒签 | 前两行声明了非 UTF-8 的源码编码（如 `# coding: utf-7`）。解释器按声明的编码解码，审核人看到的就不是同一份代码。“前两行”按解释器的规则数：直接运行时 `\r` `\n` 都算换行，`import` 时只认 `\n`，两种都查；`\x0c` `\x85` 这类字符不算换行。解析时把原始字节交给 `ast.parse`，解码方式和解释器一致 |
 | `exec-call` | 需解释 | `eval` `exec` `compile` 的任何引用，`types.CodeType` / `FunctionType`，`timeit` `cProfile` `profile` `pdb` 的字符串执行，`pandas.eval`，导入 `code` / `codeop`。`model.eval()`、`re.compile` 不算 |
 | `process-call` | 需解释 | 导入 `subprocess` `pty` 等；`os.system` `popen` `exec*` `spawn*` `startfile` `posix_spawn` `fork`、`asyncio.create_subprocess_*`；对动态导入的模块调 `.system` 之类；接收者认不出来（比如模块经函数参数传进来）时取 `.system` `.popen` `.Popen` `.check_output` `exec*` `spawn*` `fork` 这类属性，`getattr(m, "system")` 也算。`.run` `.call` 太常见，不算。`multiprocessing` 只到提示 |
-| `native-api` | 拒签 / 需解释 | 拒签（原生调用逃生口，可绕过沙箱 ACL/审计钩子：`CreateFileW` 自带安全描述符、`LoadLibrary`、`WNetAddConnection`、直连 SMB/UNC）：<br>导入 `ctypes`（含 `ctypes.util` `ctypes.wintypes`）`_ctypes` `cffi` `_cffi_backend` `_winapi` `msvcrt` `comtypes`、pywin32（`win32*` `pywintypes` `pythoncom`）；`os.add_dll_directory`、`importlib.machinery.ExtensionFileLoader`；`mmap.PROT_EXEC` 或 `mmap.mmap(prot=<含 4 的整数>)`。<br>`import` / `from … import` / `__import__` / `importlib.import_module` 都算，名字拼接、`getattr` 混淆按上面的常量折叠认；不 import 也拿得到的也算：`sys.modules["ctypes"]`、`sys.modules.get("ctypes")`、属性链中间出现 `ctypes` `ctypeslib` 等（`numpy.ctypeslib`）。<br>需解释：`winreg` `_overlapped`；对认不出来的对象取 `.ctypes` `.ctypeslib` `.windll` `.cdll` `.CDLL` `.pythonapi` 之类（模块经参数传进来；numpy 数组的 `.ctypes` 也在这里）|
+| `native-api` | 拒签 / 需解释 | 拒签（原生调用逃生口，可绕过沙箱 ACL/审计钩子：`CreateFileW` 自带安全描述符、`LoadLibrary`、`WNetAddConnection`、直连 SMB/UNC）：<br>导入 `ctypes`（含 `ctypes.util` `ctypes.wintypes`）`_ctypes` `cffi` `_cffi_backend` `_winapi` `msvcrt` `comtypes`、pywin32（`win32*` `pywintypes` `pythoncom`）；`os.add_dll_directory`（含底层的 `nt._add_dll_directory`）、`importlib.machinery.ExtensionFileLoader`；`mmap.PROT_EXEC` 或 `mmap.mmap(prot=<含 4 的整数>)`（`1|2|4`、`mmap.PROT_READ | 4` 这类常量组合也算）。<br>`import` / `from … import` / `__import__` / `importlib.import_module` 都算，名字拼接、`getattr` 混淆按上面的常量折叠认；不 import 也拿得到的也算：`sys.modules["ctypes"]`、`sys.modules.get("ctypes")`（经 `getattr` / `vars` / `__dict__` / `os.sys` 拿到的 `sys.modules` 同样）、属性链中间出现 `ctypes` `ctypeslib` 等（`numpy.ctypeslib`）。<br>需解释：`winreg` `_overlapped`；对认不出来的对象取 `.ctypes` `.ctypeslib` `.windll` `.cdll` `.CDLL` `.pythonapi` 之类（模块经参数传进来；numpy 数组的 `.ctypes` 也在这里）；`mmap.mmap` 的 `prot` 算不出来 |
 | `network` | 需解释 | `socket` `requests` `urllib`（`urllib.parse` 除外）`http.client` `ftplib` `smtplib` `paramiko` `aiohttp` `httpx` 等 |
 | `reflect-nonliteral` | 需解释 | `getattr` `setattr` `delattr` `hasattr` `__import__` `importlib.import_module` `importlib.util.*` `runpy.*` `pkgutil.resolve_name` `pydoc.locate` 的名字参数不是字符串字面量；`operator.attrgetter` / `methodcaller`；从 `sys.modules` 按变量名取模块（`sys.modules[name]`、`sys.modules.get(...)`；`sys.modules["os"]` 认得出，按 `os` 算）；`logging.config.dictConfig` / `fileConfig` / `listen` 和 Hydra 的 `instantiate` / `call`，它们按配置里写的名字导入并调用对象 |
 | `reflect-literal` | 提示 | 同上，但名字是字面量（能直接写就直接写）。字面量是内部属性的，另报 `dunder-access` |
