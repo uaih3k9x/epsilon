@@ -366,3 +366,99 @@ func TestSignJobRefusesStaleManifest(t *testing.T) {
 		})
 	}
 }
+
+// chunkFiles 列出块目录里所有块文件（相对路径），清单不算。
+func chunkFiles(t *testing.T, dir string) map[string]bool {
+	t.Helper()
+	got := map[string]bool{}
+	filepath.WalkDir(dir, func(p string, e os.DirEntry, err error) error {
+		if err == nil && !e.IsDir() && !strings.HasSuffix(p, ".json") {
+			rel, _ := filepath.Rel(dir, p)
+			got[rel] = true
+		}
+		return nil
+	})
+	return got
+}
+
+// 已有清单对不上：先比对再写块，块目录里不能多出孤儿块。
+func TestSignJobStaleManifestLeavesNoOrphanChunks(t *testing.T) {
+	r := newSignRig(t)
+	r.prebuild(t, []byte("PK older code.zip"), 7)
+	before := chunkFiles(t, r.chunks)
+	if err := r.sign(); err == nil {
+		t.Fatal("对不上的清单竟然签了")
+	}
+	if after := chunkFiles(t, r.chunks); len(after) != len(before) {
+		t.Fatalf("比对失败还往块目录写了块: 之前 %d 个, 之后 %d 个", len(before), len(after))
+	}
+}
+
+// 块目录里已有的块文件坏了（截断、改过）：sign-job 要发现，不能只核对清单。
+func TestSignJobRefusesCorruptExistingChunk(t *testing.T) {
+	for name, prebuilt := range map[string]bool{"有清单": true, "没清单": false} {
+		t.Run(name, func(t *testing.T) {
+			r := newSignRig(t)
+			r.prebuild(t, r.zip, 7)
+			var m proto.Manifest
+			b, _ := os.ReadFile(r.manifestPath())
+			json.Unmarshal(b, &m)
+			h := m.Files[0].Chunks[1]
+			if !prebuilt {
+				// 块大小改成默认值才会撞上同一个块：直接用默认块大小重做一份，再删清单
+				os.RemoveAll(r.chunks)
+				f, err := chunk.BuildFile(r.chunks, r.code, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				h = f.Chunks[0]
+			}
+			if err := os.WriteFile(filepath.Join(r.chunks, h[:2], h), []byte("PK"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.sign(); err == nil || !strings.Contains(err.Error(), h) {
+				t.Fatalf("坏块没被发现（或报错没指出是哪个块）: %v", err)
+			}
+			if _, err := os.Stat(r.out); err == nil {
+				t.Fatal("块坏了不该留下签名文件")
+			}
+		})
+	}
+}
+
+// 钥匙环源文件：limits 里必须显式写 max_nodes（防漏写、键名写错被当成 0 = 不限制）；写 0 给 warning。
+func TestKeyringSourceMaxNodes(t *testing.T) {
+	for name, tc := range map[string]struct {
+		src  string
+		ok   bool
+		warn bool
+	}{
+		"漏写":        {`{"version":1,"keys":[{"name":"a","limits":{"max_hours":1}}]}`, false, false},
+		"键名写错":      {`{"version":1,"keys":[{"name":"a","limits":{"max_hours":1,"maxNodes":5}}]}`, false, false},
+		"没有 limits": {`{"version":1,"keys":[{"name":"a"}]}`, false, false},
+		"写 0":       {`{"version":1,"keys":[{"name":"a","limits":{"max_hours":1,"max_nodes":0}}]}`, true, true},
+		"写具体数":      {`{"version":1,"keys":[{"name":"a","limits":{"max_hours":1,"max_nodes":5}}]}`, true, false},
+		"没有钥匙":      {`{"version":1}`, true, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w, err := keyringSourceWarnings([]byte(tc.src))
+			if (err == nil) != tc.ok {
+				t.Fatalf("err=%v, 要的是 ok=%v", err, tc.ok)
+			}
+			if (len(w) > 0) != tc.warn {
+				t.Fatalf("warnings=%v, 要的是 warn=%v", w, tc.warn)
+			}
+		})
+	}
+	// cmdKeyring 也要拒漏写的源文件，而且不出钥匙环
+	d := t.TempDir()
+	root, src, ring := filepath.Join(d, "root.key"), filepath.Join(d, "src.json"), filepath.Join(d, "ring.json")
+	cmdKeygen(root)
+	os.WriteFile(src, []byte(`{"version":1,"keys":[{"name":"a","pub":"x","expires":"2099-01-01T00:00:00Z","limits":{"max_hours":1}}]}`), 0o644)
+	if err := cmdKeyring(root, src, ring); err == nil {
+		t.Fatal("漏写 max_nodes 的源文件竟然签了")
+	}
+	if _, err := os.Stat(ring); err == nil {
+		t.Fatal("拒签时不该留下钥匙环")
+	}
+}

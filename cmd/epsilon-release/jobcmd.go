@@ -74,6 +74,32 @@ func writeFileAtomic(path string, b []byte) error {
 	return os.Rename(tmp, path)
 }
 
+// keyringSourceWarnings 检查人手写的钥匙环源文件：每把钥匙的 limits 必须显式写 max_nodes。
+// 0 = 不限制，漏写或键名写错（"maxNodes"，encoding/json 会忽略）都会解成 0，所以不写就拒；写了 0 给 warning。
+func keyringSourceWarnings(raw []byte) ([]string, error) {
+	var src struct {
+		Keys []struct {
+			Name   string                     `json:"name"`
+			Limits map[string]json.RawMessage `json:"limits"`
+		} `json:"keys"`
+	}
+	if err := json.Unmarshal(raw, &src); err != nil {
+		return nil, err
+	}
+	var w []string
+	for _, k := range src.Keys {
+		v, ok := k.Limits["max_nodes"]
+		if !ok {
+			return nil, fmt.Errorf("钥匙 %q 的 limits 没写 max_nodes（0 = 不限制，要不限制也得显式写 0）", k.Name)
+		}
+		var n int
+		if json.Unmarshal(v, &n) == nil && n == 0 {
+			w = append(w, fmt.Sprintf("钥匙 %q 的 max_nodes 是 0 = 不限制，它签的任务能占满所有节点", k.Name))
+		}
+	}
+	return w, nil
+}
+
 // cmdKeyring 用根钥匙签钥匙环。in 是人手写的钥匙环 JSON；没写 issued 就填现在。
 // out 已存在时要求新版本号更大（同号重签等于给回滚留口子）。签完立刻自验。
 func cmdKeyring(keyPath, in, out string) error {
@@ -81,9 +107,20 @@ func cmdKeyring(keyPath, in, out string) error {
 	if err != nil {
 		return err
 	}
-	var k jobsign.Keyring
-	if err := readJSON(in, &k); err != nil {
+	raw, err := os.ReadFile(in)
+	if err != nil {
 		return err
+	}
+	warns, err := keyringSourceWarnings(raw)
+	if err != nil {
+		return err
+	}
+	var k jobsign.Keyring
+	if err := json.Unmarshal(raw, &k); err != nil {
+		return err
+	}
+	for _, w := range warns {
+		fmt.Fprintln(os.Stderr, "warning:", w)
 	}
 	if k.Issued == "" {
 		k.Issued = time.Now().UTC().Format(time.RFC3339)
@@ -126,7 +163,8 @@ func fileSHA256(path string) (string, error) {
 
 // codeManifest 出代码包清单：ID code-<sha>，只有一个文件 jobcode/<sha>.zip（探针 prepareCode、
 // 主控 CodeManifestID 的约定，格式就是 chunk.Build 的 proto.Manifest），块写进 chunksDir。
-// 已有清单：按它的块大小把 code.zip 重切一遍比对，对不上就报错、不覆盖；对得上原样不动。没有就写一份。
+// 已有清单：按它的块大小把 code.zip 重算一遍比对，对不上就报错、不覆盖、一个块都不写；对得上原样不动。没有就写一份。
+// 块目录里已有的块文件逐个重算哈希（Store 只按文件名认块），坏了报错，免得问题到教室机上才暴露。
 func codeManifest(codePath, sha, chunksDir string) error {
 	id := "code-" + sha
 	path := filepath.Join(chunksDir, id+".json")
@@ -144,7 +182,7 @@ func codeManifest(codePath, sha, chunksDir string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	f, err := chunk.BuildFile(chunksDir, codePath, size)
+	f, err := chunk.HashFile(codePath, size)
 	if err != nil {
 		return fmt.Errorf("代码包切块: %v", err)
 	}
@@ -153,10 +191,20 @@ func codeManifest(codePath, sha, chunksDir string) error {
 	}
 	f.Path = "jobcode/" + sha + ".zip"
 	m := proto.Manifest{ID: id, ChunkSize: size, Files: []proto.ManifestFile{f}}
+	if old != nil && !reflect.DeepEqual(*old, m) {
+		return fmt.Errorf("已有代码包清单 %s 和 code.zip 对不上（不覆盖，确认后删掉重签）", path)
+	}
+	w, err := chunk.BuildFile(chunksDir, codePath, size)
+	if err != nil {
+		return fmt.Errorf("代码包切块: %v", err)
+	}
+	if w.SHA256 != f.SHA256 || !reflect.DeepEqual(w.Chunks, f.Chunks) {
+		return fmt.Errorf("切块时 code.zip 变了")
+	}
+	if err := chunk.VerifyChunks(chunksDir, f.Chunks); err != nil {
+		return fmt.Errorf("%v（删掉这个块文件重签即可）", err)
+	}
 	if old != nil {
-		if !reflect.DeepEqual(*old, m) {
-			return fmt.Errorf("已有代码包清单 %s 和 code.zip 对不上（不覆盖，确认后删掉重签）", path)
-		}
 		return nil
 	}
 	b, _ := json.MarshalIndent(m, "", "  ")

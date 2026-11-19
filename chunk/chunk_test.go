@@ -510,3 +510,52 @@ func TestAssembleRejectsBadManifest(t *testing.T) {
 		t.Fatal("校验失败不该落地")
 	}
 }
+
+// HashFile 和 BuildFile 算出的清单项一样，但一个块都不写。
+func TestHashFileMatchesBuildFileWithoutWriting(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "a.bin")
+	writeFile(t, src, []byte("0123456789abcdefghij"))
+	out := filepath.Join(d, "out")
+	h, err := HashFile(src, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Fatal("HashFile 不该建块目录")
+	}
+	b, err := BuildFile(out, src, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(h, b) {
+		t.Fatalf("HashFile %+v != BuildFile %+v", h, b)
+	}
+}
+
+// VerifyChunks 重算已有块文件的哈希：缺块、坏块都报错，报错里带块哈希。
+func TestVerifyChunks(t *testing.T) {
+	d := t.TempDir()
+	src := filepath.Join(d, "a.bin")
+	writeFile(t, src, []byte("0123456789abcdefghij"))
+	out := filepath.Join(d, "out")
+	f, err := BuildFile(out, src, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyChunks(out, f.Chunks); err != nil {
+		t.Fatalf("好块报错: %v", err)
+	}
+	bad := f.Chunks[1]
+	writeFile(t, chunkPath(out, bad), []byte("012"))
+	if err := VerifyChunks(out, f.Chunks); !errors.Is(err, ErrHashMismatch) || !strings.Contains(err.Error(), bad) {
+		t.Fatalf("坏块没报 ErrHashMismatch 或没指出块: %v", err)
+	}
+	os.Remove(chunkPath(out, bad))
+	if err := VerifyChunks(out, f.Chunks); err == nil || !strings.Contains(err.Error(), bad) {
+		t.Fatalf("缺块没报错: %v", err)
+	}
+	if err := VerifyChunks(out, []string{"../x"}); err == nil {
+		t.Fatal("不合法的哈希没拒")
+	}
+}

@@ -48,7 +48,7 @@
 | `keys[].pub` | base64 的 32 字节 ed25519 公钥 |
 | `keys[].expires` | RFC3339；过期后这把钥匙签的任务包一律不跑 |
 | `keys[].limits.max_hours` | > 0；任务包的 `max_hours` 不能超过它（探针核对） |
-| `keys[].limits.max_nodes` / `rooms` | 主控派活时执行：这把钥匙签的任务同时最多占几台（**0 = 不限制**，负数钥匙环验不过）；`rooms` 空 = 不限 |
+| `keys[].limits.max_nodes` / `rooms` | 主控派活时执行：这把钥匙签的任务同时最多占几台（**0 = 不限制**，负数钥匙环验不过）；`rooms` 空 = 不限。`keyring` 命令要求源文件里每把钥匙**显式写出** `max_nodes`（漏写或键名写错会被当成 0 = 不限制，所以直接拒签），写 0 会打 warning。**含义变更**：本 PR 之前的草稿里 0 是"一台都不派"，手头钥匙环要是按旧含义用 0 停用某把钥匙，先改成删掉这把钥匙（或写具体数字）再升版本重签 |
 | `keys[].limits.network` | false 时，要联网的任务包（`network: true`）一律不跑 |
 | `revoked_jobs` | 任务包摘要（`job.signed.json` 里 `job` 字段原文的 SHA-256，小写十六进制） |
 | `env_layers` | `名字@版本` → 环境层清单原文的 SHA-256。探针只用表里的环境层，拉到清单后核对摘要；主控换不了环境层 |
@@ -94,7 +94,7 @@ epsilon-release keygen -out dist/keys/reviewer-a.key
 epsilon-release keyring -key dist/keys/release-main.key -in keyring-src.json -out job-keyring.json
 
 # 审核人签任务包（核对 code.zip 哈希、私钥与钥匙环里同名钥匙一致，签完按探针规则自验；
-# 顺手在 -chunks 下出代码包清单 code-<sha>.json 和块，已有清单只核对不覆盖）
+# 顺手在 -chunks 下出代码包清单 code-<sha>.json 和块，已有清单只核对不覆盖，已有块重算哈希）
 epsilon-release sign-job -key dist/keys/reviewer-a.key -name reviewer-a \
     -keyring job-keyring.json -job job.json -code code.zip -chunks dist/chunks -out job.signed.json
 ```
@@ -179,7 +179,7 @@ epsilon-env install -name py311-torch2.5-cu124@1 -digest <摘要> -manifest <清
 - **主控只能挑、填、选**：提交时用 `jobsign.VerifyJob` 核任务包（验签、过期、吊销、字段），`jobsign.FillParams` 按包里的 `params` 声明校验参数（类型、`min`/`max`、`enum`）并补 `default`。下发的是任务包原文，探针自己再验。
 - **提交时就拒**：任务包不存在 404；签名/钥匙/字段不过、带 `data`（数据集还没做）、`rooms` 超出钥匙权限、`chunks_dir` 里没有代码包或环境层的清单都是 400。
 - **`queue.json` 读坏了**：批任务停用，`POST` / `DELETE /v1/jobs` 回 503，主控**不再写** `queue.json`（坏文件里是旧任务和序号，等人修好或挪走再重启）。
-- **代码包约定**：清单 ID `code-<code_sha256>`，里面只有一个文件 `jobcode/<code_sha256>.zip`。`sign-job` 签名时顺手生成（`-chunks` 目录，默认 `dist/chunks`，整个传到主控 `chunks_dir`）；那里已有 `code-<sha>.json` 的，按它的块大小重切 `code.zip` 比对，对不上就报错、不覆盖、不出签名文件，对得上原样不动。手工做也行：把 `code.zip` 改名放到 `<目录>/jobcode/<sha>.zip`，`epsilon-chunk build -id code-<sha> -root <目录> -out <chunks_dir> jobcode/<sha>.zip`。
+- **代码包约定**：清单 ID `code-<code_sha256>`，里面只有一个文件 `jobcode/<code_sha256>.zip`。`sign-job` 签名时顺手生成（`-chunks` 目录，默认 `dist/chunks`，整个传到主控 `chunks_dir`）；那里已有 `code-<sha>.json` 的，按它的块大小重切 `code.zip` 比对，对不上就报错、不覆盖、不写块、不出签名文件，对得上原样不动。块目录里已有的块文件也逐个重算哈希，坏了（rsync 中断、拷贝出错）报错并指出是哪个块，删掉它重签即可。手工做也行：把 `code.zip` 改名放到 `<目录>/jobcode/<sha>.zip`，`epsilon-chunk build -id code-<sha> -root <目录> -out <chunks_dir> jobcode/<sha>.zip`。
 - 任务号 `<任务名>-<序号>`，序号存在 `queue.json` 里接着往下排，不和 `jobs_dir` 里已有的目录撞。`count` 份就是 `count` 个任务号，各自回传输出。
 - **派活**（每次心跳和每 5 秒）：按提交顺序，给每个排队的任务挑一台节点（按名字排）：
   - 节点开了能力 32（心跳 `jobs: true`）、心跳没过期、手上没有没结束的任务（正在杀的旧任务也算占着）；
