@@ -6,15 +6,15 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"epsilon/boot"
 )
@@ -26,59 +26,83 @@ func main() {
 		}
 		return
 	}
-	keyPath := flag.String("key", "dist/keys/release-main.key", "私钥（base64 种子）")
-	version := flag.String("version", "", "版本号；试坏过的版本号引导器不会再下，修好要换新号")
-	minBoot := flag.Int("min-boot", 2, "这版本体至少要哪个版本的引导器（只在本体真的依赖新引导器时调高：调高后旧引导器的机器装不了）")
-	out := flag.String("out", "dist/release", "输出目录")
-	flag.Parse()
-	if *version == "" || flag.NArg() == 0 {
-		log.Fatal("要 -version 和至少一个文件")
-	}
-	raw, err := os.ReadFile(*keyPath)
-	if err != nil {
+	if err := runRelease(os.Args[1:]); err != nil {
 		log.Fatal(err)
 	}
-	seed, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw)))
-	if err != nil || len(seed) != ed25519.SeedSize {
-		log.Fatal("私钥格式不对")
+}
+
+// runRelease 做本体发布签名。出错时不改 -out：检查都在清空输出目录之前。
+func runRelease(args []string) error {
+	fs := flag.NewFlagSet("epsilon-release", flag.ContinueOnError)
+	keyPath := fs.String("key", "dist/keys/release-main.key", "私钥（base64 种子）")
+	version := fs.String("version", "", "版本号；试坏过的版本号引导器不会再下，修好要换新号")
+	minBoot := fs.Int("min-boot", 2, "这版本体至少要哪个版本的引导器（只在本体真的依赖新引导器时调高：调高后旧引导器的机器装不了）")
+	out := fs.String("out", "dist/release", "输出目录")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	priv := ed25519.NewKeyFromSeed(seed)
+	if *version == "" || fs.NArg() == 0 {
+		return errors.New("要 -version 和至少一个文件")
+	}
+	// F1：引导器只收清单里有本体的槽，漏传会签出一份所有机器都拒的发布。按字节比，和 VerifySlot 一致。
+	hasProbe := false
+	for _, src := range fs.Args() {
+		hasProbe = hasProbe || filepath.Base(src) == boot.ProbeExe
+	}
+	if !hasProbe {
+		return fmt.Errorf("要签入的文件里没有 %s：引导器会拒收这份发布", boot.ProbeExe)
+	}
+	priv, err := loadKey(*keyPath)
+	if err != nil {
+		return err
+	}
 
 	os.RemoveAll(*out)
 	if err := os.MkdirAll(*out, 0o755); err != nil {
-		log.Fatal(err)
+		return err
 	}
 	m := boot.Manifest{Version: *version, MinBoot: *minBoot}
-	for _, src := range flag.Args() {
-		name := filepath.Base(src)
-		in, err := os.Open(src)
+	for _, src := range fs.Args() {
+		f, err := copyHashed(src, filepath.Join(*out, filepath.Base(src)))
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
-		dst, err := os.Create(filepath.Join(*out, name))
-		if err != nil {
-			log.Fatal(err)
-		}
-		h := sha256.New()
-		n, err := io.Copy(io.MultiWriter(dst, h), in)
-		in.Close()
-		dst.Close()
-		if err != nil {
-			log.Fatal(err)
-		}
-		m.Files = append(m.Files, boot.File{Path: name, Size: n, SHA256: hex.EncodeToString(h.Sum(nil))})
+		m.Files = append(m.Files, f)
 	}
 	s, err := boot.Sign(m, priv)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	pub := priv.Public().(ed25519.PublicKey)
 	if _, err := s.Verify([]ed25519.PublicKey{pub}); err != nil {
-		log.Fatal(err)
+		return err
 	}
 	b, _ := json.MarshalIndent(s, "", "  ")
-	if err := os.WriteFile(filepath.Join(*out, "release.json"), b, 0o644); err != nil {
-		log.Fatal(err)
+	if err := os.WriteFile(filepath.Join(*out, boot.ReleaseFile), b, 0o644); err != nil {
+		return err
 	}
 	log.Printf("版本 %s，%d 个文件 -> %s", *version, len(m.Files), *out)
+	return nil
+}
+
+// copyHashed 把 src 拷到 dst，顺手算大小和 sha256。
+func copyHashed(src, dst string) (boot.File, error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return boot.File{}, err
+	}
+	defer in.Close()
+	w, err := os.Create(dst)
+	if err != nil {
+		return boot.File{}, err
+	}
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(w, h), in)
+	if cerr := w.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return boot.File{}, err
+	}
+	return boot.File{Path: filepath.Base(src), Size: n, SHA256: hex.EncodeToString(h.Sum(nil))}, nil
 }

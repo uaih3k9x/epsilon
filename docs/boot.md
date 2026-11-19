@@ -204,7 +204,10 @@ state 也不跑验不过的 R。用几个故意改坏的 boot.go（不核对版�
   测试：`TestF1ManifestMustListProbe`（缺、大小写不同、多后缀、空清单）、`TestF1ManifestWithProbePasses`、
   `TestF1CurrentWithoutProbeFallsBackToGood`、`TestF1RescueSlotMustListProbe`；`FuzzVerifySlot` 加了"放行的清单一定有本体"。
   状态机穷举里"被篡改"已经代表"槽验不过"，缺本体对 boot 的选槽逻辑是同一种情况，没有另加一种槽内容。
-  遗留：`epsilon-release` 仍然不检查有没有 exe，漏传会签出一份所有机器都会拒的发布（loader 每轮下载后验不过，不会切过去）。
+  发版侧：`epsilon-release` 签名前检查要签入的文件里有没有 `boot.ProbeExe`（取文件名按字节比），没有就报错退出，
+  不碰 `-out`（不清旧产出、不写 release.json），免得签出一份所有引导器都拒收的发布。`deploy/release.sh` 本来就传
+  `dist/build/epsilon-probe.exe`，不受影响。测试：`TestReleaseRefusesWithoutProbe`、`TestReleaseRefusesWithoutProbeKeepsOldOutput`、
+  `TestReleaseWithProbeSigns`（签出来的直接过 `VerifySlot`）。
 - **F2 bad 只记一个版本**。两个坏版本交替下发（比如管理员在两个版本之间来回调），每个都会重新试满 MaxTries 次，
   来回空转。可能的改法：bad 改成最近几个版本的列表（State 加字段，动契约），或者在主控 / loader 侧挡住。
 - **F3 槽里多余的文件不拦**。只有清单里的文件受保护。本体或它拉起的程序如果按名字加载同目录的 DLL，多出来的
