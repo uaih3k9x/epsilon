@@ -160,16 +160,33 @@ func JudgeTreeReset(quarantined string, lockedErr, runErr error) Check {
 }
 
 // JudgeMkdir700（第 15 项）：任务 os.mkdir(..., 0o700) 之后收回权限。Python 3.12.4+ 在 Windows 上给它建受保护 DACL，
-// 文档预计收回会失败、改名隔离；成真的话要人决定钩子是不是改成拦。
-func JudgeMkdir700(pyver, quarantined string, runErr error) Check {
+// 文档预计收回会失败、改名隔离；成真的话要人决定钩子是不是改成拦。收回报成功的话要回读：readErr 是收回以后探针列 m700 的错误
+// （和 lockdir 一样；TreeReset 跳过了它，下一个任务——同一个账户、就是所有者——照样读得到）。
+func JudgeMkdir700(pyver, quarantined string, readErr, runErr error) Check {
 	c := Check{Item: 15, ID: "15.mkdir700"}
 	switch {
 	case runErr != nil:
 		c.Status, c.Evidence = FAIL, "任务没跑成: "+runErr.Error()
 	case quarantined != "":
 		c.Status, c.Evidence = MANUAL, fmt.Sprintf("Python %s：mkdir(0o700) 让收回失败，目录改名隔离了 %s；要不要在钩子里拦 mkdir(0o700)（第 8 节）", pyver, quarantined)
+	case readErr != nil:
+		c.Status, c.Evidence = FAIL, fmt.Sprintf("Python %s：收回报成功，但探针读不了 output\\m700（TreeReset 跳过了它，要加抽查）: %v", pyver, readErr)
 	default:
-		c.Status, c.Evidence = PASS, fmt.Sprintf("Python %s：收回成功", pyver)
+		c.Status, c.Evidence = PASS, fmt.Sprintf("Python %s：收回成功，探针读得了 output\\m700", pyver)
+	}
+	return c
+}
+
+// JudgeIdentity（第 0 项）：helper 要和探针一样是非提升的身份。关了 UAC 的管理员登录时 RunLevel Limited 拿到的是完整令牌，
+// 后面 10.terminate、2.winsta_limited、15.* 这些项会在比生产高的权限下通过，报告却看不出来。
+func JudgeIdentity(user string, elevated bool, err error) Check {
+	c := Check{ID: "0.helper_identity", Status: PASS, Evidence: fmt.Sprintf("helper 以 %s 运行，提升=false（和探针一样）", user)}
+	switch {
+	case err != nil:
+		c.Status, c.Evidence = FAIL, "查不了自己的令牌: "+err.Error()
+	case elevated:
+		c.Status = FAIL
+		c.Evidence = fmt.Sprintf("helper 以 %s 运行，但令牌是提升的（关了 UAC 的管理员？）：后面的项都在比探针高的权限下测，结果不算数", user)
 	}
 	return c
 }

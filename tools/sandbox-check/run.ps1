@@ -265,6 +265,12 @@ try {
         }
 
         Add-Result $PsFile 8 '8.after_restore' 'MANUAL' 'reboot so C: is restored (if this machine has restore), then run run.ps1 -AfterRestore'
+
+        # ---- docs section 7 steps this kit does not automate (review #17 item 4): one MANUAL each, so the overall is never PASS ----
+        Add-Result $PsFile 3 '3.baseline_compare' 'MANUAL' 'not automated (step 3): compare VRAM and wall time of smoke and the torch GPU + DataLoader job with a run before the sandbox'
+        Add-Result $PsFile 19 '19.attack_pack' 'MANUAL' 'not automated (step 4): attack job pack with the test keyring: exe in tmp, tmp dll, ProgramData, probe.json, controller, DNS, UNC, subprocess, WMI Win32_Process.Create, schtasks, mklink /J in output, own ACL, CreateFileW with its own DACL, a background process left running, a second job reading the output of the first; each must be blocked and logged, an escaped process must halt the node'
+        Add-Result $PsFile 20 '20.kill_probe_midway' 'MANUAL' 'not automated (step 5): kill the probe while a job runs; the whole job tree must die'
+        Add-Result $PsFile 21 '21.overhead' 'MANUAL' 'not automated (step 7): canary time per job and torch import time under Low IL (selftest and 3.torch_import show part of it)'
     }
 
     # ---------------- limited phase: same principal as the probe ----------------

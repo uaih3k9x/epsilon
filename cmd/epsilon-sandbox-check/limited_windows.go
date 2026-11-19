@@ -92,7 +92,7 @@ func runLimited(o limitedOpts) (code int) {
 	}
 	c := &checker{o: o, w: w, sys32: filepath.Join(sysRoot, "System32")}
 	c.cmd = filepath.Join(c.sys32, "cmd.exe")
-	c.add(Check{ID: "0.helper_identity", Status: PASS, Evidence: identity()})
+	c.add(JudgeIdentity(identity()))
 	cfg, err := probe.LoadConfig(o.Config)
 	if err != nil {
 		c.add(Check{ID: "0.config", Status: FAIL, Evidence: err.Error()})
@@ -175,11 +175,11 @@ func runLimited(o limitedOpts) (code int) {
 	return 0
 }
 
-// identity 是这个进程的用户和是否提升（报告里说明是以什么身份测的）。
-func identity() string {
+// identity 是这个进程的用户和是否提升（JudgeIdentity 判：提升了就 FAIL）。
+func identity() (string, bool, error) {
 	tok, err := syscall.OpenCurrentProcessToken()
 	if err != nil {
-		return err.Error()
+		return "?", false, err
 	}
 	defer tok.Close()
 	user := "?"
@@ -189,8 +189,10 @@ func identity() string {
 		}
 	}
 	var elev, n uint32
-	syscall.GetTokenInformation(tok, tokenElevation, (*byte)(unsafe.Pointer(&elev)), 4, &n)
-	return fmt.Sprintf("helper 以 %s 运行，提升=%v（要和探针一样：false）", user, elev != 0)
+	if err := syscall.GetTokenInformation(tok, tokenElevation, (*byte)(unsafe.Pointer(&elev)), 4, &n); err != nil {
+		return user, false, fmt.Errorf("TokenElevation: %v", err)
+	}
+	return user, elev != 0, nil
 }
 
 // selftest 跑 epsilon-probe -sandbox-selftest，把 sandbox-selftest.txt 拷进工作目录（report 逐行解析）。
@@ -866,7 +868,10 @@ func (c *checker) lockdir(p jobbox.Platform) {
 
 // mkdir700（第 15 项）：os.mkdir(0o700) 之后收回。
 func (c *checker) mkdir700(p jobbox.Platform) {
-	res, log, err := c.boxRun(p, "mkdir700", "mkdir700", nil, 5*time.Minute, nil)
+	var rerr error
+	res, log, err := c.boxRun(p, "mkdir700", "mkdir700", nil, 5*time.Minute, func(where string) {
+		_, rerr = os.ReadDir(filepath.Join(where, "output", "m700")) // 收回报成功的话探针应该读得了（第 8 条审查）
+	})
 	c.addAll(JudgeRun(15, "mkdir700", res, err))
 	lines := ParseCheckLines([]byte(log), "job")
 	c.addAll(lines)
@@ -876,5 +881,8 @@ func (c *checker) mkdir700(p jobbox.Platform) {
 			ver = strings.TrimPrefix(l.Evidence, "Python ")
 		}
 	}
-	c.add(JudgeMkdir700(ver, res.Dir, err))
+	if res.Dir != "" {
+		rerr = nil
+	}
+	c.add(JudgeMkdir700(ver, res.Dir, rerr, err))
 }

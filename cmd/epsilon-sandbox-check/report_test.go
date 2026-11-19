@@ -11,8 +11,8 @@ import (
 )
 
 func TestEveryItemHasTitleAndDoc(t *testing.T) {
-	if len(Items) != 19 {
-		t.Fatalf("要 0（运行与清理）加 18 项: %d", len(Items))
+	if len(Items) != 22 {
+		t.Fatalf("要 0（运行与清理）加 21 项: %d", len(Items))
 	}
 	for i, it := range Items {
 		if it.N != i || it.Title == "" || it.Doc == "" {
@@ -127,13 +127,13 @@ func TestBuildAggregatesAndFillsMissingItems(t *testing.T) {
 		{Item: 18, ID: "18.len", Status: PASS},
 	}
 	r := Build(checks, "pc-xx", time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC))
-	if len(r.Items) != 19 {
+	if len(r.Items) != len(Items) {
 		t.Fatal(len(r.Items))
 	}
 	if r.Items[5].Status != FAIL || r.Items[13].Status != MANUAL || r.Items[18].Status != PASS || r.Items[1].Status != SKIP {
 		t.Fatalf("%+v", r.Items)
 	}
-	if r.Overall != FAIL || r.Counts[FAIL] != 1 || r.Counts[PASS] != 1 || r.Counts[MANUAL] != 1 || r.Counts[SKIP] != 15 {
+	if r.Overall != FAIL || r.Counts[FAIL] != 1 || r.Counts[PASS] != 1 || r.Counts[MANUAL] != 1 || r.Counts[SKIP] != len(Items)-4 {
 		t.Fatalf("%s %v", r.Overall, r.Counts)
 	}
 	if !strings.Contains(r.Items[1].Checks[0].Evidence, "没跑到") {
@@ -144,7 +144,7 @@ func TestBuildAggregatesAndFillsMissingItems(t *testing.T) {
 		t.Fatal(err)
 	}
 	var back Report
-	if err := json.Unmarshal(b, &back); err != nil || back.Overall != FAIL || len(back.Items) != 19 {
+	if err := json.Unmarshal(b, &back); err != nil || back.Overall != FAIL || len(back.Items) != len(Items) {
 		t.Fatalf("%v %+v", err, back)
 	}
 	txt := r.Text()
@@ -161,7 +161,7 @@ func TestBuildAggregatesAndFillsMissingItems(t *testing.T) {
 
 func TestOverallIgnoresOnlyPassAndCleanup(t *testing.T) {
 	var cs []Check
-	for i := 1; i <= 18; i++ {
+	for i := 1; i < len(Items); i++ {
 		cs = append(cs, Check{Item: i, ID: "x", Status: PASS})
 	}
 	if r := Build(cs, "", time.Now()); r.Overall != PASS {
@@ -206,5 +206,27 @@ func TestReportReadsWorkDirAndWritesBothFiles(t *testing.T) {
 	b, _ := os.ReadFile(out + ".json")
 	if err := json.Unmarshal(b, &r); err != nil || r.Items[12].Checks[0].Source != "ps" || r.Items[18].Checks[0].Source != "limited" {
 		t.Fatalf("%v %+v", err, r.Items[12])
+	}
+}
+
+func TestManualStepsKeepOverallFromPass(t *testing.T) {
+	// 审查 #17 第 4 条：第 7 节的手工步骤（攻击任务包、跑到一半杀探针、量开销）不在套件里。
+	// 它们是单独的项，run.ps1 报 MANUAL：自动化的项全过，总体也只能是 MANUAL，不能让人看着 PASS 去开 jobs_sandboxed
+	var cs []Check
+	for i := 1; i <= 18; i++ {
+		cs = append(cs, Check{Item: i, ID: "x", Status: PASS})
+	}
+	r := Build(cs, "", time.Now())
+	if r.Overall == PASS {
+		t.Fatal("第 19–21 项没跑（SKIP）时总体不能是 PASS")
+	}
+	for _, id := range []string{"19.attack_pack", "20.kill_probe_midway", "21.overhead"} {
+		cs = append(cs, Check{ID: id, Status: MANUAL})
+	}
+	if r := Build(cs, "", time.Now()); r.Overall != MANUAL {
+		t.Fatal(r.Overall)
+	}
+	if !strings.Contains(r.Text(), "第 1–21 项") {
+		t.Fatal(r.Text()[:200])
 	}
 }

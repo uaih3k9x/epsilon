@@ -130,13 +130,30 @@ func TestJudgeTreeReset(t *testing.T) {
 }
 
 func TestJudgeMkdir700(t *testing.T) {
-	if c := JudgeMkdir700("3.11.9", "", nil); c.Status != PASS {
+	if c := JudgeMkdir700("3.11.9", "", nil, nil); c.Status != PASS {
 		t.Fatalf("%+v", c)
 	}
-	if c := JudgeMkdir700("3.12.4", `D:\epsilon\jobs\.q-1`, nil); c.Status != MANUAL || !strings.Contains(c.Evidence, "3.12.4") {
+	if c := JudgeMkdir700("3.12.4", `D:\epsilon\jobs\.q-1`, nil, nil); c.Status != MANUAL || !strings.Contains(c.Evidence, "3.12.4") {
 		t.Fatalf("文档里说的风险成真了：要人决定钩子是不是改成拦: %+v", c)
 	}
-	if c := JudgeMkdir700("", "", errors.New("x")); c.Status != FAIL {
+	if c := JudgeMkdir700("", "", nil, errors.New("x")); c.Status != FAIL {
+		t.Fatalf("%+v", c)
+	}
+	// 审查 #17 第 8 条：收回报成功，但 m700 探针读不了 = TreeReset 跳过了它，下一个任务（同一个账户、就是所有者）照样读得到
+	if c := JudgeMkdir700("3.12.4", "", errors.New("Access is denied."), nil); c.Status != FAIL || !strings.Contains(c.Evidence, "跳过") {
+		t.Fatalf("%+v", c)
+	}
+}
+
+func TestJudgeIdentity(t *testing.T) {
+	// 审查 #17 第 9 条：关了 UAC 的管理员登录时，RunLevel Limited 拿到的还是完整令牌，后面的项都在比生产高的权限下通过
+	if c := JudgeIdentity(`PC\Administrator`, false, nil); c.Status != PASS || c.ID != "0.helper_identity" {
+		t.Fatalf("%+v", c)
+	}
+	if c := JudgeIdentity(`PC\Administrator`, true, nil); c.Status != FAIL || !strings.Contains(c.Evidence, "提升") {
+		t.Fatalf("提升了的身份测出来的结果不算数: %+v", c)
+	}
+	if c := JudgeIdentity("?", false, errors.New("OpenProcessToken: x")); c.Status != FAIL {
 		t.Fatalf("%+v", c)
 	}
 }

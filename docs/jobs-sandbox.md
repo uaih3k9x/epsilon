@@ -75,6 +75,13 @@ stdout/stderr 接日志句柄（复制一份可继承的）、`lpDesktop = epsil
 任务账户在窗口站上是 `0x2037f`、桌面上是 `0x201ff`（全部具体权限 + READ_CONTROL），**没有 WRITE_DAC、WRITE_OWNER、DELETE**，改不了它们的 DACL。
 第一次健康检查之前先清场：上一个探针的残留进程攥着窗口站时建不出新的。
 `CreateDesktop` 要先 `SetProcessWindowStation`（整个进程生效），建完马上切回。建不出来就不接任务。
+**`lpDesktop` 只决定进程起在哪个桌面，不挡它主动打开别的**（审查 #17 第 3 条，待真机确认）：MSDN 说 LocalSystem 不能调
+`CreateProcessWithLogonW`，理由是"它要用调用者令牌里的登录 SID"，也就是任务令牌里很可能带着探针（学生登录会话）的 `S-1-5-5-x-y`，
+而 `WinSta0`、`WinSta0\Default` 的 DACL 正是按这个登录 SID 授权的。那样任务（Low IL 也一样，读不受 NW 标签限制）可以
+`OpenWindowStationW("WinSta0", WINSTA_READSCREEN|WINSTA_ENUMERATE)` → `SetProcessWindowStation` → `OpenDesktopW("Default")` → 截屏、轮询按键。
+系统金丝雀 `winsta0_denied` 反向实测（必须错误 5），`token_groups` 把令牌里的登录 SID 写进证据：成立的话每个任务都会因为系统金丝雀不符被拒、
+本机停接（fail-closed），要换方案（sitecustomize 用把登录 SID 设成仅拒绝的受限令牌重新起自己，`CreateProcessAsUser` 用自己令牌的受限版本不要特权），
+或者拍板写进剩余风险。
 
 **Low IL 和特权**：`sitecustomize` 在装钩子之前用 ctypes 把自己的令牌降到 Low，再用 `SE_PRIVILEGE_REMOVED` 删掉除 SeChangeNotifyPrivilege 以外的全部特权
 （工作站上 Users 有 SeShutdownPrivilege，不删的话任务能 `InitiateShutdownW` 重启教室机；作业对象的 UILIMIT_EXITWINDOWS 只管 ExitWindowsEx），子进程都继承。之后只能写标了 Low 的地方（`output\` `tmp\`），
@@ -130,7 +137,9 @@ CUDA 在 Low IL 下能不能跑要真机验证；不行的备选是给已知的�
      系统层的办法（整机拦出站 TCP 139/445、禁用 WebClient 服务）会影响本机所有用户，待拍板（第 8 节）；根治是独立 VLAN（16.7）或受限的解析器。
    - **回环不过 Windows 防火墙**（连本机自己的地址也按回环处理）：本机 `epsilon-boot`、p2p（有令牌）、停推理那一小段时间的 llama-server :8080
      和 ggml-rpc-server :50052（没有认证）、以 SYSTEM 运行的教室管理代理都在听。钩子只许连本进程自己 bind 的回环端口；探针开始跑任务前
-     等推理、rpc 进程真的退出。绕过钩子（ctypes；代码包里直接用 ctypes 已在静态审核拒签）的连接只能靠盘点本机监听、逐个确认要认证（第 7 节）。
+     等推理、rpc 进程真的退出。**钩子挡不住的连接只能靠盘点本机监听、逐个确认要认证（第 7 节第 13 条），这一条是硬要求**：
+     绕过钩子不止 ctypes 一条路（静态审核拒签），纯 Python 用 gc 枚举、取钩子帧也能改钩子的状态（会留记录，第 5 节、第 8 节）。
+     以前这里写的"绕过要 ctypes"不成立（审查 #17 第 1 条）：那时任务一句 `sys.modules['sitecustomize'].decide = ...` 就关掉了钩子，不留记录。
 5. 探针不读防火墙配置，金丝雀以任务账户连主控，必须得到 **WSAEACCES（10013）**；连上、超时、被拒绝都算失败。
 
 ## 5. 审计钩子（能力 35）和金丝雀
@@ -147,9 +156,18 @@ CUDA 在 Low IL 下能不能跑要真机验证；不行的备选是给已知的�
 - 只在任务进程里装：令牌用户是 `epsilon-job`，或者有 `EPSILON_JOB_DIR`。人手工跑层里的 python 不受影响。
 - **顺序，任何一步出错就 `os._exit(97)`**（site.py 只会打印一句然后接着跑）：用 `CreateFileW(FILE_WRITE_DATA)` 连 `\\.\pipe\epsilon-audit`
   （管道 DACL 不给任务账户 FILE_CREATE_PIPE_INSTANCE，普通 `open` 要的 GENERIC_WRITE 会被拒；不用 stderr，multiprocessing 的子进程不继承句柄）
-  → 降到 Low IL → 删特权 → `sys.addaudithook` → 写就绪记录 `{"ev":"ready","pid","ppid","il","job_dir","file","layer"}`。
+  → 降到 Low IL → 删特权 → `sys.addaudithook` → 写就绪记录 `{"ev":"ready","pid","ppid","il","privs","job_dir","file","layer"}`。
+- **钩子运行时不查任何任务改得了的东西**（审查 #17 第 1 条）。任务用纯 Python 改模块全局、标准库函数（`ntpath.normpath`、`os.write`、`json.dumps`）、
+  类属性（`socket.socket.getsockname`）和内建（`builtins.isinstance`）都不触发审计事件，所以钩子路径上的函数把用到的一切在 import 时（用户代码之前）
+  绑成**位置默认参数**：没有全局和内建查找、没有闭包（`cell_contents` 能改）、不用 `__kwdefaults__`（能改的字典），默认参数只放不可变的东西；
+  改这些函数的 `__code__`/`__defaults__` 有 `object.__setattr__` 事件，钩子认得自己的函数，拦下。
+  参数按类型读底层数据（str 子类、元组子类、int 子类和 C 读到的一样），**不调任务的任何代码**（`__fspath__`、`__repr__`、`__eq__`、重写的方法）。
+  钩子运行中跑到的任务代码（GC 在钩子里触发的 `__del__`）照样判，不再跳过；钩子自己不触发审计事件，不会递归。
+  `tools/test_sandbox_hook.py` 逐个函数核对这几条，并在真解释器里把能改的都改一遍（`test_tampering_with_globals_does_not_switch_the_hook_off`）。
+  还剩的路要先拿到钩子的对象：`gc.get_objects/get_referrers/get_referents`、`sys._current_frames` 逐条记；从拦截异常的 `tb_frame` 拿到的钩子帧里只有不可变的东西和计数。
 - 探针一侧：主进程恢复后 30 秒内收不到它的就绪，整树杀、`rejected`；主进程的连接在进程退出前断开（宽限 5 秒）、任何连接上记录格式不对、
-  或者就绪记录的 `job_dir` 不是这个任务的目录，视为篡改：整树杀、`failed`、照常回传。拦截次数运行中就写进心跳。
+  就绪记录的 `job_dir` 不是这个任务的目录、**`il` 不是 `low` 或 `privs` 不是恰好 `["SeChangeNotifyPrivilege"]`**（审查 #17 第 2 条：
+  降级和删特权全在层里的 sitecustomize 里做，它写错了系统控制金丝雀测不出来），视为篡改：整树杀、`failed`、照常回传。拦截次数运行中就写进心跳。
 - 记录一行一个 JSON：`{"t","pid","ev","act":"block|log|count","args"}`，args 截到 512 字节，一次 `os.write` 写完。
 
 ### 策略（`jobbox/py/sitecustomize.py` 的 `decide`，纯函数）
@@ -161,17 +179,19 @@ CUDA 在 Low IL 下能不能跑要真机验证；不行的备选是给已知的�
 | `socket.bind` | 不是 127.0.0.1 / ::1 / localhost 就拦 |
 | `socket.connect` `sendto` `sendmsg` | 不是回环就拦；回环只放行本进程自己 bind 的端口（`socketpair`、asyncio 的自连），别的回环端口也拦 |
 | `socket.getaddrinfo` `gethostbyname*` `gethostbyaddr` `getnameinfo` | 不是 localhost 就拦（DNS 隐蔽通道） |
-| 所有带路径的事件（`open` `os.listdir` `os.scandir` `os.mkdir` `os.rename`（含 `os.replace`）`os.remove` `os.rmdir` `os.chdir` `os.chmod` `os.utime` `os.link` `os.symlink` `os.truncate` `os.add_dll_directory` `shutil.*` `tempfile.mk*` `glob.glob`，见 `PATH_ARGS`） | 拦 UNC、`\\?\UNC\`、`\\.\` 设备路径（`\\.\pipe\` 和 `\\?\X:\` 除外）。`os.stat` 没有审计事件 |
-| `open` | `code\` 和环境层以外的 `.py` `.pyc` `.pyw` `.pth` 读写都拦 |
+| 所有带路径的事件（`open` `os.listdir` `os.scandir` `os.mkdir` `os.rename`（含 `os.replace`）`os.remove` `os.rmdir` `os.chdir` `os.chmod` `os.utime` `os.link` `os.symlink` `os.truncate` `os.add_dll_directory` `shutil.*` `tempfile.mk*` `glob.glob`，见 `PATH_ARGS`） | 拦 UNC、`\\?\UNC\`、`\\.\` 设备路径（`\\.\pipe\` 和 `\\?\X:\` 除外）。`os.stat` 没有审计事件。路径参数不是 str/bytes（`pathlib`、`os.DirEntry`、任务自己的类）只计数 `path.opaque`：钩子不调它的 `__fspath__`（第二次调可以返回和系统调用用的不一样的路径）；`open()` 不受影响（C 先转换成 str 再发事件） |
+| `open` | `code\` 和环境层以外的 `.py` `.pyc` `.pyw` `.pth` 读写都拦（按 Windows 规则：`x.py.`、`x.py `、`x.py::$DATA` 都是 `x.py`） |
 | `os.rename` `os.link` `os.symlink` `shutil.copyfile` `shutil.move` | 目标是 `code\` 和环境层以外的 `.py` 之类就拦（先写 `x.txt` 再改名） |
 | `os.mkdir(mode=0o700)` | 计数（Python 3.12.4+ 在 Windows 上给它建受保护 DACL，所有者完全控制，收回权限会失败） |
-| `import` | `sys.path` 里有 `code\` 和环境层以外的条目就拦 |
+| `import` | `sys.path` 里有 `code\` 和环境层以外的条目、或者不是字符串的条目就拦 |
 | `ctypes.dlopen` | 全记；带路径的在环境层和 System32 之外就拦 |
 | `ctypes.call_function` `pickle.find_class` `marshal.loads` | 只计数（每种原样记前 50 条，之后每 1000 次一条累计）；multiprocessing、torch 内部也会触发 |
 | `compile` `exec` | 文件名在 `code\`、环境层（含层内 pyc 的相对路径）、冻结模块的算导入，只计数；`<string>` 之类算动态执行，逐条记 |
 | `winreg` 写操作 | 拦 |
 | 改 `EPSILON_*` 环境变量 | **拦**（设计稿写的是记录）。只拦得住 `os.putenv`：`_winapi.CreateProcess` 可以自带环境块，所以就绪记录里带 `job_dir`，探针核对，和任务目录不一致按篡改整树杀 |
 | `sys.addaudithook` `cpython.run_*` | 记 |
+| `gc.get_objects` `gc.get_referrers` `gc.get_referents` `sys._current_frames` `sys._current_exceptions` `sys.settrace` `sys.setprofile` | 记（能摸到钩子的对象和正在跑的钩子帧） |
+| `object.__setattr__` 改钩子自己的函数（`__code__` `__defaults__`） | 拦 |
 
 拦截是抛 `PermissionError`，任务可以接住接着跑，但已经计数。有拦截不自动判失败，按 22.6.1 交给人复查、吊销。
 
@@ -185,15 +205,17 @@ CUDA 在 Low IL 下能不能跑要真机验证；不行的备选是给已知的�
 在任务目录 ACL 设好之后、任务起来之前，以任务账户、同样的桌面和作业对象跑，输出写 `canary.out`，由 `jobbox.CheckCanary` 对照（每一项恰好报一次且 ok，任何 fail 都拒）。之后清空 `tmp\` `output\`。
 
 1. **系统控制**（`python -I -S -c <引导> canary\sys.txt canary\cfg.json`，不加载钩子；先用和 sitecustomize 一模一样的代码降到 Low、删特权，测试核对两份相同）：
-   `integrity_low` `privileges_dropped`（只剩 SeChangeNotify）`desktop` `read_probe_json` `read_secrets` `read_data_disk`（列卷根必须错误 5）
+   `integrity_low` `privileges_dropped`（只剩 SeChangeNotify）`desktop` `winsta0_denied`（打开交互窗口站 `WinSta0` 必须错误 5，第 2 节）
+   `token_groups`（令牌里没有 Users 以外的本机组，不管直接还是嵌套；证据带登录 SID）`read_probe_json` `read_secrets` `read_data_disk`（列卷根必须错误 5）
    `exec_artifact_root`（以 FILE_EXECUTE 打开 `epsilon-boot.exe` 必须错误 5）`hardlink_probe_json`（从 `output\` 建到 `probe.json` 的硬链接必须失败）
    `chdir_tmp` `write_code` `write_params` `delete_params` `write_job_root` `write_sitecustomize` `write_env`
    `write_tmp` `write_output` `exec_tmp`（复制 python.exe 进 tmp 再起，必须错误 5）`load_tmp_dll` `set_dacl_own_file`（改自己文件的 DACL 必须错误 5，验 OW）
    `write_programdata` `write_windows_temp` `write_users_public` `connect_controller`（必须 10013）`socketpair`。
    金丝雀活着时探针核对 `WTSEnumerateProcessesExW` 列得出它（列不出 = 清场是瞎的，停接任务）。
 2. **钩子**（`python -E -s -B -c <引导> canary\hook.txt canary\cfg.json`，工作目录 `code\`，和真任务一样）：`hook_installed` `subprocess_blocked` `spawn_flags_blocked` `connect_blocked` `dns_blocked` `unc_blocked`
-   `unc_paths_blocked`（mkdir、rename、chdir）`env_tamper_blocked` `tmp_py_blocked` `rename_py_blocked` `dlopen_tmp_blocked` `loopback_blocked` `socketpair_ok` `mp_child`；
-   探针另从审计管道核对 `ready_main` `ready_in_layer` `ready_child`。
+   `unc_paths_blocked`（mkdir、rename、chdir）`env_tamper_blocked` `tmp_py_blocked` `rename_py_blocked` `dlopen_tmp_blocked` `loopback_blocked` `socketpair_ok`
+   `tamper_globals_blocked`（把 sitecustomize 的模块全局、`ntpath.normpath`、`os.fspath` 换掉以后照样拦）`mp_child`；
+   探针另从审计管道核对 `ready_main` `ready_in_layer` `ready_child` `ready_low_il`（主进程和子进程的就绪记录都是 il=low、只剩 SeChangeNotify）。
 
 ## 6. 出错就拒
 
@@ -209,7 +231,8 @@ Backup Operators 的 SeBackup 能绕过所有 DACL）、窗口站建好了。不
 | 健康检查不过（典型：C: 被还原） | 派来的任务 `rejected`（retry） | 是，直到下一次检查通过 |
 | 设 ACL 或标签失败 | 先收回再删掉任务目录，`rejected`（retry） | 否 |
 | `CreateProcessWithLogonW` 报 1326 / 1385 / 1058 / 1327 / 1330 / 1331 / 1907 / 1909 | `rejected`（retry） | 是，直到探针重启 |
-| 启动错误 2 / 3 / 123 / 193 / 206 / 267（解释器、路径、工作目录不对）；命令行超过 1024 字符 | `rejected` | 否 |
+| 任务进程的启动错误 2 / 3 / 123 / 193 / 206 / 267（解释器、路径、工作目录不对）；命令行超过 1024 字符 | `rejected` | 否 |
+| 金丝雀起不来（任何错误：程序、目录、参数都是探针生成的，审查 #17 第 7 条） | `rejected`（retry） | 是，直到探针重启 |
 | 其他启动错误（5、1314……）；指派作业对象或恢复失败；建不了审计管道 | 结束挂起的进程，`rejected`（retry） | 是，直到探针重启 |
 | 系统控制金丝雀不符（配置漂移，不是任务的问题） | `rejected`（retry） | 是，直到探针重启 |
 | 清场列不出系统金丝雀（非管理员枚举不出别的账户进程的 SID） | `rejected`（retry） | 是，直到探针重启 |
@@ -217,7 +240,7 @@ Backup Operators 的 SeBackup 能绕过所有 DACL）、窗口站建好了。不
 | 钩子金丝雀不符（层没有钩子、钩子不对） | `rejected`，写明是哪个环境层 | 否 |
 | 30 秒内没收到就绪；没发就绪就退出 | 整树杀，`rejected` | 否 |
 | 运行中审计管道断开、记录被篡改 | 整树杀，`failed`，照常回传 | 否 |
-| 结束后 3 秒宽限内还有这个 SID 的进程（作业对象 Close 时先等 ActiveProcesses 归零；conhost、正在退出的在宽限内消失不算） | 有进程逃出了作业对象，TerminateProcess，发事件 | 是，直到重启（C: 还原自然清场） |
+| 结束后 3 秒宽限内还有这个 SID 的进程（作业对象 Close 时先等 ActiveProcesses 归零；conhost、正在退出的在宽限内消失不算） | 有进程逃出了作业对象，试着 TerminateProcess（**可能结束不了**，第 8 节），发事件 | 是，直到重启（C: 还原自然清场） |
 | 收回 ACL 失败 | 改名隔离（`jobs\.q-…`），照常回传，发事件 | 否；改名也失败才停到重启 |
 
 编译期：Windows 构建里探针只有真沙箱（`jobbox.New`），没有不受限的路径；非 Windows 构建的 `New` 返回 `Unavailable`。
@@ -229,8 +252,9 @@ Mac 上测了：SDDL 字面量、环境块、金丝雀解析和对照（每一�
 编排顺序和每一步失败的出错即拒、心跳 `jobs` 跟着沙箱、`network:true` 拒、`sitecustomize.py` 拒收、链接不回传、钩子策略（pytest，subprocess/socket/环境变量在真解释器里端到端）、
 `install.ps1` 静态检查；`GOOS=windows go build/vet ./...`。
 
-**必须在真 Windows 上验证**（牺牲机或测试机，不铺教室）。验证套件在 `tools/sandbox-check/`：拷到牺牲机一条命令跑完下面 18 项，
+**必须在真 Windows 上验证**（牺牲机或测试机，不铺教室）。验证套件在 `tools/sandbox-check/`：拷到牺牲机一条命令跑完下面 18 项（共 21 项），
 出一份 PASS / FAIL / MANUAL / SKIP 的报告（`D:\epsilon\sandbox-check-<时间>.txt`），用法、回滚和结果怎么看见那里的 README。
+第 19–21 条（下面"步骤"里的 4、5、7）套件不做，报告里各报一条 MANUAL，要手工做完（审查 #17 第 4 条）。
 
 1. `CreateProcessWithLogonW` 在 `CREATE_SUSPENDED` 下重定向 stdout/stderr 是否可用；返回的进程句柄能不能 AssignProcessToJobObject；进程会不会已经被 seclogon 放进别的作业。
 2. 非提升用户能不能建窗口站和桌面；CUDA 在这个桌面下能不能用；Low 标签对 user32 初始化够不够；非交互窗口站的桌面堆够不够。
@@ -241,18 +265,26 @@ Mac 上测了：SDDL 字面量、环境块、金丝雀解析和对照（每一�
 7. multiprocessing spawn 的子进程命令行是否就是放行的那种形状；钩子和管道是否都正常。
 8. DPAPI 在 C: 还原后的表现。
 9. 教室机上 seclogon 是否可用；secedit 合并用户权限是否正确。
-10. 非管理员的探针用 `WTSEnumerateProcessesExW` 能否查到别的账户的进程（`pUserSid` 是否为空；金丝雀核对会停接）、终止权限够不够；
+10. 非管理员的探针用 `WTSEnumerateProcessesExW` 能否查到别的账户的进程（`pUserSid` 是否为空；金丝雀核对会停接）、终止权限够不够
+    （审查 #17 第 5 条：任务进程的 DACL 来自 LogonUser 令牌的默认 DACL——任务用户 GA、SYSTEM GA、登录 SID 只有 GR|GX——探针的用户 SID 不在里面，
+    `OpenProcess(PROCESS_TERMINATE)` 很可能报 5；`10.terminate` 测得出来）；
     **普通任务结束后马上清场**会不会看到 conhost 或正在退出的进程（3 秒宽限够不够）。
 11. 服务端关管道连接时，挂着的同步 `ReadFile` 能不能被 `DisconnectNamedPipe` / `CancelIoEx` 叫醒（叫不醒的话探针只是少收尾 2 秒，不会卡住）；
-    `ConnectNamedPipe` 叫不醒时 stop 最多等 3 秒。
+    `ConnectNamedPipe` 叫不醒时 stop 最多等 3 秒。`Close` 落在两次 `Accept` 之间时实例不漏（审查 #17 第 6 条；逻辑在 `jobbox/pipeserver.go`，Mac 上有单测），
+    真机上连续跑两个任务，第二个照样建得出审计管道。
 12. `install.ps1` 第 4/8 步整段：`Add/Remove-LocalGroupMember -SID`、`Set-LocalUser` 参数、一次性 `/reset` 的耗时、数据卷根上拒读的传播耗时；
     中途故意让一步失败（比如停掉 seclogon 之外的某个依赖），确认后面照常装、密码文件被删、心跳报 `jobs:false`。
 13. 回环：`netstat -ano` 盘点 127.0.0.1 和本机地址上的监听（含教室管理软件），逐个确认要认证；钩子金丝雀 `loopback_blocked`、`socketpair_ok`。
 14. `C:\ProgramData`、`C:\Users\Public` 等 C: 上 Users 可读的内容盘点：有没有管理软件的配置、口令。
 15. `TreeResetNamedSecurityInfoW` 遇到把探针排除在外的子项时是中止还是跳过（跳过的话收回"成功"了却没收回，要加抽查）；Python 3.12.4+ 的 `mkdir(0o700)`。
 16. 删特权以后 torch、CUDA、DataLoader 是否正常；窗口站 `0x2037f`、桌面 `0x201ff` 对 user32 初始化和 CUDA 够不够；`CWF_CREATE_ONLY` 在探针重启后能否重建。
-17. 系统金丝雀新增项：`hardlink_probe_json`（Low IL 下必须失败）、`chdir_tmp`、`exec_artifact_root`、`read_data_disk`、`privileges_dropped`。
+17. 系统金丝雀新增项：`hardlink_probe_json`（Low IL 下必须失败）、`chdir_tmp`、`exec_artifact_root`、`read_data_disk`、`privileges_dropped`、
+    `winsta0_denied`（第 2 节：任务令牌里有没有探针的登录 SID，`token_groups` 的证据对照探针 `whoami /groups` 的 LogonId）、`token_groups`；
+    钩子金丝雀 `tamper_globals_blocked`、探针核对的 `ready_low_il`。
 18. 命令行长度：两次金丝雀和真任务的命令行都在 1024 字符以内（Mac 上按同样的规则算过）。
+19. **攻击任务包**（手工，下面步骤 4）。逃出作业的进程（WMI、schtasks）要让本机停接；再看它是否真被结束了（第 10 条、第 8 节）。
+20. **跑到一半杀探针**（手工，步骤 5）。
+21. **开销**（手工，步骤 7）。
 
 步骤：
 
@@ -265,7 +297,7 @@ Mac 上测了：SDDL 字面量、环境块、金丝雀解析和对照（每一�
 6. 重启（C: 还原）后心跳报 `jobs:false`；重跑 `install.ps1` 恢复。
 7. 量开销：每次金丝雀的耗时、torch 在 Low IL 下的导入时间。
 
-全过之后才把 `docs/jobs.md` 的"上线前必须做"改成"已做"。
+报告没有 FAIL、MANUAL 都拍了板、第 19–21 条和第 3 条的"和沙箱前一致"手工做完之后，才把 `docs/jobs.md` 的"上线前必须做"改成"已做"。
 
 ## 8. 待拍板和剩余风险
 
@@ -286,14 +318,25 @@ Mac 上测了：SDDL 字面量、环境块、金丝雀解析和对照（每一�
 
 - 防火墙按 SID 拦不住 DNS 和 SMB/WebDAV 出口，靠钩子拦和留痕，根治靠 VLAN。`os.stat` / `os.path.exists` 走 UNC 没有审计事件，钩子也拦不住、不留记录；
   SMB 还会带上任务账户的 NTLM（每台不同的密码、拒绝网络登录，拿到也横向不了）。
-- 回环不过防火墙：钩子只放行本进程自己 bind 的端口；ctypes 直接调 Winsock 绕得过，靠本机监听都要认证（第 7 节盘点）。
-- 钩子可以被绕过（ctypes 直接调系统 API 只计数），系统控制兜着。
+- 回环不过防火墙：钩子只放行本进程自己 bind 的端口；绕过钩子就连得上，靠本机监听都要认证（第 7 节第 13 条盘点，硬要求）。
+- 钩子可以被绕过，系统控制兜着：ctypes 直接调系统 API（只计数；静态审核拒签）；纯 Python 先 `gc.get_objects()` 找到钩子的函数
+  （`__closure__` / `cell_contents`、`__cantrace__` 加 `sys.settrace` 都不触发事件）——前一步逐条记录，`sys.settrace` 也记，所以**能改但留痕**。
+  任务帧里拿得到的拦截异常的 `tb_frame` 只暴露钩子的默认参数（不可变）和计数字典（改了只影响 count 类记录的取证）。
+  **送审手册待补**（`epsilon-review` 的规则在另一条分支，这里没改）：代码包里访问 `sitecustomize`、`gc.get_objects/get_referrers/get_referents`、
+  帧对象（`sys._getframe`、`tb_frame`、`f_back`、`f_globals`、`f_locals`）、`__closure__` / `cell_contents` 的列为拒签项。
+- 路径参数不是 str/bytes 的带路径事件（`os.mkdir(Path(r"\\h\s"))`、`os.rename(p, Path("tmp/x.py"))`）只计数不拦：和 `os.stat` 一样拦不住 UNC；
+  改名出来的 `.py` 也打不开、导入不了（`open` 和 `import` 两道检查都在）。
+- 钩子运行中被 GC 触发的任务 `__del__` 照样受钩子管，但它和钩子在同一个线程里：要是它在 `write` 写到一半时也写记录，那一行会坏，探针按篡改整树杀（fail-closed）。
 - **建文件时自带 DACL**：任务用 ctypes `CreateFileW` 传安全描述符，可以给自己新建的文件加上执行权限，绕过写执行分离（OW 只管事后改 DACL）。
   仍在 Low IL、作业对象、防火墙、独立桌面之内；结束后 `TreeResetNamedSecurityInfoW` 把 `output\` `tmp\` 重置成只继承，防的是留给下一个任务读。
   任务要是把探针也排除在 DACL 外，探针读不了、重置不了：回传失败或收回失败，后者把目录改名隔离（不停接）。
 - 上面几条 ctypes 绕过，签名前先挡一道：任务包静态审核（`epsilon-review`，rules_version 2）把代码包里直接用 ctypes / cffi / `_winapi` / msvcrt / pywin32 / `os.add_dll_directory` / 可执行 mmap 的一律拒签（含 `__import__`、`importlib`、拼接、`sys.modules['ctypes']` 等写法）。运行时钩子和系统控制仍是兜底；环境层库内部的 ctypes 不受影响。
 - 内存里生成机器码的 JIT（numba 等）绕得过写执行分离，环境层默认不装。
-- 任务账户能运行 System32 下的程序：钩子挡着；绕过钩子也还在作业对象、Low IL 和防火墙之内；逃出作业对象的由结束后的清扫兜底。
+- 任务账户能运行 System32 下的程序：钩子挡着；绕过钩子也还在作业对象、Low IL 和防火墙之内。逃出作业对象的（WMI、schtasks；Low IL 下 DCOM 激活
+  能不能成要真机看）结束后清扫看得见，**只保证本机停接（直到重启），不保证杀得掉**：`Sweep` 以探针身份 `OpenProcess(PROCESS_TERMINATE)`，
+  任务进程的默认 DACL 里没有探针的用户 SID，多半报 5（审查 #17 第 5 条）。要真杀的话候选：再以任务账户（探针有它的密码）起一个
+  `taskkill /F /PID`，同一个账户对自己的进程有 GA；或者管理员身份的计划任务。真机 `10.terminate` 失败了再选。
+- 任务令牌里可能带着探针的登录 SID（第 2 节"独立桌面"）：成立的话系统金丝雀 `winsta0_denied` 不过、本机不接任务，直到换方案。
 - 审计管道只认第一条就绪记录里的 pid（没用 `GetNamedPipeClientProcessId` 核对）；任务可以伪造自己子进程的记录，只影响取证，不影响边界。
 - 钩子金丝雀的 multiprocessing 子进程启动时 `sys.path[0]` 是 `code\`（和真任务一样），任务包里的 `multiprocessing` 包能在那个子进程里跑起来：
   它在钩子之内，改不了父进程打出的金丝雀行（每项恰好一次、任何 fail 都拒），只是这几秒没接上整树杀。

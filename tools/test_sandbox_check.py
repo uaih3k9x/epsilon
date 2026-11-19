@@ -153,7 +153,16 @@ def test_every_ps_result_id_starts_with_its_item_number():
     for item, cid in ids:
         assert re.match(r"^\d+\.", cid), cid
         assert cid.split(".")[0] == item, (item, cid)
-        assert 0 <= int(item) <= 18
+        assert 0 <= int(item) <= 21
+
+
+def test_manual_steps_are_reported():
+    # 审查 #17 第 4 条：第 7 节里没自动化的步骤每一步都要在报告里有一条 MANUAL，总体就不会是 PASS
+    s = read(RUN)
+    for cid in ("3.baseline_compare", "19.attack_pack", "20.kill_probe_midway", "21.overhead"):
+        assert re.search(r"Add-Result \$PsFile \d+ '%s' 'MANUAL'" % re.escape(cid), s), cid
+    readme = read(os.path.join(ROOT, "tools", "sandbox-check", "README.md"))
+    assert "第 19–21 项" in readme and "jobs_sandboxed" in readme
 
 
 def test_ps_statuses_are_known():

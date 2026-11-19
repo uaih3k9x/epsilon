@@ -44,7 +44,7 @@ type ItemInfo struct {
 
 const doc = "docs/jobs-sandbox.md "
 
-// Items 和 docs/jobs-sandbox.md 第 7 节的 18 条一一对应。
+// Items 和 docs/jobs-sandbox.md 第 7 节的 21 条一一对应（19–21 是没自动化的手工步骤，run.ps1 报 MANUAL）。
 var Items = []ItemInfo{
 	{0, "运行与清理（前置检查、自检退出码、收尾）", "tools/sandbox-check/README.md"},
 	{1, "CreateProcessWithLogonW 挂起、重定向输出、放进作业对象", doc + "第 2 节「启动」"},
@@ -65,6 +65,9 @@ var Items = []ItemInfo{
 	{16, "删特权后 torch/CUDA；窗口站/桌面权限；CWF_CREATE_ONLY 重建", doc + "第 2 节「独立桌面」「Low IL 和特权」"},
 	{17, "系统金丝雀新增项（hardlink、chdir_tmp、exec_artifact_root、read_data_disk、privileges_dropped）", doc + "第 5 节「金丝雀」"},
 	{18, "命令行长度在 1024 字符以内", doc + "第 2 节「启动」"},
+	{19, "攻击任务包（WMI、schtasks、mklink /J、自带 DACL、留后台进程、第二个任务读第一个的输出）：手工", doc + "第 7 节第 19 条、第 8 节剩余风险"},
+	{20, "跑到一半杀探针，整棵进程树一起死：手工", doc + "第 7 节第 20 条"},
+	{21, "开销：每次金丝雀的耗时、Low IL 下 torch 的导入时间：手工", doc + "第 7 节第 21 条"},
 }
 
 var rank = map[string]int{PASS: 0, SKIP: 1, MANUAL: 2, FAIL: 3}
@@ -212,11 +215,11 @@ type Report struct {
 	Generated string         `json:"generated"`
 	Host      string         `json:"host,omitempty"`
 	Overall   string         `json:"overall"`
-	Counts    map[string]int `json:"counts"` // 第 1–18 项各状态的个数
+	Counts    map[string]int `json:"counts"` // 第 1 项起各状态的个数
 	Items     []ItemResult   `json:"items"`
 }
 
-// Build 按项汇总。没有任何结果的项补一条 SKIP（没跑到）。总体 = 第 1–18 项加上第 0 项的 FAIL。
+// Build 按项汇总。没有任何结果的项补一条 SKIP（没跑到）。总体 = 第 1 项起的各项加上第 0 项的 FAIL。
 func Build(checks []Check, host string, now time.Time) Report {
 	r := Report{Version: 1, Generated: now.Format(time.RFC3339), Host: host, Counts: map[string]int{}}
 	by := make([][]Check, len(Items))
@@ -259,7 +262,7 @@ func (r Report) JSON() ([]byte, error) { return json.MarshalIndent(r, "", "  ") 
 func (r Report) Text() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Epsilon 批任务沙箱真机验证（docs/jobs-sandbox.md 第 7 节）\n生成 %s  主机 %s\n", r.Generated, r.Host)
-	fmt.Fprintf(&b, "总体: %s    PASS %d  FAIL %d  MANUAL %d  SKIP %d（第 1–18 项）\n", r.Overall, r.Counts[PASS], r.Counts[FAIL], r.Counts[MANUAL], r.Counts[SKIP])
+	fmt.Fprintf(&b, "总体: %s    PASS %d  FAIL %d  MANUAL %d  SKIP %d（第 1–%d 项）\n", r.Overall, r.Counts[PASS], r.Counts[FAIL], r.Counts[MANUAL], r.Counts[SKIP], len(Items)-1)
 	b.WriteString("FAIL = 不符合设计，按该项后面写的文档章节查；MANUAL = 证据收齐了，要人判断；SKIP = 没验证到（缺环境层、缺 GPU 或前面失败）。\n\n")
 	items := append([]ItemResult(nil), r.Items...)
 	sort.SliceStable(items, func(i, j int) bool { return rank[items[i].Status] > rank[items[j].Status] })

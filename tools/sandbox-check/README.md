@@ -1,7 +1,9 @@
 # 批任务沙箱真机验证套件
 
-把 `docs/jobs-sandbox.md` 第 7 节那 18 项"必须在真 Windows 上验证"的单子，变成在一台牺牲机上**一条命令跑完、拿回一份报告**。
+把 `docs/jobs-sandbox.md` 第 7 节那 21 项"必须在真 Windows 上验证"的单子，变成在一台牺牲机上**一条命令跑完、拿回一份报告**。
 能自动判的自动判（PASS / FAIL），证据收齐了要人拿主意的标 MANUAL，没条件测的（缺环境层、缺 GPU）标 SKIP。
+**第 19–21 项（攻击任务包、跑到一半杀探针、量开销）和第 3 项里"和沙箱前对比"套件不做**，报告里各有一条 MANUAL（4.2）：
+所以报告的总体最好也只是 MANUAL，不会是 PASS。
 
 套件只读状态、起测试进程、建测试任务目录，**不改 install.ps1 装好的任何配置**，结束时把自己弄出来的东西清掉。
 但它会以任务账户真的去试那些"应该被拦下"的操作：要是哪一项没拦住，机器上就真的留下了痕迹。所以只在牺牲机上跑。
@@ -103,13 +105,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\epsilon\sandbox-check\run
 | SKIP | 没验证到：缺环境层 / torch / GPU、没放 `epsilon-probe.exe`，或者前面一步失败了 |
 
 id 的前缀就是第 7 节的条目号；`selftest.*` 是 `-sandbox-selftest` 的原行，`0.*` 是运行和清理本身。
+`0.helper_identity` 是 FAIL 的话（helper 拿到的是提升的令牌，比如登录的是关了 UAC 的管理员），后面的结果都是在比探针高的权限下测的，不算数。
 
 ### 4.1 能自动判的
 
 | 项 | 怎么判 |
 |---|---|
 | 1 | `CreateProcessWithLogonW` 挂起起 `cmd /c echo`，输出进了文件、退出码 0（`1.start_stdout`）；任务进程在作业里（`1.in_job`）；seclogon 起的挂起进程事先在不在别的作业里（`1.prior_job`，在的话 MANUAL） |
-| 2 | 非提升身份建窗口站和桌面（`2.winsta_limited`、自检 `health`）；Low IL 下 `CreateWindowExW`（`2.user32_window`）；自检 `desktop` |
+| 2 | 非提升身份建窗口站和桌面（`2.winsta_limited`、自检 `health`）；Low IL 下 `CreateWindowExW`（`2.user32_window`）；自检 `desktop`；反向：任务打不开交互窗口站 `WinSta0`（自检 `winsta0_denied`，必须错误 5）、令牌里没有 Users 以外的本机组（自检 `token_groups`，证据里有登录 SID） |
 | 3 | 就绪记录 il=low（`3.*.ready`）、令牌 Low（`3.low_il`）、torch 导入耗时、CUDA matmul、DataLoader 两个 worker；自检 `integrity_low`、`ready_main`、往 ProgramData / Windows\Temp / Users\Public 写不进 |
 | 4 | 自检 `exec_tmp`、`load_tmp_dll`、`set_dacl_own_file`、任务目录各处写不进；Low IL 下 makedirs / walk / rmtree（`4.fs_ops`）；cuDNN 卷积（`4.cudnn`） |
 | 5 | 两条规则在、按 SID、不要 IPsec（`5.fw_rules`）；任务账户连主控和 192.0.2.1 必须 10013；回环必须连得上、探针这边收得到；对照：探针自己连不是 10013 |
@@ -117,7 +120,7 @@ id 的前缀就是第 7 节的条目号；`selftest.*` 是 `-sandbox-selftest` �
 | 7 | `multiprocessing` spawn 的 Pool 和 DataLoader worker 跑得起来；测试任务被拦过的话 `7.*.blocks` 记 MANUAL、列出事件；自检钩子那一段全部 |
 | 8 | 探针身份解得开 SYSTEM 写的密码文件（`8.dpapi_limited`、自检 `health`） |
 | 9 | seclogon 没被禁用；secedit 四条拒绝里有任务账户、拒绝本地登录里没有 |
-| 10 | 非管理员列得出任务账户的进程（`10.visible`，附带查不到 SID 的进程数）、结束得了（`10.terminate`）；普通进程退出后多久从枚举里消失，超过 3 秒宽限算 FAIL（`10.sweep_after_exit_*`）；测试任务结束后没有判成逃出（`10.*.no_escape`） |
+| 10 | 非管理员列得出任务账户的进程（`10.visible`，附带查不到 SID 的进程数）、结束得了（`10.terminate`，作业内的进程；作业外的、WMI 起的没测，见第 19 项）；普通进程退出后多久从枚举里消失，超过 3 秒宽限算 FAIL（`10.sweep_after_exit_*`）；测试任务结束后没有判成逃出（`10.*.no_escape`） |
 | 11 | 关连接时挂着的 `ReadFile` 2 秒内醒、`Close` 时挂着的 `ConnectNamedPipe` 3 秒内醒（醒不了记 MANUAL：探针不会卡住，只是多等） |
 | 12 | 账户属性、只在 Users、登录界面隐藏、`secrets\` 受保护且拒绝任务账户、`D:\epsilon` 根上两条拒绝、`envs\` 读+执行、每个数据卷根拒读、install.log 里是 "job sandbox ready" |
 | 15 | 任务建只给自己的锁目录后，收回是报错中止（改名隔离，PASS）还是报成功却跳过了（FAIL，要加抽查）；`mkdir(0o700)` 之后收回成不成 |
@@ -135,6 +138,12 @@ id 的前缀就是第 7 节的条目号；`selftest.*` 是 `-sandbox-selftest` �
   （教室管理软件、llama-server :8080、ggml-rpc-server :50052 尤其要看）。
 - **14 C: 可读内容**：`inventory.txt` 里 `KEY` 是内容像口令/密钥，`NAME` 是文件名可疑，`EXT` 是配置类。看有没有管理软件的配置、口令。
 - **1 嵌套作业**、**11 叫不醒**、**15 mkdir(0o700)** 出现 MANUAL 时，证据里写了影响和该拍板的事。
+- **3 和沙箱前对比**（`3.baseline_compare`）：同一台机器上不开沙箱跑一次 smoke 和 torch GPU + DataLoader，对比显存和耗时。
+- **19 攻击任务包**（`19.attack_pack`，第 7 节步骤 4）：用测试钥匙环签一个攻击包，逐条试 `docs/jobs-sandbox.md` 第 7 节第 19 条列的操作，
+  每一条都要被拦下并在 `audit.log` 里留记录；**逃出作业的进程**（WMI `Win32_Process.Create`、schtasks）要让本机停接
+  （事件里有"逃出"），再看它是不是真被结束了（`Sweep` 以探针身份可能结束不了，文档第 8 节）。套件里"逃出作业"这条路一次都没真走过。
+- **20 跑到一半杀探针**（`20.kill_probe_midway`）：任务跑着时结束 `epsilon-probe.exe`，整棵进程树要一起死（作业对象 KILL_ON_JOB_CLOSE）。
+- **21 开销**（`21.overhead`）：每次金丝雀的耗时、Low IL 下 torch 的导入时间（自检和 `3.torch_import` 有一部分）。
 
 ### 4.3 C: 还原后（第 8 项）
 
@@ -160,8 +169,8 @@ id 的前缀就是第 7 节的条目号；`selftest.*` 是 `-sandbox-selftest` �
 | 17 | 第 5 节「金丝雀」；`jobbox/py/canary_sys.py` |
 | `0.*` | 本文件；受限阶段没起来多半是没人登录桌面 |
 
-全部过了（或 MANUAL 都看过、拍了板）之后，才把 `docs/jobs.md` 的"上线前必须做"改成"已做"，
-`probe.json` 的 `jobs_sandboxed` 才能打开。
+没有 FAIL、每一条 MANUAL 都看过并拍了板，**并且第 19–21 项和 `3.baseline_compare` 都按 4.2 手工做完**之后，
+才把 `docs/jobs.md` 的"上线前必须做"改成"已做"，`probe.json` 的 `jobs_sandboxed` 才能打开。只看报告全 PASS 是不够的（也不会出现）。
 
 ## 6. 回滚
 
