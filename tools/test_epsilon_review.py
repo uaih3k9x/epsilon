@@ -106,12 +106,94 @@ def test_process_needs_explanation(src):
     assert not rules(fs, REJECT)
 
 
-@pytest.mark.parametrize("src", ["import ctypes", "from ctypes import windll", "import cffi", "import winreg",
-                                 "import win32api", "import _winapi", "import msvcrt"])
-def test_native_needs_explanation(src):
+# 11-18: 原生调用逃生口 (ctypes / cffi / pywin32 / _winapi / msvcrt ...) 从需解释升到拒签.
+# 任务代码能直接调 CreateFileW / LoadLibrary / WNetAddConnection, 绕过沙箱的目录 ACL 和审计钩子;
+# torch 等库内部用 ctypes 属于环境层, 不在代码包里, 不受影响.
+
+NATIVE_REJECT = [
+    "import ctypes",
+    "import ctypes.util",
+    "import ctypes.wintypes",
+    "from ctypes import windll",
+    "from ctypes import wintypes",
+    "from ctypes.wintypes import HANDLE",
+    "from ctypes.util import find_library",
+    "import ctypes as c\nc.windll.kernel32.CreateFileW(p, 0, 0, sd, 3, 0, None)",
+    "import _ctypes",
+    "import cffi",
+    "from cffi import FFI",
+    "import _cffi_backend",
+    "import _winapi",
+    "import win32api",
+    "import win32file",
+    "import win32security",
+    "import win32con",
+    "import win32com.client",
+    "import pywintypes",
+    "import pythoncom",
+    "import msvcrt",
+    "import comtypes",
+    "import os\nos.add_dll_directory('x')",
+    "from os import add_dll_directory",
+    "import mmap\nm = mmap.mmap(-1, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)",
+    "from mmap import PROT_EXEC",
+    "import mmap\nm = mmap.mmap(-1, 4096, prot=7)",
+    # 动态导入
+    "__import__('ctypes')",
+    "__import__('ctypes.wintypes')",
+    "import importlib\nimportlib.import_module('ctypes')",
+    "import importlib\nimportlib.import_module('win32file')",
+    "from importlib import import_module as im\nim('_winapi')",
+    # 拼接 / 变量 / getattr 混淆
+    "__import__('ct' + 'ypes')",
+    "import importlib\nimportlib.import_module('win' + '32' + 'api')",
+    "m = 'ctyp' + 'es'\n__import__(m)",
+    "__import__(f'{\"ctypes\"}')",
+    "__import__(''.join(['ct', 'yp', 'es']))",
+    "import os\ngetattr(os, 'add_dll_' + 'directory')('x')",
+    "import os\ngetattr(os, 'add_dll_directory')('x')",
+    "import builtins\ngetattr(builtins, '__import__')('ctypes')",
+    # 不 import 也拿得到: torch / numpy 早把 ctypes 载进来了
+    "import sys\nk = sys.modules['ctypes'].windll.kernel32",
+    "import sys\nk = sys.modules.get('ctypes')",
+    "import numpy as np\nnp.ctypeslib.ctypes.CDLL('x')",
+    "import numpy\nlib = numpy.ctypeslib.load_library('x', '.')",
+]
+
+
+@pytest.mark.parametrize("src", NATIVE_REJECT)
+def test_native_call_escape_rejected(src):
+    fs = scan_py(src)
+    hits = [f for f in fs if f.rule == "native-api" and f.level == REJECT]
+    assert hits, [(f.rule, f.level, f.message) for f in fs]
+    assert any("沙箱" in f.message and "审计钩子" in f.message for f in hits)
+
+
+@pytest.mark.parametrize("src", [
+    "import winreg",                      # 走 Python 自己的封装，有审计事件
+    "import _overlapped",
+    "def f(m):\n    return m.ctypeslib",  # 接收者认不出来：可能是 numpy
+    "def f(m):\n    return getattr(m, 'windll')",
+])
+def test_native_api_soft_cases_need_explanation(src):
     fs = scan_py(src)
     assert "native-api" in rules(fs, EXPLAIN)
-    assert not rules(fs, REJECT)
+    assert "native-api" not in rules(fs, REJECT)
+
+
+@pytest.mark.parametrize("src", [
+    "import mmap\nm = mmap.mmap(-1, 4096)",
+    "import mmap\nm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)",
+    "import numpy as np\nx = np.zeros(3)\ny = x.astype(np.float32)",
+    "import torch\nt = torch.zeros(3)",
+    "from types import SimpleNamespace",
+])
+def test_native_false_positives(src):
+    assert "native-api" not in rules(scan_py(src))
+
+
+def test_native_rule_bumped_rules_version():
+    assert er.RULES_VERSION >= 2
 
 
 @pytest.mark.parametrize("src", ["import socket", "import requests", "from urllib.request import urlopen",

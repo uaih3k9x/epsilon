@@ -7,7 +7,8 @@
 工具不是沙箱、不做最终裁决：负责把可疑点一个不漏地列出来，签不签由审核人决定。
 
 分级（2026-11-01 定）：拒签只留审核人读不到的代码（二进制、pickle 系、写 .py 再导入、审计钩子）；
-动态执行、进程、系统 API、联网等需解释，审核人当场判断。规则、退出码、JSON 契约见 docs/review.md。
+动态执行、进程、系统 API、联网等需解释，审核人当场判断。11-18 补：原生调用逃生口（ctypes、cffi、pywin32、
+_winapi、msvcrt、add_dll_directory、可执行 mmap）拒签，它们能绕过沙箱的目录 ACL 和审计钩子。规则、退出码、JSON 契约见 docs/review.md。
 """
 
 import argparse
@@ -29,7 +30,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 
 TOOL_VERSION = "0.1.0"
-RULES_VERSION = 1  # 规则或级别一改就加 1；sign-job 把它记进签名记录
+RULES_VERSION = 2  # 规则或级别一改就加 1；sign-job 把它记进签名记录
 
 REJECT, EXPLAIN, INFO, ERROR = "reject", "explain", "info", "error"
 LABEL = {ERROR: "工具出错", REJECT: "拒签", EXPLAIN: "需解释", INFO: "提示"}
@@ -483,8 +484,21 @@ MODULE_RULES.append(("multiprocessing.reduction", REJECT, "pickle-use",
                      "用了 multiprocessing.reduction（ForkingPickler 就是 pickle）", _PICKLE_HINT))
 for _m in ("code", "codeop"):
     MODULE_RULES.append((_m, EXPLAIN, "exec-call", f"导入了 {_m}：能把字符串当代码执行", "送审单里说明执行的是什么"))
-for _m in ("ctypes", "_ctypes", "cffi", "winreg", "_winreg", "_winapi", "msvcrt", "pywintypes", "pythoncom", "_overlapped"):
+# 原生调用逃生口：能直接调 CreateFileW / LoadLibrary / WNetAddConnection 之类，绕过沙箱 ACL 和审计钩子。
+# win32* 前缀另在 check_module 里认；torch 等库内部用 ctypes 属于环境层，不在代码包里。
+_NATIVE_MODULES = ("ctypes", "_ctypes", "cffi", "_cffi_backend", "_winapi", "msvcrt", "pywintypes", "pythoncom",
+                   "comtypes")
+_NATIVE_WHY = "能直接调系统原生 API（CreateFileW、LoadLibrary、WNetAddConnection、直连 SMB 等），可绕过沙箱 ACL/审计钩子"
+_NATIVE_HINT = "任务代码不需要直接调原生 API；需要的功能找平台在环境层提供"
+for _m in _NATIVE_MODULES:
+    MODULE_RULES.append((_m, REJECT, "native-api", f"导入了 {_m}：{_NATIVE_WHY}", _NATIVE_HINT))
+for _m in ("winreg", "_winreg", "_overlapped"):
     MODULE_RULES.append((_m, EXPLAIN, "native-api", f"导入了 {_m}：直接碰系统 API", "送审单里说明调了什么、为什么非用不可"))
+# 属性链中间出现这些名字也算拿到了原生调用能力：sys.modules["ctypes"]、numpy.ctypeslib.ctypes
+_NATIVE_SEGMENTS = set(_NATIVE_MODULES) | {"ctypeslib"}
+# 接收者认不出来时（模块经参数传进来、numpy 数组的 .ctypes）取这些属性：需解释
+_OPAQUE_NATIVE = _NATIVE_SEGMENTS | {"windll", "oledll", "cdll", "pydll", "pythonapi", "CDLL", "WinDLL", "OleDLL",
+                                     "PyDLL", "add_dll_directory"}
 for _m in ("socket", "_socket", "requests", "urllib", "urllib2", "urllib3", "http.client", "http.server", "httplib",
            "ftplib", "smtplib", "poplib", "imaplib", "telnetlib", "nntplib", "xmlrpc", "socketserver", "paramiko",
            "aiohttp", "httpx", "websocket", "websockets", "pycurl", "wget"):
@@ -516,8 +530,8 @@ FUNC_RULES = [
     (r"sys\.addaudithook", REJECT, "audit-hook", "任务代码不该碰审计钩子（平台用它做运行时兜底）", "删掉"),
     (r"asyncio\.create_subprocess_(exec|shell)|platform\.popen", EXPLAIN, "process-call", "{q} 会起子进程",
      "送审单里说明起什么进程、参数从哪来"),
-    (r"os\.add_dll_directory|importlib\.machinery\.ExtensionFileLoader", EXPLAIN, "native-api",
-     "{q} 会加载本地二进制", "送审单里说明"),
+    (r"os\.add_dll_directory|importlib\.machinery\.ExtensionFileLoader|mmap\.PROT_EXEC", REJECT, "native-api",
+     "{q}：加载本地二进制 / 可执行内存，" + _NATIVE_WHY, _NATIVE_HINT),
     (r"asyncio\.open_connection|asyncio\.start_server", EXPLAIN, "network", "{q} 会联网", "送审单里说明连哪、传什么"),
     (r"base64\.(b64decode|b32decode|b32hexdecode|b16decode|b85decode|a85decode|urlsafe_b64decode|standard_b64decode"
      r"|decodebytes|decodestring)|binascii\.(a2b_\w+|unhexlify)|codecs\.(decode|getdecoder|iterdecode|getincrementaldecoder)"
@@ -587,6 +601,13 @@ def _const_str(node):
     return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
 
 
+def _native_segment(q):
+    """属性链中间出现 ctypes 之类（开头就是的由导入那条报）。"""
+    parts = q.split(".")
+    return parts[0] not in _NATIVE_SEGMENTS and not parts[0].startswith("win32") and \
+        any(p in _NATIVE_SEGMENTS for p in parts[1:])
+
+
 # ============================================================================ 代码层：扫描
 
 class _PyScan:
@@ -621,15 +642,15 @@ class _PyScan:
             fq = self.resolve(node.func, depth + 1)
             arg = self._arg(node, 1 if "builtins.getattr" in fq else 0)
             if "builtins.getattr" in fq:
-                s = _const_str(arg)
+                s = self._fold(arg)
                 return {f"{b}.{s}" for b in self.resolve(node.args[0], depth + 1)} if s and node.args else set()
             if fq & _DYN_IMPORT:
-                s = _const_str(arg)
+                s = self._fold(arg)
                 if s is None:
                     return {"?"}
                 return {s.split(".")[0] if "builtins.__import__" in fq else s}
             if fq & _NAME_RESOLVERS:
-                s = _const_str(arg)
+                s = self._fold(arg)
                 return {"?"} if s is None else {s.replace(":", ".")}
             if "builtins.vars" in fq and node.args:
                 return self.resolve(node.args[0], depth + 1)
@@ -651,6 +672,38 @@ class _PyScan:
         if isinstance(node, ast.NamedExpr):
             return self.resolve(node.value, depth + 1)
         return set()
+
+    def _fold(self, node, depth=0):
+        """能静态算出来的字符串：字面量、+ 拼接、只含常量的 f-string、"".join([...])、只赋过一次值的变量。"""
+        if node is None or depth > 10:
+            return None
+        s = _const_str(node)
+        if s is not None:
+            return s
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            a, b = self._fold(node.left, depth + 1), self._fold(node.right, depth + 1)
+            return a + b if a is not None and b is not None else None
+        if isinstance(node, ast.JoinedStr):
+            out = []
+            for v in node.values:
+                if isinstance(v, ast.FormattedValue):
+                    if v.format_spec is not None or v.conversion not in (-1, ord("s")):
+                        return None
+                    v = v.value
+                x = self._fold(v, depth + 1)
+                if x is None:
+                    return None
+                out.append(x)
+            return "".join(out)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "join" \
+                and len(node.args) == 1 and not node.keywords and isinstance(node.args[0], (ast.List, ast.Tuple)):
+            sep = self._fold(node.func.value, depth + 1)
+            parts = [self._fold(e, depth + 1) for e in node.args[0].elts]
+            return sep.join(parts) if sep is not None and None not in parts else None
+        if isinstance(node, ast.Name):
+            vals = {self._fold(v, depth + 1) for v in self._lookup(node)}
+            return vals.pop() if len(vals) == 1 and None not in vals else None
+        return None
 
     @staticmethod
     def _arg(call, pos, kw=None):
@@ -770,9 +823,19 @@ class _PyScan:
                 self.add(level, rule, node, msg, hint)
                 hit = True
         if mod.split(".")[0].startswith("win32"):
-            self.add(EXPLAIN, "native-api", node, f"导入了 {mod}：直接碰 Windows API", "送审单里说明调了什么、为什么非用不可")
+            self.add(REJECT, "native-api", node, f"导入了 {mod}（pywin32）：{_NATIVE_WHY}", _NATIVE_HINT)
             hit = True
+        if _native_segment(mod):
+            hit |= self._native_reject(mod, node)
         return hit
+
+    def _native_reject(self, q, node):
+        """同一个位置只报一次（from numpy import ctypeslib 会先后经过导入和引用两条路）。"""
+        pos = (getattr(node, "lineno", 0), getattr(node, "col_offset", -1) + 1)
+        if any(f.rule == "native-api" and f.level == REJECT and (f.line, f.col) == pos for f in self.out):
+            return True
+        self.add(REJECT, "native-api", node, f"经 {q} 拿到了原生调用能力：{_NATIVE_WHY}", _NATIVE_HINT)
+        return True
 
     def check_qualified(self, quals, node):
         for q in sorted(quals):
@@ -783,6 +846,8 @@ class _PyScan:
                     self.add(EXPLAIN, "process-call", node, f"对动态导入的模块调用 .{q[2:]}：可能是起进程",
                              "模块名写死；送审单里说明")
                 continue
+            if _native_segment(q):
+                self._native_reject(q, node)
             if _PROCESS_RE.match(q):
                 self.add(EXPLAIN, "process-call", node, f"{q} 会起子进程", "送审单里说明起什么进程、参数从哪来")
             for pat, level, rule, msg, hint in FUNC_RULES:
@@ -851,6 +916,9 @@ class _PyScan:
                 if _OPAQUE_PROCESS.match(node.attr) and isinstance(node.ctx, ast.Load) and not self.resolve(node.value):
                     self.add(EXPLAIN, "process-call", node, f"对认不出来的对象取 .{node.attr}：可能是 os / subprocess 经参数传进来",
                              "直接写 os.xxx / subprocess.xxx；送审单里说明")
+                if node.attr in _OPAQUE_NATIVE and isinstance(node.ctx, ast.Load) and not self.resolve(node.value):
+                    self.add(EXPLAIN, "native-api", node, f"对认不出来的对象取 .{node.attr}：可能是经别的模块拿到 ctypes 一类",
+                             "直接写出来源；送审单里说明")
                 if node.attr in _DUNDERS:
                     self.add(EXPLAIN, "dunder-access", node, f"碰了内部属性 {node.attr}", "直接写要用的属性，别经过内部属性")
                 if isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -896,6 +964,17 @@ class _PyScan:
 
     def _check_sys_modules(self, node, parent):
         """sys.modules["os"] 能认出来；下标不是字面量、.get(name) 之类就认不出取的是哪个模块。"""
+        # torch / numpy 早就把 ctypes 载进来了：不 import 也能从 sys.modules 拿，字面量名字照导入查
+        if isinstance(parent, ast.Subscript) and parent.value is node and isinstance(parent.ctx, ast.Load):
+            name = self._fold(parent.slice)
+            if name:
+                self.check_module(name, parent)
+        elif isinstance(parent, ast.Attribute) and parent.value is node and parent.attr in ("get", "pop", "__getitem__"):
+            call = self.parent.get(parent)
+            if isinstance(call, ast.Call) and call.func is parent:
+                name = self._fold(self._arg(call, 0))
+                if name:
+                    self.check_module(name, call)
         if isinstance(parent, ast.Subscript) and parent.value is node and (
                 _const_str(parent.slice) is not None or isinstance(parent.ctx, (ast.Store, ast.Del))):
             return
@@ -922,6 +1001,10 @@ class _PyScan:
             inner = ast.Call(func=node.args[0], args=node.args[1:], keywords=node.keywords)
             ast.copy_location(inner, node)
             self._check_deserialize(inner, self.resolve(node.args[0]), "", partial=True)
+        if "mmap.mmap" in fq:
+            prot = self._arg(node, 3, "prot")
+            if isinstance(prot, ast.Constant) and isinstance(prot.value, int) and prot.value & 4:   # PROT_EXEC
+                self.add(REJECT, "native-api", node, f"mmap 申请了可执行内存：{_NATIVE_WHY}", _NATIVE_HINT)
         self._check_path_loader(node, fq)
         self._check_decode(node, fq, term)
         self._check_writes(node, fq, term, writes_py)
@@ -937,12 +1020,22 @@ class _PyScan:
             if s is None:
                 self.add(EXPLAIN, "reflect-nonliteral", node, f"{short} 的名字参数不是字面量",
                          "写死的字典分派 MODELS = {...}，参数声明成 enum")
+                folded = self._fold(arg)    # "ct" + "ypes" 这类拼接：照拼出来的名字再查一遍
+                if folded and (q in _DYN_IMPORT or q in _NAME_RESOLVERS or q == "runpy.run_module"):
+                    self.check_module(folded.replace(":", "."), node)
+                if folded and q == "builtins.getattr" and folded in _OPAQUE_NATIVE and node.args \
+                        and not self.resolve(node.args[0]):
+                    self.add(EXPLAIN, "native-api", node, f"对认不出来的对象取 {folded!r}：可能是经别的模块拿到 ctypes 一类",
+                             "直接写出来源；送审单里说明")
             else:
                 self.add(INFO, "reflect-literal", node, f"{short}({s!r})：名字是字面量", "能直接写属性 / import 就直接写")
                 if s in _DUNDERS:
                     self.add(EXPLAIN, "dunder-access", node, f"经 {short} 碰了内部属性 {s}", "别经过内部属性")
                 if q in _DYN_IMPORT or q in _NAME_RESOLVERS or q == "runpy.run_module":
                     self.check_module(s.replace(":", "."), node)
+                if q == "builtins.getattr" and s in _OPAQUE_NATIVE and node.args and not self.resolve(node.args[0]):
+                    self.add(EXPLAIN, "native-api", node, f"对认不出来的对象取 {s!r}：可能是经别的模块拿到 ctypes 一类",
+                             "直接写出来源；送审单里说明")
                 if q == "builtins.getattr" and _OPAQUE_PROCESS.match(s) and node.args and not self.resolve(node.args[0]):
                     self.add(EXPLAIN, "process-call", node, f"对认不出来的对象取 {s!r}：可能是 os / subprocess 经参数传进来",
                              "直接写 os.xxx / subprocess.xxx；送审单里说明")
