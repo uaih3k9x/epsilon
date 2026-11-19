@@ -46,7 +46,8 @@
 
 loader 的步骤：
 1. 只在 `pending == ""` 时动手；目标槽 = `current` 以外的那个（`current` 为空时是 A）。**绝不写 current 槽**。
-2. 清空目标槽 → 逐个下载文件（`.part` → 校验大小和 sha256 → 改名）→ 最后写 `release.json`。
+2. 先验主控给的发布（签名 + `min_boot` ≤ boot 版本 + 清单里有 `epsilon-probe.exe`，和 boot 共用 `boot.CheckManifest`），不过就什么都不动——目标槽可能正是 good 退路。
+   过了再清空目标槽 → 逐个下载文件（`.part` → 校验大小和 sha256 → 改名）→ 最后写 `release.json`。
 3. 对整个槽按 boot 同样的规则验一遍（签名 + 清单里有 `epsilon-probe.exe` + 每个文件哈希 + `min_boot` ≤ boot 版本）。
 4. 原子写 `staged.json`。它出现就表示"槽已备好、可以切"。
 
@@ -208,6 +209,8 @@ state 也不跑验不过的 R。用几个故意改坏的 boot.go（不核对版�
   不碰 `-out`（不清旧产出、不写 release.json），免得签出一份所有引导器都拒收的发布。`deploy/release.sh` 本来就传
   `dist/build/epsilon-probe.exe`，不受影响。测试：`TestReleaseRefusesWithoutProbe`、`TestReleaseRefusesWithoutProbeKeepsOldOutput`、
   `TestReleaseWithProbeSigns`（签出来的直接过 `VerifySlot`）。
+  同一循环里也拒掉重复的文件名（会在 `-out` 里互相覆盖、清单留两条同名 path）：`TestReleaseRefusesDuplicateNames`。
+  loader 侧：`release()` 用 `boot.CheckManifest` 在清空目标槽、下载之前就拒缺本体的发布（`TestStageRejectsRelease/清单缺本体`）。
 - **F2 bad 只记一个版本**。两个坏版本交替下发（比如管理员在两个版本之间来回调），每个都会重新试满 MaxTries 次，
   来回空转。可能的改法：bad 改成最近几个版本的列表（State 加字段，动契约），或者在主控 / loader 侧挡住。
 - **F3 槽里多余的文件不拦**。只有清单里的文件受保护。本体或它拉起的程序如果按名字加载同目录的 DLL，多出来的

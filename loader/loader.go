@@ -138,7 +138,7 @@ func (l *Loader) sameTarget(st boot.State, target string) bool {
 	return ok && t == target
 }
 
-// release 取主控的签名发布并验过：签名、min_boot。
+// release 取主控的签名发布并验过：签名、min_boot、清单里有 ProbeExe（和 boot 同一个 CheckManifest）。
 func (l *Loader) release(ctx context.Context) (boot.Signed, boot.Manifest, error) {
 	var rel boot.Signed
 	r, err := l.get(ctx, "/v1/boot/release")
@@ -154,8 +154,9 @@ func (l *Loader) release(ctx context.Context) (boot.Signed, boot.Manifest, error
 	if err != nil {
 		return rel, m, fmt.Errorf("主控给的发布: %w", err)
 	}
-	if m.MinBoot > l.BootVersion {
-		return rel, m, fmt.Errorf("版本 %s 要引导器 %d，本机是 %d", m.Version, m.MinBoot, l.BootVersion)
+	// min_boot、清单里有本体（F1）：清空目标槽之前就拒，那个槽可能是 good 退路
+	if err := boot.CheckManifest(m, l.BootVersion); err != nil {
+		return rel, m, err
 	}
 	return rel, m, nil
 }

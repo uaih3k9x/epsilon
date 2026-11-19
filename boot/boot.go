@@ -149,7 +149,7 @@ func sumFile(path string) (int64, string, error) {
 	return n, hex.EncodeToString(h.Sum(nil)), err
 }
 
-// check 验槽（签名、min_boot、文件哈希），并核对清单版本 == state 记的版本。
+// check 验槽（VerifySlot：签名、min_boot、清单里有 ProbeExe、文件哈希），并核对清单版本 == state 记的版本。
 // 版本对不上说明 loader 往里写过新东西，不能当已确认的版本跑（docs/boot.md "回退时核对版本"）。
 func (b *Boot) check(st State, slot string) error {
 	m, err := VerifySlot(b.path(slot), b.Keys)

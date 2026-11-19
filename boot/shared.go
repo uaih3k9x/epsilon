@@ -48,6 +48,20 @@ func ReadState(root string) (State, error) {
 	return s, err
 }
 
+// CheckManifest 是不用看文件就能做的检查：min_boot 不超过本引导器、清单里有 ProbeExe（F1）。
+// VerifySlotFor 和 loader 下载前的早拒共用它，两边规则一致。
+func CheckManifest(m Manifest, bootVersion int) error {
+	if m.MinBoot > bootVersion {
+		return fmt.Errorf("版本 %s 要引导器 %d，本机是 %d", m.Version, m.MinBoot, bootVersion)
+	}
+	for _, f := range m.Files {
+		if f.Path == ProbeExe { // 和 safeName 一样按字节比，不折叠大小写
+			return nil
+		}
+	}
+	return fmt.Errorf("版本 %s 的清单里没有 %s", m.Version, ProbeExe)
+}
+
 // VerifySlot 验一个槽：release.json 签名、min_boot 不超过本引导器、清单里有 ProbeExe、每个文件大小和 sha256。
 func VerifySlot(dir string, keys []ed25519.PublicKey) (Manifest, error) {
 	return VerifySlotFor(dir, keys, Version)
@@ -68,15 +82,8 @@ func VerifySlotFor(dir string, keys []ed25519.PublicKey, bootVersion int) (Manif
 	if err != nil {
 		return m, err
 	}
-	if m.MinBoot > bootVersion {
-		return m, fmt.Errorf("版本 %s 要引导器 %d，本机是 %d", m.Version, m.MinBoot, bootVersion)
-	}
-	hasProbe := false
-	for _, f := range m.Files {
-		hasProbe = hasProbe || f.Path == ProbeExe // 和 safeName 一样按字节比，不折叠大小写
-	}
-	if !hasProbe {
-		return m, fmt.Errorf("版本 %s 的清单里没有 %s", m.Version, ProbeExe)
+	if err := CheckManifest(m, bootVersion); err != nil {
+		return m, err
 	}
 	for _, f := range m.Files {
 		n, sum, err := sumFile(filepath.Join(dir, f.Path))

@@ -327,8 +327,12 @@ func TestF1CurrentWithoutProbeFallsBackToGood(t *testing.T) {
 	if slot, trial := b.Pick(); slot != "A" || trial {
 		t.Fatalf("Pick=%q,%v", slot, trial)
 	}
+	// 真跑一遍 Run：启动的是 A，缺本体的 B 一次都没启动
+	stop := run(t, b)
+	waitFor(t, "A 启动", func() bool { return r.count("A") > 0 })
+	stop()
 	if r.count("B") != 0 {
-		t.Fatal("跑了缺本体的槽")
+		t.Fatalf("跑了缺本体的槽: %v", r.list())
 	}
 }
 

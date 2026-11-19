@@ -45,9 +45,15 @@ func runRelease(args []string) error {
 		return errors.New("要 -version 和至少一个文件")
 	}
 	// F1：引导器只收清单里有本体的槽，漏传会签出一份所有机器都拒的发布。按字节比，和 VerifySlot 一致。
-	hasProbe := false
+	// 同名文件会在 -out 里互相覆盖，清单却留两条同名 path，引导器也会拒。
+	hasProbe, seen := false, map[string]bool{}
 	for _, src := range fs.Args() {
-		hasProbe = hasProbe || filepath.Base(src) == boot.ProbeExe
+		name := filepath.Base(src)
+		if seen[name] {
+			return fmt.Errorf("文件名 %s 重复：产出会互相覆盖，引导器会拒收这份发布", name)
+		}
+		seen[name] = true
+		hasProbe = hasProbe || name == boot.ProbeExe
 	}
 	if !hasProbe {
 		return fmt.Errorf("要签入的文件里没有 %s：引导器会拒收这份发布", boot.ProbeExe)
