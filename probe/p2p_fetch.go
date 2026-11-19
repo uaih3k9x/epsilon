@@ -84,6 +84,9 @@ func (a *Agent) fetchAs(ctx context.Context, id string, preload bool) error {
 // defaultChunkSize 和 chunk.DefaultChunkSize 一样：清单没写块大小时按它限回包长度。
 const defaultChunkSize = 64 << 20
 
+// maxChunkSize: 清单里 chunk_size 的上限（默认 64 MiB 的 16 倍）。主控被拿下时可能写个离谱的值。
+const maxChunkSize = 1 << 30
+
 // chunkLimit: 清单里一块最多多大，邻居回包超过就断（坏邻居不能一直灌、写满磁盘）。
 func chunkLimit(m proto.Manifest) int64 {
 	if m.ChunkSize > 0 {
@@ -96,6 +99,9 @@ func chunkLimit(m proto.Manifest) int64 {
 func checkManifest(m proto.Manifest, id string) error {
 	if m.ID != id {
 		return fmt.Errorf("清单 %s 回来的是 %q", id, m.ID)
+	}
+	if m.ChunkSize < 0 || m.ChunkSize > maxChunkSize {
+		return fmt.Errorf("清单 %s 的块大小 %d 不合法", id, m.ChunkSize)
 	}
 	for _, f := range m.Files {
 		for _, h := range f.Chunks {
@@ -258,7 +264,7 @@ func (c *capReader) Read(p []byte) (int, error) {
 	if c.left < 0 {
 		return 0, errTooLong
 	}
-	if int64(len(p)) > c.left+1 {
+	if int64(len(p)) > c.left { // 不写成 > left+1：left 是 MaxInt64 时会溢出
 		p = p[:c.left+1]
 	}
 	n, err := c.r.Read(p)
@@ -313,12 +319,19 @@ func (a *Agent) evict(keep map[string]bool) {
 func (a *Agent) reportHave(add, del []string) {
 	a.hmu.Lock()
 	defer a.hmu.Unlock()
-	// 同一块先加后删只报删、先删后加只报加：主控收到时不用管先后
-	a.haveAdd = without(merge(a.haveAdd, add), del)
-	a.haveDel = without(merge(a.haveDel, del), add)
-	// 持着 hmu 再看一眼缓存：add 由后台合并上报，可能晚于同一块被淘汰时报的 del。
-	// 已经不在的不报 add；淘汰发生在这之后的话，它的 del 要等 hmu，一定排在这次后面。
-	a.haveAdd = slices.DeleteFunc(a.haveAdd, func(h string) bool { return !a.Chunks.Has(h) })
+	// 增减都按持着 hmu 时缓存的现状定，不按调用先后互相抵消：add 由后台合并上报，可能晚于同一块
+	// 被淘汰时报的 del；del 是在 hmu 外算的，发出时块可能已经重新放回来。在的只报 add、不在的只报 del。
+	// 之后再变的话，那次变化的上报要等 hmu，一定排在这次后面。
+	have := map[string]bool{}
+	for _, l := range [][]string{a.haveAdd, a.haveDel, add, del} {
+		for _, h := range l {
+			if _, ok := have[h]; !ok {
+				have[h] = a.Chunks.Has(h)
+			}
+		}
+	}
+	a.haveAdd = slices.DeleteFunc(merge(a.haveAdd, add), func(h string) bool { return !have[h] })
+	a.haveDel = slices.DeleteFunc(merge(a.haveDel, del), func(h string) bool { return have[h] })
 	if len(a.haveAdd) == 0 && len(a.haveDel) == 0 {
 		return
 	}
@@ -387,16 +400,6 @@ func merge(list, more []string) []string {
 		}
 	}
 	return list
-}
-
-func without(list, drop []string) []string {
-	out := list[:0]
-	for _, h := range list {
-		if !slices.Contains(drop, h) {
-			out = append(out, h)
-		}
-	}
-	return out
 }
 
 func (a *Agent) get(ctx context.Context, path string, out any) error {

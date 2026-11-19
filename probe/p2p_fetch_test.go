@@ -297,6 +297,7 @@ func TestReportHave(t *testing.T) {
 	e.fc.haveCode = http.StatusInternalServerError
 	a.reportHave([]string{"aa"}, nil)
 	e.fc.haveCode = 0
+	delete(e.store.data, "aa")                   // 报 del 时块已经不在缓存里
 	a.reportHave([]string{"bb"}, []string{"aa"}) // 上次没报出去的要补上；先加后删的只报删
 	e.fc.mu.Lock()
 	if len(e.fc.haves) != 1 || fmt.Sprint(e.fc.haves[0].Add) != "[bb]" || fmt.Sprint(e.fc.haves[0].Del) != "[aa]" {
