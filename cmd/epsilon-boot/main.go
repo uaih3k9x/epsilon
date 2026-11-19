@@ -79,14 +79,14 @@ func main() {
 		RescueWithin: 30 * time.Minute, RescueGap: 10 * time.Minute,
 		Start: func(slotDir, confirm string) (boot.Proc, error) {
 			// 命令行是冻结契约（docs/boot.md），本体以后的版本都得认这些参数
-			return spawn(*root, filepath.Join(slotDir, "epsilon-probe.exe"),
+			return spawn(*root, filepath.Join(slotDir, boot.ProbeExe),
 				"-config", filepath.Join(*root, "probe.json"), "-log", filepath.Join(*root, "probe.log"),
 				"-workloads", filepath.Join(slotDir, "workloads.json"), "-confirm", confirm,
 				"-boot", fmt.Sprintf("%d/%s", boot.Version, filepath.Base(slotDir)), "-root", *root)
 		},
 		Rescue: func(slotDir string) (boot.Proc, error) {
 			// 同样是冻结契约（docs/boot.md "救援槽 R"）：跑一轮 loader 就退出
-			return spawn(*root, filepath.Join(slotDir, "epsilon-probe.exe"),
+			return spawn(*root, filepath.Join(slotDir, boot.ProbeExe),
 				"-seed", "-config", filepath.Join(*root, "probe.json"), "-root", *root,
 				"-log", filepath.Join(*root, "rescue.log"), // 不然日志默认写进 R（只有安装脚本写 R）
 				"-boot", fmt.Sprintf("%d/%s", boot.Version, boot.RescueSlot))

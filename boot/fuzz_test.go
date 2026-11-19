@@ -75,7 +75,7 @@ func fuzzRoot(f *testing.F) *Boot {
 	if err := makeSlot(filepath.Join(root, "B"), fuzzPriv, "1.B", 1); err != nil {
 		f.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "B", "epsilon-probe.exe"), []byte("evil"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "B", ProbeExe), []byte("evil"), 0o644); err != nil {
 		f.Fatal(err)
 	}
 	return &Boot{Root: root, Keys: fuzzKeys()}
@@ -195,17 +195,17 @@ func fileEntry(name, body string) File {
 }
 
 // 任意 release.json 和本体文件：只要清单原文不是测试私钥签的，就绝不返回 nil；
-// 返回 nil 时 Files 的路径都合 safeName，本体文件和清单对得上。
+// 返回 nil 时 Files 的路径都合 safeName，清单里有 ProbeExe，本体文件和清单对得上。
 func FuzzVerifySlot(f *testing.F) {
 	exe := "probe 1.0"
 	seeds := []Manifest{
-		{Version: "1.0", MinBoot: 1, Files: []File{fileEntry("epsilon-probe.exe", exe)}},
-		{Version: "1.0", MinBoot: Version + 1, Files: []File{fileEntry("epsilon-probe.exe", exe)}},
+		{Version: "1.0", MinBoot: 1, Files: []File{fileEntry(ProbeExe, exe)}},
+		{Version: "1.0", MinBoot: Version + 1, Files: []File{fileEntry(ProbeExe, exe)}},
 		{Version: "1.0", MinBoot: 1},
 		{Version: "", MinBoot: 1},
 		{Version: "1.0", Files: []File{fileEntry(`..\epsilon-probe.exe`, exe)}},
 		{Version: "1.0", Files: []File{fileEntry("sub/epsilon-probe.exe", exe)}},
-		{Version: "1.0", Files: []File{fileEntry("epsilon-probe.exe", exe), fileEntry("workloads.json", "{}")}},
+		{Version: "1.0", Files: []File{fileEntry(ProbeExe, exe), fileEntry("workloads.json", "{}")}},
 	}
 	for _, m := range seeds {
 		addSeed(f, fuzzRelease(m), []byte(exe))
@@ -228,7 +228,7 @@ func FuzzVerifySlot(f *testing.F) {
 	dir := f.TempDir()
 	f.Fuzz(func(t *testing.T, release, body []byte) {
 		os.WriteFile(filepath.Join(dir, ReleaseFile), release, 0o644)
-		os.WriteFile(filepath.Join(dir, "epsilon-probe.exe"), body, 0o644)
+		os.WriteFile(filepath.Join(dir, ProbeExe), body, 0o644)
 		m, err := VerifySlot(dir, fuzzKeys())
 		if err != nil {
 			return
@@ -237,16 +237,21 @@ func FuzzVerifySlot(f *testing.F) {
 		if json.Unmarshal(release, &s) != nil || !fuzzSigned[s.Manifest] {
 			t.Fatalf("放行了不是测试私钥签的清单: %q", release)
 		}
+		hasProbe := false
 		for _, fl := range m.Files {
+			hasProbe = hasProbe || fl.Path == ProbeExe
 			if !safeName.MatchString(fl.Path) {
 				t.Fatalf("放行了非法文件名 %q", fl.Path)
 			}
-			if fl.Path == "epsilon-probe.exe" {
+			if fl.Path == ProbeExe {
 				sum := sha256.Sum256(body)
 				if int64(len(body)) != fl.Size || hex.EncodeToString(sum[:]) != fl.SHA256 {
 					t.Fatal("本体文件和清单对不上也放行了")
 				}
 			}
+		}
+		if !hasProbe {
+			t.Fatalf("放行了没有 %s 的清单（F1）", ProbeExe)
 		}
 	})
 }

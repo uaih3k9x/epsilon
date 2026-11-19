@@ -14,13 +14,18 @@
 
 ```
 <root>\                     例如 D:\epsilon
-  A\  B\                    槽：本体文件 + release.json（签名清单原文）
+  A\  B\                    槽：本体文件 + release.json（签名清单原文）；清单 files 里必须有 epsilon-probe.exe
   boot-state.json           只有 boot 写
   staged.json               只有 loader 创建；只有 boot 删除
   boot-events.jsonl         只有 boot 追加写；loader 只读
   boot-events.sent          只有 loader 写：已转发到的字节偏移
   confirm-A / confirm-B     本体第一次心跳成功后创建；boot 读到就转正
 ```
+
+**清单必需项（冻结，2026-11-18 定，F1）**：`release.json` 的 `files` 里必须有一项 `path` 正好是 `epsilon-probe.exe`
+（`boot.ProbeExe`；按字节比较，不折叠大小写，和文件名规则 `safeName` 一样；带目录的写法本来就不合法）。没有就是坏槽：
+`VerifySlot` / `VerifySlotFor` 返回错误，A/B、R 一视同仁。boot 启动的就是 `<slot>\epsilon-probe.exe`，缺它的槽即使
+能起来，起来的也是没验过签的东西，没人和主控通信，机器失联只能人跑过去。
 
 **每个文件只有一个写入方**（staged.json 是"loader 创建、boot 消费删除"的交接）。写文件一律"临时文件 → 刷盘 → 改名"。
 
@@ -42,7 +47,7 @@
 loader 的步骤：
 1. 只在 `pending == ""` 时动手；目标槽 = `current` 以外的那个（`current` 为空时是 A）。**绝不写 current 槽**。
 2. 清空目标槽 → 逐个下载文件（`.part` → 校验大小和 sha256 → 改名）→ 最后写 `release.json`。
-3. 对整个槽按 boot 同样的规则验一遍（签名 + 每个文件哈希 + `min_boot` ≤ boot 版本）。
+3. 对整个槽按 boot 同样的规则验一遍（签名 + 清单里有 `epsilon-probe.exe` + 每个文件哈希 + `min_boot` ≤ boot 版本）。
 4. 原子写 `staged.json`。它出现就表示"槽已备好、可以切"。
 
 boot 的处理（启动选槽前，以及看护非试启动的本体时每个 Poll 周期检查一次）：
@@ -96,7 +101,7 @@ boot 不下载，所以安装脚本负责放进第一个版本：
 
 loader 住在本体里，本体跑不起来就没人下载修复版。所以加一个**只读的救援槽** `<root>\R`：
 
-- 内容：`epsilon-probe.exe` + 签了名的 `release.json`（+ `workloads.json`），和 A/B 一样能用 `VerifySlot` 验。
+- 内容：`epsilon-probe.exe` + 签了名的 `release.json`（+ `workloads.json`），和 A/B 一样能用 `VerifySlot` 验；清单里同样必须有 `epsilon-probe.exe`。
 - **只有安装脚本写 R**；boot 和 loader 都不写、不删。R 不进 `boot-state.json` 的 `versions`，不当 current / good / pending。
 - **什么时候用**：boot 选槽时"没有能跑的"——
   1. current 和 good 都验不过（或版本对不上），且没有能试的 pending；或者
@@ -143,7 +148,7 @@ R 只在重装时更新，所以"救援时选哪个槽"的规则以**装进 R �
 
 ## 冻结前折磨测试（设计书 11.12，2026-11-18）
 
-生产代码只改了一处：`boot/fault.go` 加了一道断电注入的缝（`faultHook`，生产里是 nil），`boot.go` 里的写盘点
+生产代码改了两处：F1 定下后 `VerifySlot` 要求清单里有本体（见下面 F1）；另一处是 `boot/fault.go` 加了一道断电注入的缝（`faultHook`，生产里是 nil），`boot.go` 里的写盘点
 （`writeAtomic` 的 Create/Write/Sync/Rename、`appendLine` 的轮转 Rename/OpenFile/Write/Sync、删 staged.json 的两处、
 删确认文件的一处）换成了同名小包装，逻辑没动。测试都在 `boot/` 下：
 
@@ -188,13 +193,18 @@ state 也不跑验不过的 R。用几个故意改坏的 boot.go（不核对版�
 ## 冻结前暴露的问题
 
 折磨测试**没有找到 boot 逻辑的 bug**，所以 boot.go 除了换包装没有别的改动。下面几条要动冻结契约，或者要在真机上
-确认，只记下来待定，没有改。F1–F3 各有一条 `TestKnownIssue*` 用例记录现状，定了怎么改再把断言反过来。
+确认。F1 已决定并改了；其余只记下来待定，没有改。F2、F3 各有一条 `TestKnownIssue*` 用例记录现状，定了怎么改再把断言反过来。
 
-- **F1 清单不要求有本体**。`VerifySlot` 只校验清单里列出的文件，不要求列出 `epsilon-probe.exe`；而 boot 启动的就是
-  `<slot>\epsilon-probe.exe`。签名清单如果漏了它，槽里随便放一个 exe 都会被当成验过的本体启动。`epsilon-release` 签的是
-  命令行给的那些文件，也不检查有没有 exe，发版时漏传一个参数就会出这样的清单。可能的改法：`VerifySlot` 要求 `Files` 里有 `epsilon-probe.exe`
-  （loader 也用它，一起生效）。救援槽 R 走的是同一个 `VerifySlot`，R 的清单漏了本体时 R 里的 exe 也会被运行；
-  这个改法对 R 一起生效（`TestKnownIssueF1RescueSlot`）。
+- **F1 清单不要求有本体**（**已决定，2026-11-18，9x 拍板**）。原来 `VerifySlot` 只校验清单里列出的文件，不要求列出
+  `epsilon-probe.exe`；而 boot 启动的就是 `<slot>\epsilon-probe.exe`。签名清单漏了它，槽里随便放一个 exe 都会被当成验过的
+  本体启动，R 也一样。缺探针的槽能通过校验并启动，但启动后没东西和主控通信，机器失联只能人跑过去——是坏槽却看起来是好的。
+  **契约变更**：`VerifySlot` / `VerifySlotFor` 要求 `Files` 里有 `boot.ProbeExe`（`epsilon-probe.exe`，按字节比较），
+  缺了返回错误。boot 按现有逻辑处理：staged 交接被拒；current 验不过就回退到 good；R 验不过记 `boot_rescue_bad`、不跑。
+  loader 用同一个函数验槽，一起生效。引导器版本号不变（还是 2）：现有发布都带本体，新旧 boot 对它们结论一样。
+  测试：`TestF1ManifestMustListProbe`（缺、大小写不同、多后缀、空清单）、`TestF1ManifestWithProbePasses`、
+  `TestF1CurrentWithoutProbeFallsBackToGood`、`TestF1RescueSlotMustListProbe`；`FuzzVerifySlot` 加了"放行的清单一定有本体"。
+  状态机穷举里"被篡改"已经代表"槽验不过"，缺本体对 boot 的选槽逻辑是同一种情况，没有另加一种槽内容。
+  遗留：`epsilon-release` 仍然不检查有没有 exe，漏传会签出一份所有机器都会拒的发布（loader 每轮下载后验不过，不会切过去）。
 - **F2 bad 只记一个版本**。两个坏版本交替下发（比如管理员在两个版本之间来回调），每个都会重新试满 MaxTries 次，
   来回空转。可能的改法：bad 改成最近几个版本的列表（State 加字段，动契约），或者在主控 / loader 侧挡住。
 - **F3 槽里多余的文件不拦**。只有清单里的文件受保护。本体或它拉起的程序如果按名字加载同目录的 DLL，多出来的

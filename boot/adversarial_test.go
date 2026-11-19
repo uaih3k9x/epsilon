@@ -32,8 +32,8 @@ func putRelease(t *testing.T, b *Boot, slot string, release []byte, files map[st
 
 func probeManifest(version string) (Manifest, map[string]string) {
 	body := "probe " + version
-	return Manifest{Version: version, MinBoot: 1, Files: []File{fileEntry("epsilon-probe.exe", body)}},
-		map[string]string{"epsilon-probe.exe": body}
+	return Manifest{Version: version, MinBoot: 1, Files: []File{fileEntry(ProbeExe, body)}},
+		map[string]string{ProbeExe: body}
 }
 
 func signedRaw(t *testing.T, m Manifest, priv ed25519.PrivateKey) (Signed, []byte) {
@@ -189,18 +189,18 @@ func TestAdversarialSlotFiles(t *testing.T) {
 	cases := map[string]func(t *testing.T, b *Boot, priv ed25519.PrivateKey){
 		"本体文件被截断": func(t *testing.T, b *Boot, priv ed25519.PrivateKey) {
 			putSlot(t, b, priv, "B", "0.2.0")
-			p := filepath.Join(b.Root, "B", "epsilon-probe.exe")
+			p := filepath.Join(b.Root, "B", ProbeExe)
 			body := readFile(t, p)
 			write(t, p, body[:len(body)-1])
 		},
 		"本体文件多了一个字节": func(t *testing.T, b *Boot, priv ed25519.PrivateKey) {
 			putSlot(t, b, priv, "B", "0.2.0")
-			p := filepath.Join(b.Root, "B", "epsilon-probe.exe")
+			p := filepath.Join(b.Root, "B", ProbeExe)
 			write(t, p, readFile(t, p)+"x")
 		},
 		"本体文件缺失": func(t *testing.T, b *Boot, priv ed25519.PrivateKey) {
 			putSlot(t, b, priv, "B", "0.2.0")
-			os.Remove(filepath.Join(b.Root, "B", "epsilon-probe.exe"))
+			os.Remove(filepath.Join(b.Root, "B", ProbeExe))
 		},
 		"release.json 缺失": func(t *testing.T, b *Boot, priv ed25519.PrivateKey) {
 			putSlot(t, b, priv, "B", "0.2.0")
@@ -229,7 +229,7 @@ func TestAdversarialSlotFiles(t *testing.T) {
 			putSlot(t, b, priv, "B", "0.2.0")
 			outside := filepath.Join(t.TempDir(), "evil.exe")
 			write(t, outside, "evil")
-			p := filepath.Join(b.Root, "B", "epsilon-probe.exe")
+			p := filepath.Join(b.Root, "B", ProbeExe)
 			os.Remove(p)
 			if err := os.Symlink(outside, p); err != nil {
 				t.Skipf("建不了符号链接: %v", err)
@@ -252,7 +252,7 @@ func TestAdversarialSlotFiles(t *testing.T) {
 func TestAdversarialSymlinkFollowed(t *testing.T) {
 	b, priv, _ := newBoot(t)
 	putSlot(t, b, priv, "B", "0.2.0")
-	p := filepath.Join(b.Root, "B", "epsilon-probe.exe")
+	p := filepath.Join(b.Root, "B", ProbeExe)
 	outside := filepath.Join(t.TempDir(), "same.exe")
 	write(t, outside, readFile(t, p))
 	os.Remove(p)
@@ -275,41 +275,78 @@ func TestKnownIssueF3ExtraFilesIgnored(t *testing.T) {
 	}
 }
 
-// 记录现状（F1）：VerifySlot 不要求清单里有 epsilon-probe.exe。签名清单漏了它时，
-// 槽里随便放一个 epsilon-probe.exe 都会被当成验过的本体启动。
-func TestKnownIssueF1ExeNotRequiredInManifest(t *testing.T) {
-	b, priv, r := newBoot(t)
-	m := Manifest{Version: "0.2.0", MinBoot: 1, Files: []File{fileEntry("workloads.json", "{}")}}
+// F1（已决定）：清单里必须有 ProbeExe。缺了就是坏槽：校验失败、交接被拒、回退到上一个好槽。
+// 名字和 safeName 一样按字节比较，不折叠大小写（boot 启动的就是这个名字，Linux 上大小写不同是另一个文件）；
+// 带目录的写法 Verify 已经拒掉了。
+func TestF1ManifestMustListProbe(t *testing.T) {
+	const fake = "任意未签名的程序"
+	cases := map[string][]File{
+		"只有 workloads.json": {fileEntry("workloads.json", "{}")},
+		"空清单":               nil,
+		"大写":                {fileEntry("EPSILON-PROBE.EXE", fake)},
+		"首字母大写":             {fileEntry("Epsilon-Probe.exe", fake)},
+		"多了后缀":              {fileEntry(ProbeExe+".bak", fake)},
+	}
+	for name, files := range cases {
+		t.Run(name, func(t *testing.T) {
+			b, priv, _ := newBoot(t)
+			putSlot(t, b, priv, "A", "0.1.0")
+			setState(t, b, State{Current: "A", Versions: map[string]string{"A": "0.1.0"}})
+			_, raw := signedRaw(t, Manifest{Version: "0.2.0", MinBoot: 1, Files: files}, priv)
+			bodies := map[string]string{"workloads.json": "{}", ProbeExe: fake}
+			for _, f := range files {
+				bodies[f.Path] = fake
+				if f.Path == "workloads.json" {
+					bodies[f.Path] = "{}"
+				}
+			}
+			putRelease(t, b, "B", raw, bodies)
+			assertRejected(t, b, "B")
+		})
+	}
+}
+
+func TestF1ManifestWithProbePasses(t *testing.T) {
+	b, priv, _ := newBoot(t)
+	files := map[string]string{ProbeExe: "probe", "workloads.json": "{}"}
+	m := Manifest{Version: "0.2.0", MinBoot: 1, Files: []File{fileEntry(ProbeExe, "probe"), fileEntry("workloads.json", "{}")}}
 	_, raw := signedRaw(t, m, priv)
-	putRelease(t, b, "A", raw, map[string]string{"workloads.json": "{}", "epsilon-probe.exe": "任意未签名的程序"})
-	stage(t, b, "A", "0.2.0")
-	if !b.consumeStaged() {
-		t.Fatal("现状变了（清单缺本体时拒绝交接）；更新 docs/boot.md 和这条用例")
-	}
-	if slot, trial := b.Pick(); slot != "A" || !trial {
-		t.Fatalf("Pick=%q,%v", slot, trial)
-	}
-	if _, err := b.Start(filepath.Join(b.Root, "A"), ""); err != nil || r.count("A") != 1 {
+	putRelease(t, b, "B", raw, files)
+	if _, err := VerifySlot(filepath.Join(b.Root, "B"), b.Keys); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// 记录现状（F1，救援槽 R）：救援走同一个 VerifySlot，R 的清单漏了本体时，R 里随便放的 exe 也会被运行。
-// F1 的改法（VerifySlot 要求清单里有 epsilon-probe.exe）对 R 一起生效。
-func TestKnownIssueF1RescueSlot(t *testing.T) {
+// F1：已转正的槽如果清单缺本体（比如旧 boot 时代收下的），按现有逻辑回退到 good。
+func TestF1CurrentWithoutProbeFallsBackToGood(t *testing.T) {
+	b, priv, r := newBoot(t)
+	putSlot(t, b, priv, "A", "0.1.0")
+	_, raw := signedRaw(t, Manifest{Version: "0.2.0", MinBoot: 1, Files: []File{fileEntry("workloads.json", "{}")}}, priv)
+	putRelease(t, b, "B", raw, map[string]string{"workloads.json": "{}", ProbeExe: "任意未签名的程序"})
+	setState(t, b, State{Current: "B", Good: "A", Versions: map[string]string{"A": "0.1.0", "B": "0.2.0"}})
+	if slot, trial := b.Pick(); slot != "A" || trial {
+		t.Fatalf("Pick=%q,%v", slot, trial)
+	}
+	if r.count("B") != 0 {
+		t.Fatal("跑了缺本体的槽")
+	}
+}
+
+// F1（救援槽 R）：R 走同一个 VerifySlot，R 的清单缺本体时不运行 R，只记 boot_rescue_bad。
+func TestF1RescueSlotMustListProbe(t *testing.T) {
 	b, priv, r := newBoot(t)
 	r.behave = func(slot, confirm string, p *fakeProc) { p.Kill() }
 	m := Manifest{Version: "0.0.1", MinBoot: 1, Files: []File{fileEntry("workloads.json", "{}")}}
 	_, raw := signedRaw(t, m, priv)
-	putRelease(t, b, RescueSlot, raw, map[string]string{"workloads.json": "{}", "epsilon-probe.exe": "任意未签名的程序"})
+	putRelease(t, b, RescueSlot, raw, map[string]string{"workloads.json": "{}", ProbeExe: "任意未签名的程序"})
 	setState(t, b, State{})
 	why := b.rescueWhy()
 	if why == "" {
 		t.Fatal("没东西可跑却不救援")
 	}
 	b.rescue(nil, why)
-	if r.count(RescueSlot) != 1 {
-		t.Fatalf("现状变了（R 的清单缺本体时不运行）；更新 docs/boot.md 和这条用例。事件 %+v", events(t, b))
+	if r.count(RescueSlot) != 0 || !hasEvent(t, b, "boot_rescue_bad") {
+		t.Fatalf("R 的清单缺本体却运行了。事件 %+v", events(t, b))
 	}
 }
 

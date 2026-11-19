@@ -152,7 +152,7 @@ func smTemplates(t *testing.T) (string, []ed25519.PublicKey) {
 				t.Fatal(err)
 			}
 			if c == cTampered {
-				write(t, filepath.Join(d, "epsilon-probe.exe"), "evil")
+				write(t, filepath.Join(d, ProbeExe), "evil")
 			}
 		}
 	}
@@ -174,7 +174,7 @@ func (w *smWorker) boot(k smKey) *Boot {
 		}
 		src := filepath.Join(w.tmpl, fmt.Sprintf("%s-%d", slot, combo[i]))
 		os.MkdirAll(filepath.Join(root, slot), 0o755)
-		for _, f := range []string{"epsilon-probe.exe", ReleaseFile} {
+		for _, f := range []string{ProbeExe, ReleaseFile} {
 			raw, err := os.ReadFile(filepath.Join(src, f))
 			if err == nil {
 				err = os.WriteFile(filepath.Join(root, slot, f), raw, 0o644)

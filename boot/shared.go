@@ -16,7 +16,8 @@ const (
 	StagedFile  = "staged.json"
 	EventsFile  = "boot-events.jsonl"
 	ReleaseFile = "release.json"
-	RescueSlot  = "R" // 救援槽：只有安装脚本写，boot 和 loader 都只读
+	RescueSlot  = "R"                 // 救援槽：只有安装脚本写，boot 和 loader 都只读
+	ProbeExe    = "epsilon-probe.exe" // 槽里的本体，boot 启动的就是它；清单里必须有（F1）
 )
 
 // Staged 是 loader 交给 boot 的"槽已备好"。版本只作参考，boot 以槽里验过的清单为准。
@@ -47,7 +48,7 @@ func ReadState(root string) (State, error) {
 	return s, err
 }
 
-// VerifySlot 验一个槽：release.json 签名、min_boot 不超过本引导器、每个文件大小和 sha256。
+// VerifySlot 验一个槽：release.json 签名、min_boot 不超过本引导器、清单里有 ProbeExe、每个文件大小和 sha256。
 func VerifySlot(dir string, keys []ed25519.PublicKey) (Manifest, error) {
 	return VerifySlotFor(dir, keys, Version)
 }
@@ -69,6 +70,13 @@ func VerifySlotFor(dir string, keys []ed25519.PublicKey, bootVersion int) (Manif
 	}
 	if m.MinBoot > bootVersion {
 		return m, fmt.Errorf("版本 %s 要引导器 %d，本机是 %d", m.Version, m.MinBoot, bootVersion)
+	}
+	hasProbe := false
+	for _, f := range m.Files {
+		hasProbe = hasProbe || f.Path == ProbeExe // 和 safeName 一样按字节比，不折叠大小写
+	}
+	if !hasProbe {
+		return m, fmt.Errorf("版本 %s 的清单里没有 %s", m.Version, ProbeExe)
 	}
 	for _, f := range m.Files {
 		n, sum, err := sumFile(filepath.Join(dir, f.Path))

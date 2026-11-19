@@ -35,12 +35,12 @@ func makeSlot(dir string, priv ed25519.PrivateKey, version string, minBoot int) 
 	body := "probe " + version
 	sum := sha256.Sum256([]byte(body))
 	s, err := Sign(Manifest{Version: version, MinBoot: minBoot,
-		Files: []File{{Path: "epsilon-probe.exe", Size: int64(len(body)), SHA256: hex.EncodeToString(sum[:])}}}, priv)
+		Files: []File{{Path: ProbeExe, Size: int64(len(body)), SHA256: hex.EncodeToString(sum[:])}}}, priv)
 	if err != nil {
 		return err
 	}
 	raw, _ := json.Marshal(s)
-	if err := os.WriteFile(filepath.Join(dir, "epsilon-probe.exe"), []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ProbeExe), []byte(body), 0o644); err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, ReleaseFile), raw, 0o644)
@@ -327,7 +327,7 @@ func pcScenarios() []*pcScenario {
 		return makeSlot(filepath.Join(e.root, "B"), e.priv, b, 1)
 	}
 	tamperA := func(e *pcEnv) error {
-		return os.WriteFile(filepath.Join(e.root, "A", "epsilon-probe.exe"), []byte("evil"), 0o644)
+		return os.WriteFile(filepath.Join(e.root, "A", ProbeExe), []byte("evil"), 0o644)
 	}
 	stagedAccept := func(e *pcEnv) error {
 		if err := ab(e, "0.1.0", "0.2.0"); err != nil {

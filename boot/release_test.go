@@ -18,7 +18,7 @@ func keys(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 
 func TestSignVerify(t *testing.T) {
 	pub, priv := keys(t)
-	m := Manifest{Version: "0.2.0", MinBoot: 1, Files: []File{{Path: "epsilon-probe.exe", Size: 3, SHA256: "ab"}}}
+	m := Manifest{Version: "0.2.0", MinBoot: 1, Files: []File{{Path: ProbeExe, Size: 3, SHA256: "ab"}}}
 	s, err := Sign(m, priv)
 	if err != nil {
 		t.Fatal(err)
