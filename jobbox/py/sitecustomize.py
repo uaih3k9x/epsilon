@@ -66,7 +66,8 @@ COUNT_EVENTS = frozenset({"ctypes.call_function", "pickle.find_class", "marshal.
 LOG_EVENTS = frozenset({"sys.addaudithook", "cpython.run_command", "cpython.run_module", "cpython.run_file",
                         "cpython.run_interactivehook", "cpython.run_startup", "cpython.run_stdin",
                         "gc.get_objects", "gc.get_referrers", "gc.get_referents", "sys._current_frames",
-                        "sys._current_exceptions", "sys.settrace", "sys.setprofile"})
+                        "sys._current_exceptions", "sys.settrace", "sys.setprofile",
+                        "sys.monitoring.register_callback"})   # 3.12+；作用同 settrace
 CODE_SUFFIXES = (".py", ".pyc", ".pyw", ".pth")
 LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
 PRIVATE_MKDIR = 0o700  # Python 3.12.4+ 在 Windows 上给它建受保护 DACL（只有 SY、BA、所有者）

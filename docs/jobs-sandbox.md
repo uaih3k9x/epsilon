@@ -322,8 +322,11 @@ Mac 上测了：SDDL 字面量、环境块、金丝雀解析和对照（每一�
 - 钩子可以被绕过，系统控制兜着：ctypes 直接调系统 API（只计数；静态审核拒签）；纯 Python 先 `gc.get_objects()` 找到钩子的函数
   （`__closure__` / `cell_contents`、`__cantrace__` 加 `sys.settrace` 都不触发事件）——前一步逐条记录，`sys.settrace` 也记，所以**能改但留痕**。
   任务帧里拿得到的拦截异常的 `tb_frame` 只暴露钩子的默认参数（不可变）和计数字典（改了只影响 count 类记录的取证）。
-  **送审手册待补**（`epsilon-review` 的规则在另一条分支，这里没改）：代码包里访问 `sitecustomize`、`gc.get_objects/get_referrers/get_referents`、
-  帧对象（`sys._getframe`、`tb_frame`、`f_back`、`f_globals`、`f_locals`）、`__closure__` / `cell_contents` 的列为拒签项。
+  任务包静态审核（`epsilon-review`，rules_version 3，规则 `hook-tamper` / `audit-hook`，见 PR #14）在签名前再挡一道：代码包里 monkeypatch 标准库或 builtins
+  （属性赋值、`del`、`setattr` / `object.__setattr__`、改模块 `__dict__`）、改函数的 `__code__` / `__defaults__` / `__kwdefaults__` / `cell_contents`、碰 `__globals__` / `__closure__`、
+  访问 `sitecustomize` / `usercustomize`、`sys.settrace` / `setprofile`（含 `threading.*`、`sys.monitoring`）、`sys._current_frames`、`sys.addaudithook` / `sys.audit` 的一律拒签；
+  `gc.get_objects` / `get_referrers` / `get_referents`、取帧（`sys._getframe`、`inspect.currentframe` / `stack`、`f_back` / `f_globals` / `f_locals` / `tb_frame`）列为需解释。
+  运行时钩子不查可被改掉的东西、逐条记录 gc 枚举，仍是兜底；静态审核认不出模块经容器、参数传进来再改的写法。
 - 路径参数不是 str/bytes 的带路径事件（`os.mkdir(Path(r"\\h\s"))`、`os.rename(p, Path("tmp/x.py"))`）只计数不拦：和 `os.stat` 一样拦不住 UNC；
   改名出来的 `.py` 也打不开、导入不了（`open` 和 `import` 两道检查都在）。
 - 钩子运行中被 GC 触发的任务 `__del__` 照样受钩子管，但它和钩子在同一个线程里：要是它在 `write` 写到一半时也写记录，那一行会坏，探针按篡改整树杀（fail-closed）。

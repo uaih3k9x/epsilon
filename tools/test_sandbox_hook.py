@@ -285,7 +285,8 @@ def test_hook_functions_cannot_be_rewired(ctx):
 
 
 @pytest.mark.parametrize("event", ["gc.get_objects", "gc.get_referrers", "gc.get_referents", "sys._current_frames",
-                                   "sys._current_exceptions", "sys.settrace", "sys.setprofile"])
+                                   "sys._current_exceptions", "sys.settrace", "sys.setprofile",
+                                   "sys.monitoring.register_callback"])
 def test_introspection_that_reaches_hook_objects_is_logged(ctx, event):
     # 这几个能摸到钩子的对象（函数、默认参数里的字典）或正在跑的钩子帧：正常任务很少用，逐条记
     assert act(ctx, event, None) == "log"
