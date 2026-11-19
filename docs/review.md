@@ -20,10 +20,15 @@ python3 -I tools/epsilon-review.py <任务包目录|code.zip> [--job job.json] [
 分级以 issue #3 里 2026-11-01 的调整为准。原则是信任提交人：针对提交人的规则放宽，防主控、防钥匙泄露、防供应链的不放宽。
 2026-11-18 补一条：原生调用逃生口（`native-api` 的 ctypes 一类）升为拒签。它能绕过批任务沙箱的目录 ACL 和审计钩子（PR #17 剩余风险），
 ML 任务代码本身几乎用不到；torch 等库内部用 ctypes 属于环境层，不在代码包里，不受影响。
+2026-11-19 再补一条（`hook-tamper`，`RULES_VERSION` 3）：PR #17 深审发现不用 ctypes、纯 Python 就能关掉或骗过审计钩子
+（`jobbox/py/sitecustomize.py`）。直接击穿钩子的写法拒签：monkeypatch 标准库和 builtins、改函数的 `__code__` / `__defaults__` /
+`__kwdefaults__` / `__globals__` / `__closure__`、碰 `sitecustomize`、`sys.settrace` / `setprofile`、`sys._current_frames`、
+`sys.addaudithook` / `sys.audit`；ML 任务代码几乎用不到。gc 枚举对象、取帧需解释：调试和日志代码偶尔用，单靠它们改不了钩子
+（要改还得经过上面拒签的那几步）；gc 枚举运行时另有逐条记录。
 
 | 级别 | JSON 里的值 | 含义 |
 |---|---|---|
-| 拒签 | `reject` | 审核人读不到的代码：二进制、pickle 系、写 `.py` 再导入、审计钩子；以及能绕过沙箱的原生调用（ctypes 一类）。按规矩直接退回 |
+| 拒签 | `reject` | 审核人读不到的代码：二进制、pickle 系、写 `.py` 再导入；以及能绕过沙箱的写法：原生调用（ctypes 一类）、篡改运行时和审计钩子。按规矩直接退回 |
 | 需解释 | `explain` | 审核人要在送审单里找到解释，当场判断 |
 | 提示 | `info` | 不算违规，审核人可能想知道 |
 | 工具出错 | `error` | 没扫完：zip 坏了、语法错误、解压超限等等。结果不能作为签名依据 |
@@ -76,7 +81,8 @@ ML 任务代码本身几乎用不到；torch 等库内部用 ctypes 属于环境
 | `unsafe-load` | 拒签 / 需解释 | 拒签：不带字面量 `weights_only=True` 的 `torch.load`；任何调用里的 `allow_pickle=True`（`np.load`、`np.lib.format.read_array` 等）；`Loader` 不是 Safe/Base 的 `yaml.load`；`yaml.unsafe_load`；`functools.partial` 里预先绑定了上面这些危险参数。<br>需解释：参数看不出是什么（`**kw`、变量）；`yaml.full_load`；这几个函数没被直接调用，而是赋给变量、放进容器、传给别的函数（工具查不了调用时的参数） |
 | `write-then-import` | 拒签 / 需解释 | 同一个文件里，既写了 `.py` / `.pth` 文件（`open`、`io.FileIO`、`os.open`、`Path.write_text`、`shutil.copy` 等），又有动态导入（`importlib`、`runpy`、`__import__`、`imp`、`zipimport`、`pkgutil`、`pydoc.locate`）、改了 `sys.path`，或者静态 `import` 了和写出的文件同名的模块，就拒签。只写 `.py`、没看到导入的，需解释 |
 | `load-source` | 拒签 / 需解释 | 按路径加载代码：`runpy.run_path`、`imp.load_source` / `load_module` / `load_compiled`、`importlib.machinery.SourceFileLoader` / `SourcelessFileLoader`、`importlib.util.spec_from_file_location`、`zipimport.zipimporter`。路径是字面量但不是 `.py`，或者加载的是字节码，拒签（工具没按代码扫过它）；其余需解释 |
-| `audit-hook` | 拒签 | `sys.addaudithook`：平台用审计钩子做运行时兜底，任务代码不该碰 |
+| `audit-hook` | 拒签 | `sys.addaudithook`（任务自己加钩子也不行）、`sys.audit`（伪造审计事件）：平台用审计钩子做运行时兜底，任务代码不该碰 |
+| `hook-tamper` | 拒签 / 需解释 | 可篡改/绕过沙箱审计钩子（PR #17 第 8 节）。钩子运行时不查能被任务改掉的东西，这里在签名前再挡一道。<br>拒签：<br>· 给标准库模块或 builtins 的属性赋值、`del`（monkeypatch）：`os.fspath = …`、`ntpath.normpath = …`、`json.dumps = …`、类属性 `socket.socket.getsockname = …`、`builtins.isinstance = …` / `__builtins__.isinstance = …` / `__builtins__["isinstance"] = …`；`setattr` / `delattr` / `object.__setattr__` / `type.__setattr__` / `os.__setattr__(…)`（名字看不出来的也算）；改模块字典 `os.__dict__[…]`、`vars(builtins).update(…)`。“标准库”按写死的模块表认（3.9–3.14 的 `sys.stdlib_module_names` 并集），模块经别名、`getattr`、`__import__` / `importlib`、`sys.modules["os"]` 拿到的照样认。文档就是这么用的几个不算：`sys.stdout` `stderr` `stdin` `argv` `excepthook` `tracebacklimit` `dont_write_bytecode`、`threading.excepthook`、`warnings.showwarning`、`logging.raiseExceptions`、`logging.Formatter.converter`（改 `sys.path` 之类仍由 `import-machinery` 报）；<br>· 改函数内部属性：给 `__code__` `__defaults__` `__kwdefaults__` `cell_contents` 赋值或删除（含 `setattr`）、往 `__kwdefaults__` / `__globals__` 里写；碰到 `__globals__` `__closure__` `cell_contents` 就拒（属性、`getattr`、字符串字面量都算）；<br>· `sitecustomize` / `usercustomize`：`import`、动态导入（含拼接）、`sys.modules[…]` 取 / 删 / `pop`、属性链里出现（`site.execsitecustomize`），以及字符串里出现（按路径读写 `sitecustomize.py`）；<br>· `sys.settrace` `sys.setprofile` `threading.settrace` `threading.setprofile`（含 `_all_threads`）、`sys.monitoring`、`sys._current_frames` `sys._current_exceptions`。<br>需解释：`gc.get_objects` `get_referrers` `get_referents` `gc.callbacks`；`sys._getframe`、`inspect.currentframe` `stack` `trace` `getouterframes` `getinnerframes`；取帧属性 `f_globals` `f_locals` `f_back` `f_builtins` `f_trace` `tb_frame` `gi_frame` `cr_frame` `ag_frame`（接收者是什么都算）；`pdb.set_trace` / `breakpoint()` / `bdb`（会装跟踪函数）。<br>不算：给自己写的函数、类、模块赋属性（`w.calls = 0`、`config.lr = …`），第三方库的设置（`torch.backends.cudnn.benchmark = True`），读 `__defaults__`、`__code__.co_argcount`（后者照旧报 `dunder-access`），继承标准库类（`json.JSONEncoder`、`threading.Thread`），和内置函数同名的变量（`input.requires_grad = True`） |
 | `source-encoding` | 拒签 | 前两行声明了非 UTF-8 的源码编码（如 `# coding: utf-7`）。解释器按声明的编码解码，审核人看到的就不是同一份代码。“前两行”按解释器的规则数：直接运行时 `\r` `\n` 都算换行，`import` 时只认 `\n`，两种都查；`\x0c` `\x85` 这类字符不算换行。解析时把原始字节交给 `ast.parse`，解码方式和解释器一致 |
 | `exec-call` | 需解释 | `eval` `exec` `compile` 的任何引用，`types.CodeType` / `FunctionType`，`timeit` `cProfile` `profile` `pdb` 的字符串执行，`pandas.eval`，导入 `code` / `codeop`。`model.eval()`、`re.compile` 不算 |
 | `process-call` | 需解释 | 导入 `subprocess` `pty` 等；`os.system` `popen` `exec*` `spawn*` `startfile` `posix_spawn` `fork`、`asyncio.create_subprocess_*`；对动态导入的模块调 `.system` 之类；接收者认不出来（比如模块经函数参数传进来）时取 `.system` `.popen` `.Popen` `.check_output` `exec*` `spawn*` `fork` 这类属性，`getattr(m, "system")` 也算。`.run` `.call` 太常见，不算。`multiprocessing` 只到提示 |
@@ -86,7 +92,7 @@ ML 任务代码本身几乎用不到；torch 等库内部用 ctypes 属于环境
 | `reflect-literal` | 提示 | 同上，但名字是字面量（能直接写就直接写）。字面量是内部属性的，另报 `dunder-access` |
 | `namespace-access` | 需解释 | `globals()` `locals()` `vars()` 被下标访问、取属性或传给别的函数 |
 | `dunder-access` | 需解释 | `__builtins__` `__dict__` `__code__` `__globals__` `__subclasses__` `__reduce__` `__reduce_ex__` `__getattribute__` `__mro__` `__bases__` `__base__` `__closure__`，以及定义 `__reduce__` |
-| `import-machinery` | 需解释 | 改 `sys.path` `sys.modules` `sys.meta_path` `sys.path_hooks`，`site.addsitedir`，改 `PATH` `PYTHONPATH` `LD_PRELOAD` 一类环境变量（变量名看不出来的也算），改写内置函数 |
+| `import-machinery` | 需解释 | 改 `sys.path` `sys.modules` `sys.meta_path` `sys.path_hooks`，`site.addsitedir`，改 `PATH` `PYTHONPATH` `LD_PRELOAD` 一类环境变量（变量名看不出来的也算），改写内置函数（同时报 `hook-tamper` 拒签） |
 | `string-decode` | 需解释 | `base64.*decode` `binascii` `codecs.decode` `bytes.fromhex`，`zlib` `lzma` `bz2` `gzip` 解压，`.decode("rot13")` 这类编码，连续 8 个以上 `chr()` 拼接，`"".join(chr ...)`，用整数列表拼字节串 |
 | `suspicious-literal` | 需解释 | 字符串长度超过 200；长度 ≥ 64 的 ASCII 串或字节串、熵 > 4.5 比特/字符；100 字符以上的十六进制 / base64 形状。docstring 不算 |
 | `download` | 需解释 / 提示 | `from_pretrained` `load_dataset` `snapshot_download` `hf_hub_download` 等：看不出是本地路径就需解释，是本地路径（`DATA / "x"`、`./x`）或 `local_files_only=True` 就提示；`torch.hub.load` 会执行 `hubconf.py`，一律需解释；`download=True`、`trust_remote_code` 需解释 |
@@ -111,7 +117,7 @@ ML 任务代码本身几乎用不到；torch 等库内部用 ctypes 属于环境
 ```json
 {
   "tool_version": "0.1.0",
-  "rules_version": 2,
+  "rules_version": 3,
   "package": "<命令行给的路径>",
   "name": "cifar10-hpsearch", "version": "1.0.0",
   "files": 12,
@@ -150,4 +156,7 @@ ML 任务代码本身几乎用不到；torch 等库内部用 ctypes 属于环境
 - 不知道环境层里装了哪些依赖，所以“导入了包里没有、标准库里也没有的模块”不报。
 - 协议 0 / 1 的 pickle 是文本形状，没有魔数可抓。不过要加载它就得用 pickle，`pickle-use` 会拒。
 - 按运行工具的那个 Python 的语法解析。用 3.9 跑工具，审 3.10 以后的语法（`match`）会报 `parse-error`，换新一点的 Python 跑就行。
+- `hook-tamper` 只认得出静态能看出目标的写法：模块经容器、函数参数传来再改（`x = [os]; x[0].fspath = f`、`def g(m): m.fspath = f`）认不出；
+  让钩子回调任务代码的写法（`__fspath__` / `__repr__` / `__eq__`、子类方法、元类 `__hash__`、GC 触发的 `__del__`）是正常代码也常用的，不报。
+  这些靠运行时：钩子用到的一切在用户代码之前绑成默认参数、不调任务代码（PR #17 `docs/jobs-sandbox.md` 第 5 节）。
 - 不是沙箱：纯 Python 写的恶意逻辑（比如直接删 `output\` 以外的文件）只能靠审核人读，以及运行时的低权限账户兜底。

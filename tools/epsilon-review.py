@@ -8,7 +8,10 @@
 
 分级（2026-11-01 定）：拒签只留审核人读不到的代码（二进制、pickle 系、写 .py 再导入、审计钩子）；
 动态执行、进程、系统 API、联网等需解释，审核人当场判断。11-18 补：原生调用逃生口（ctypes、cffi、pywin32、
-_winapi、msvcrt、add_dll_directory、可执行 mmap）拒签，它们能绕过沙箱的目录 ACL 和审计钩子。规则、退出码、JSON 契约见 docs/review.md。
+_winapi、msvcrt、add_dll_directory、可执行 mmap）拒签，它们能绕过沙箱的目录 ACL 和审计钩子。
+11-19 补（PR #17 第 8 节）：纯 Python 篡改运行时 / 审计钩子（hook-tamper）——monkeypatch 标准库和 builtins、改函数的
+__code__ / __defaults__ / __closure__ 等、碰 sitecustomize、settrace / setprofile、_current_frames——拒签；gc 枚举、取帧需解释。
+规则、退出码、JSON 契约见 docs/review.md。
 """
 
 import argparse
@@ -30,7 +33,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass
 
 TOOL_VERSION = "0.1.0"
-RULES_VERSION = 2  # 规则或级别一改就加 1；sign-job 把它记进签名记录
+RULES_VERSION = 3  # 规则或级别一改就加 1；sign-job 把它记进签名记录
 
 REJECT, EXPLAIN, INFO, ERROR = "reject", "explain", "info", "error"
 LABEL = {ERROR: "工具出错", REJECT: "拒签", EXPLAIN: "需解释", INFO: "提示"}
@@ -499,6 +502,13 @@ _NATIVE_SEGMENTS = set(_NATIVE_MODULES) | {"ctypeslib"}
 # 接收者认不出来时（模块经参数传进来、numpy 数组的 .ctypes）取这些属性：需解释
 _OPAQUE_NATIVE = _NATIVE_SEGMENTS | {"windll", "oledll", "cdll", "pydll", "pythonapi", "CDLL", "WinDLL", "OleDLL",
                                      "PyDLL", "add_dll_directory", "_add_dll_directory"}
+# 篡改运行时 / 审计钩子（PR #17 第 8 节）：纯 Python 就能关掉或骗过 sitecustomize，不需要 ctypes
+_TAMPER_WHY = "可篡改/绕过沙箱审计钩子"
+_TAMPER_HINT = "任务代码不需要改标准库、函数内部属性或审计钩子；要定制行为就写自己的函数或子类"
+_TAMPER_EXPLAIN_HINT = "送审单里说明用途（调试、日志）；调试代码送审前删掉"
+for _m in ("sitecustomize", "usercustomize"):
+    MODULE_RULES.append((_m, REJECT, "hook-tamper", f"碰了 {_m}（沙箱的审计钩子装在这里）：{_TAMPER_WHY}", _TAMPER_HINT))
+MODULE_RULES.append(("bdb", EXPLAIN, "hook-tamper", f"导入了 bdb：能装跟踪函数，{_TAMPER_WHY}", _TAMPER_EXPLAIN_HINT))
 for _m in ("socket", "_socket", "requests", "urllib", "urllib2", "urllib3", "http.client", "http.server", "httplib",
            "ftplib", "smtplib", "poplib", "imaplib", "telnetlib", "nntplib", "xmlrpc", "socketserver", "paramiko",
            "aiohttp", "httpx", "websocket", "websockets", "pycurl", "wget"):
@@ -527,7 +537,18 @@ FUNC_RULES = [
     (r"yaml\.(unsafe_load|unsafe_load_all)", REJECT, "unsafe-load", "{q} 能构造任意 Python 对象", "用 yaml.safe_load"),
     (r"logging\.config\.(dictConfig|fileConfig|listen)|hydra\.utils\.(instantiate|call|get_method|get_class|get_object)",
      EXPLAIN, "reflect-nonliteral", "{q} 会按配置里写的名字导入并调用对象", "送审单里说明配置从哪来、会构造什么"),
-    (r"sys\.addaudithook", REJECT, "audit-hook", "任务代码不该碰审计钩子（平台用它做运行时兜底）", "删掉"),
+    (r"sys\.addaudithook", REJECT, "audit-hook", "{q}：任务代码不该自己加审计钩子（平台用它做运行时兜底），" + _TAMPER_WHY,
+     "删掉"),
+    (r"sys\.audit", REJECT, "audit-hook", "{q} 能伪造审计事件：" + _TAMPER_WHY, "删掉"),
+    (r"sys\.(settrace|setprofile|_current_frames|_current_exceptions|monitoring(\..*)?)"
+     r"|threading\.(settrace|setprofile)(_all_threads)?", REJECT, "hook-tamper",
+     "{q}：能看到或改动正在跑的钩子帧，" + _TAMPER_WHY, _TAMPER_HINT),
+    (r"gc\.(get_objects|get_referrers|get_referents|callbacks(\..*)?)", EXPLAIN, "hook-tamper",
+     "{q} 能摸到钩子的函数和状态（运行时逐条记录），" + _TAMPER_WHY, _TAMPER_EXPLAIN_HINT),
+    (r"sys\._getframe(modulename)?|inspect\.(currentframe|stack|trace|getouterframes|getinnerframes)", EXPLAIN,
+     "hook-tamper", "{q} 取调用栈的帧（f_globals / f_locals / f_back），" + _TAMPER_WHY, _TAMPER_EXPLAIN_HINT),
+    (r"pdb\.(set_trace|post_mortem|pm|Pdb)|builtins\.breakpoint", EXPLAIN, "hook-tamper",
+     "{q} 会装跟踪函数（调试器），" + _TAMPER_WHY, _TAMPER_EXPLAIN_HINT),
     (r"asyncio\.create_subprocess_(exec|shell)|platform\.popen", EXPLAIN, "process-call", "{q} 会起子进程",
      "送审单里说明起什么进程、参数从哪来"),
     (r"os\._?add_dll_directory|importlib\.machinery\.ExtensionFileLoader|mmap\.PROT_EXEC", REJECT, "native-api",
@@ -581,6 +602,44 @@ _STAR_RISKY = {"os", "posix", "nt", "subprocess", "builtins", "sys", "importlib"
                "marshal", "shutil", "pty", "platform", "asyncio", "codecs", "base64", "zlib", "types", "io", "operator"}
 _DUNDERS = {"__dict__", "__code__", "__globals__", "__subclasses__", "__reduce__", "__reduce_ex__", "__getattribute__",
             "__mro__", "__bases__", "__base__", "__closure__", "__builtins__"}
+# 标准库顶层模块（3.9–3.14 的 sys.stdlib_module_names 并集）。写死而不是运行时取，换个 Python 跑工具结论不变
+_STDLIB = frozenset("""
+__future__ _abc _aix_support _android_support _apple_support _ast _ast_unparse _asyncio _bisect _blake2 _bz2 _codecs
+_codecs_cn _codecs_hk _codecs_iso2022 _codecs_jp _codecs_kr _codecs_tw _collections _collections_abc _colorize
+_compat_pickle _compression _contextvars _crypt _csv _ctypes _curses _curses_panel _datetime _dbm _decimal
+_elementtree _frozen_importlib _frozen_importlib_external _functools _gdbm _hashlib _heapq _hmac _imp _interpchannels
+_interpqueues _interpreters _io _ios_support _json _locale _lsprof _lzma _markupbase _md5 _msi _multibytecodec
+_multiprocessing _opcode _opcode_metadata _operator _osx_support _overlapped _pickle _posixshmem _posixsubprocess
+_py_abc _py_warnings _pydatetime _pydecimal _pyio _pylong _pyrepl _queue _random _remote_debugging _scproxy _sha1
+_sha2 _sha3 _signal _sitebuiltins _socket _sqlite3 _sre _ssl _stat _statistics _string _strptime _struct _suggestions
+_symtable _sysconfig _thread _threading_local _tkinter _tokenize _tracemalloc _types _typing _uuid _warnings _weakref
+_weakrefset _winapi _wmi _zoneinfo _zstd abc aifc annotationlib antigravity argparse array ast asynchat asyncio
+asyncore atexit audioop base64 bdb binascii bisect builtins bz2 calendar cgi cgitb chunk cmath cmd code codecs codeop
+collections colorsys compileall compression concurrent configparser contextlib contextvars copy copyreg cProfile crypt
+csv ctypes curses dataclasses datetime dbm decimal difflib dis distutils doctest email encodings ensurepip enum errno
+faulthandler fcntl filecmp fileinput fnmatch fractions ftplib functools gc genericpath getopt getpass gettext glob
+graphlib grp gzip hashlib heapq hmac html http idlelib imaplib imghdr imp importlib inspect io ipaddress itertools
+json keyword lib2to3 linecache locale logging lzma mailbox mailcap marshal math mimetypes mmap modulefinder msilib
+msvcrt multiprocessing netrc nis nntplib nt ntpath nturl2path numbers opcode operator optparse os ossaudiodev pathlib
+pdb pickle pickletools pipes pkgutil platform plistlib poplib posix posixpath pprint profile pstats pty pwd py_compile
+pyclbr pydoc pydoc_data pyexpat queue quopri random re readline reprlib resource rlcompleter runpy sched secrets
+select selectors shelve shlex shutil signal site smtpd smtplib sndhdr socket socketserver spwd sqlite3 sre_compile
+sre_constants sre_parse ssl stat statistics string stringprep struct subprocess sunau symtable sys sysconfig syslog
+tabnanny tarfile telnetlib tempfile termios textwrap this threading time timeit tkinter token tokenize tomllib trace
+traceback tracemalloc tty turtle turtledemo types typing unicodedata unittest urllib uu uuid venv warnings wave
+weakref webbrowser winreg winsound wsgiref xdrlib xml xmlrpc zipapp zipfile zipimport zlib zoneinfo
+""".split())
+# 给标准库赋值但文档就是这么用的（不影响钩子：钩子不经过它们）；改导入状态另由 import-machinery 报
+_PATCH_OK = {"sys.stdout", "sys.stderr", "sys.stdin", "sys.argv", "sys.excepthook", "sys.tracebacklimit",
+             "sys.dont_write_bytecode", "threading.excepthook", "warnings.showwarning", "logging.raiseExceptions",
+             "logging.Formatter.converter"} | _IMPORT_STATE
+_FUNC_STORE = {"__code__", "__defaults__", "__kwdefaults__", "cell_contents"}   # 赋值 / 删除就拒（读不算）
+_FUNC_ANY = {"__globals__", "__closure__", "cell_contents"}                      # 碰到就拒
+_FRAME_ATTRS = {"f_globals", "f_locals", "f_back", "f_builtins", "f_trace", "tb_frame", "gi_frame", "cr_frame", "ag_frame"}
+_SETATTRS = {"builtins.setattr", "builtins.delattr", "builtins.object.__setattr__", "builtins.object.__delattr__",
+             "builtins.type.__setattr__", "builtins.type.__delattr__", "types.ModuleType.__setattr__",
+             "types.ModuleType.__delattr__"}
+_CUSTOMIZE = ("sitecustomize", "usercustomize")
 _DECODE_CODECS = {"rot13", "rot_13", "hex", "hex_codec", "base64", "base64_codec", "zlib", "zlib_codec", "bz2",
                   "bz2_codec", "uu", "uu_codec", "unicode_escape", "raw_unicode_escape", "punycode"}
 _OPENERS = {"builtins.open", "io.open", "codecs.open", "os.fdopen", "io.FileIO", "_io.FileIO"}
@@ -609,6 +668,15 @@ def _native_segment(q):
     parts = q.split(".")
     return parts[0] not in _NATIVE_SEGMENTS and not parts[0].startswith("win32") and \
         any(p in _NATIVE_SEGMENTS for p in parts[1:])
+
+
+def _stdlib_attr(q):
+    """q 是标准库 / builtins 模块上的属性（os.fspath、socket.socket.getsockname），而且不在白名单里。
+    builtins.X.Y 不算：内置类型和函数本身改不了属性，这种多半是和内置函数同名的变量（input.requires_grad = True）。"""
+    parts = q.split(".")
+    if parts[0] == "builtins" and len(parts) > 2:
+        return False
+    return len(parts) > 1 and parts[0] in _STDLIB and q not in _PATCH_OK
 
 
 # ============================================================================ 代码层：扫描
@@ -905,6 +973,8 @@ class _PyScan:
             if mod == prefix or mod.startswith(prefix + "."):
                 if level == REJECT and rule == "native-api":
                     self._native_reject(mod, node, msg)
+                elif rule == "hook-tamper":
+                    self._tamper(level, node, msg, hint)
                 else:
                     self.add(level, rule, node, msg, hint)
                 hit = True
@@ -923,6 +993,15 @@ class _PyScan:
         self.add(REJECT, "native-api", node, msg or f"经 {q} 拿到了原生调用能力：{_NATIVE_WHY}", _NATIVE_HINT)
         return True
 
+    def _tamper(self, level, node, msg, hint=None):
+        """hook-tamper 同一行同一级别只报一次：sys.modules['sitecustomize'] 会经字面量、导入、引用几条路先后命中。"""
+        line = getattr(node, "lineno", 0)
+        if any(f.rule == "hook-tamper" and f.level == level and f.line == line for f in self.out):
+            return
+        if _TAMPER_WHY not in msg:
+            msg = f"{msg}：{_TAMPER_WHY}"
+        self.add(level, "hook-tamper", node, msg, _TAMPER_HINT if hint is None else hint)
+
     def check_qualified(self, quals, node):
         for q in sorted(quals):
             if q.startswith(("nt.", "posix.")):
@@ -939,9 +1018,14 @@ class _PyScan:
                 self._native_reject(q, node)
             if _PROCESS_RE.match(q):
                 self.add(EXPLAIN, "process-call", node, f"{q} 会起子进程", "送审单里说明起什么进程、参数从哪来")
+            if any(c in p for p in q.split(".") for c in _CUSTOMIZE):   # site.execsitecustomize 之类
+                self._tamper(REJECT, node, f"碰了 {q}（沙箱的审计钩子装在 sitecustomize 里）")
             for pat, level, rule, msg, hint in FUNC_RULES:
                 if pat.match(q):
-                    self.add(level, rule, node, msg.format(q=q), hint)
+                    if rule == "hook-tamper":
+                        self._tamper(level, node, msg.format(q=q), hint)
+                    else:
+                        self.add(level, rule, node, msg.format(q=q), hint)
 
     def run(self, tree):
         self.prepare(tree)
@@ -1011,6 +1095,11 @@ class _PyScan:
                              "直接写出来源；送审单里说明")
                 if node.attr in _DUNDERS:
                     self.add(EXPLAIN, "dunder-access", node, f"碰了内部属性 {node.attr}", "直接写要用的属性，别经过内部属性")
+                if node.attr in _FUNC_ANY:
+                    self._tamper(REJECT, node, f"碰了函数内部的 {node.attr}（能改钩子函数用到的全局和闭包）")
+                elif node.attr in _FRAME_ATTRS and isinstance(node.ctx, ast.Load):
+                    self._tamper(EXPLAIN, node, f"取帧对象的 .{node.attr}（拦截异常的 tb_frame 就是钩子的帧）",
+                                 _TAMPER_EXPLAIN_HINT)
                 if isinstance(node.ctx, (ast.Store, ast.Del)):
                     import_mech |= self._check_store(node, node)
             elif isinstance(node, ast.Subscript) and isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -1023,6 +1112,13 @@ class _PyScan:
                     self.add(EXPLAIN, "string-decode", node, "连续 chr() 拼字符串", _DECODE_HINT)
             elif isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)) and id(node) not in docstrings:
                 self._check_literal(node)
+                low = node.value.lower() if isinstance(node.value, str) else node.value.decode("latin-1").lower()
+                if any(c in low for c in _CUSTOMIZE):    # 按路径读写 sitecustomize.py、sys.modules['sitecustomize']
+                    self._tamper(REJECT, node, "字符串里出现 sitecustomize / usercustomize（沙箱的审计钩子装在这里）")
+                elif node.value in _FUNC_ANY:            # attrgetter('__globals__')、object.__getattribute__(f, ...)
+                    self._tamper(REJECT, node, f"按名字 {node.value!r} 取函数内部属性（能改钩子函数用到的全局和闭包）")
+                elif node.value in _FRAME_ATTRS:
+                    self._tamper(EXPLAIN, node, f"按名字 {node.value!r} 取帧对象的属性", _TAMPER_EXPLAIN_HINT)
 
         for w, mods in writes_py:
             imported = sorted(m for m in mods if m and m in static_imports)
@@ -1046,11 +1142,65 @@ class _PyScan:
             if q in _IMPORT_STATE:
                 self.add(EXPLAIN, "import-machinery", node, f"改了 {q}", "别改导入路径；同目录的模块直接 import")
                 touched = True
-            elif q.startswith("builtins.") and key is None and target is node:
+            elif q.startswith("builtins.") and q.count(".") == 1 and key is None and target is node:
                 self.add(EXPLAIN, "import-machinery", node, f"改写了内置函数 {q}", "送审单里说明")
             elif q == "os.environ" and key is not None:
                 self._check_env_key(key, node)
+            if key is None and target is node and _stdlib_attr(q):
+                self._tamper(REJECT, node, f"改了标准库的 {q}（钩子和它调用的标准库函数会跟着变）")
+            if q == "sys.modules" and key is not None and any(c in (self._fold(key) or "") for c in _CUSTOMIZE):
+                self._tamper(REJECT, node, "改了 sys.modules 里的 sitecustomize")
+        if key is None and isinstance(node, ast.Attribute) and node.attr in _FUNC_STORE:
+            self._tamper(REJECT, node, f"改了函数内部的 {node.attr}（能换掉钩子函数的代码和默认参数）")
+        if key is not None:
+            self._check_dict_store(target, node)
         return touched
+
+    def _module_dict(self, e):
+        """e 是标准库模块的命名空间字典（os.__dict__、vars(builtins)、__builtins__），返回模块名集合。"""
+        if isinstance(e, ast.Attribute) and e.attr == "__dict__":
+            base = self.resolve(e.value)
+        elif isinstance(e, ast.Call) and "builtins.vars" in self.resolve(e.func) and e.args:
+            base = self.resolve(e.args[0])
+        else:
+            return {q for q in self.resolve(e) if q in _STDLIB}
+        return {q for q in base if q.split(".")[0] in _STDLIB}
+
+    def _check_dict_store(self, e, node):
+        """往模块字典、__kwdefaults__、__globals__ 里写（下标赋值或 update / pop 之类）"""
+        mods = self._module_dict(e)
+        if mods:
+            self._tamper(REJECT, node, f"改了标准库 {min(mods)} 的命名空间字典")
+        elif isinstance(e, ast.Attribute) and e.attr in ("__kwdefaults__", "__globals__"):
+            self._tamper(REJECT, node, f"改了函数的 {e.attr}（能换掉钩子函数的默认参数和全局）")
+
+    def _check_tamper_call(self, node, fq):
+        """setattr(json, 'dumps', f)、object.__setattr__(os, ...)、os.__dict__.update(...)、setattr(f, '__code__', c)"""
+        f = node.func
+        if isinstance(f, ast.Attribute) and f.attr in _MUTATORS:
+            self._check_dict_store(f.value, node)
+        if isinstance(f, ast.Attribute) and f.attr in ("__setattr__", "__delattr__") and not fq & _SETATTRS:
+            # type(os).__setattr__(os, 'fspath', g)；绑定方法 os.__setattr__('fspath', g)
+            for base, name in ((self.resolve(f.value), self._arg(node, 0)),
+                               (self.resolve(node.args[0]) if node.args else set(), self._arg(node, 1))):
+                name = self._fold(name)
+                for q in sorted(base):
+                    if q.split(".")[0] in _STDLIB and (name is None or _stdlib_attr(f"{q}.{name}")):
+                        self._tamper(REJECT, node, f"经 {f.attr} 改了标准库 {q} 的属性")
+        if fq & (_SETATTRS | {"builtins.getattr", "builtins.hasattr"}) and len(node.args) >= 2:
+            name = self._fold(node.args[1])
+            if name in _FUNC_ANY:
+                self._tamper(REJECT, node, f"经 getattr / setattr 碰了函数内部的 {name}")
+            elif name in _FRAME_ATTRS and not fq & _SETATTRS:
+                self._tamper(EXPLAIN, node, f"经 getattr 取帧对象的 {name}", _TAMPER_EXPLAIN_HINT)
+            if not fq & _SETATTRS:
+                return
+            if name in _FUNC_STORE:
+                self._tamper(REJECT, node, f"经 setattr 改了函数内部的 {name}（能换掉钩子函数的代码和默认参数）")
+            for q in sorted(self.resolve(node.args[0])):
+                if q.split(".")[0] in _STDLIB and (name is None or _stdlib_attr(f"{q}.{name}")):
+                    what = f"{q}.{name}" if name else f"{q} 上名字看不出来的属性"
+                    self._tamper(REJECT, node, f"经 setattr / delattr 改了标准库的 {what}")
 
     def _check_sys_modules(self, node, parent):
         """sys.modules["os"] 能认出来；下标不是字面量、.get(name) 之类就认不出取的是哪个模块。"""
@@ -1085,6 +1235,7 @@ class _PyScan:
         f = node.func
         term = f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
         import_mech = self._check_reflect(node, fq)
+        self._check_tamper_call(node, fq)
         self._check_namespace(node, fq, parent)
         self._check_deserialize(node, fq, term)
         if fq & {"functools.partial", "functools.partialmethod"} and node.args:

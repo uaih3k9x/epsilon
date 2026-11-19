@@ -1250,6 +1250,16 @@ HOOK_TAMPER_REJECT = [
     "import sys\nsys._current_frames()",
     "import sys\nsys._current_exceptions()",
     "import sys\nsys.monitoring.register_callback(1, 2, cb)",
+    # 补: 别的拿法
+    "import os as o\nsetattr(o.path, 'normpath', f)",
+    "from json import encoder\nencoder.c_make_encoder = None",
+    "import builtins as b\nb.__dict__.__setitem__('isinstance', f)",
+    "import sys\nsys.modules['builtins'].isinstance = f",
+    "__import__('builtins').isinstance = f",
+    "import os\ntype(os).__setattr__(os, 'fspath', f)",
+    "import os\nos.__setattr__('fspath', f)",
+    "import operator\noperator.attrgetter('__globals__')(f)",
+    "object.__getattribute__(f, '__closure__')",
 ]
 
 
@@ -1319,6 +1329,10 @@ def test_hook_introspection_needs_explanation(src):
     "import json\nclass Enc(json.JSONEncoder):\n    def default(self, o):\n        return str(o)",
     "import threading\nclass W(threading.Thread):\n    def run(self):\n        pass",
     "import site\np = site.getsitepackages()",
+    "class A:\n    def __setattr__(self, k, v):\n        super().__setattr__(k, v)",
+    # 和内置函数同名的变量: 内置函数本身改不了属性
+    "import torch\ninput = torch.randn(3)\ninput.requires_grad = True\nsetattr(input, 'grad', None)",
+    "filter = Conv()\nfilter.weight = w",
 ])
 def test_hook_tamper_false_positives(src):
     fs = scan_py(src)
