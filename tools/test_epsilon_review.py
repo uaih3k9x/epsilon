@@ -1167,3 +1167,176 @@ def test_zip_non_ascii_name_without_utf8_flag_rejected(tmp_path):
     data[i + 9] &= ~0x08                 # 中央目录 flag 的 0x800
     p.write_bytes(bytes(data))
     assert "bad-path" in rules(er.scan_package(str(p)), REJECT)
+
+
+# ======================================================================== 篡改运行时 / 审计钩子 (PR #17 第 8 节)
+# 纯 Python 就能关掉或骗过 sitecustomize: monkeypatch 标准库 / builtins、改函数内部属性、碰 sitecustomize、
+# 跟踪函数、别的线程的帧. 直接击穿钩子的拒签; gc 枚举、取帧需解释 (调试 / 日志库偶尔用, 运行时逐条记录).
+# 只用内存 scan_files, 不碰文件系统.
+
+HOOK_TAMPER_REJECT = [
+    # monkeypatch 标准库函数 / 类属性
+    "import os\nos.fspath = lambda p: p",
+    "import ntpath\nntpath.normpath = f",
+    "import os\nos.write = f",
+    "import json\njson.dumps = f",
+    "import socket\nsocket.socket.getsockname = f",
+    "from socket import socket\nsocket.getsockname = f",
+    "import os.path as p\np.normpath = f",
+    "import os\ndel os.fspath",
+    "import os\nos.fspath, x = f, 1",
+    "import os\nos.__class__ = M",
+    # builtins
+    "import builtins\nbuiltins.isinstance = f",
+    "__builtins__.isinstance = f",
+    "__builtins__['isinstance'] = f",
+    "import builtins\nbuiltins.__dict__['isinstance'] = f",
+    "import builtins\nvars(builtins)['isinstance'] = f",
+    "import builtins\nvars(builtins).update(isinstance=f)",
+    "import os\nos.__dict__.update(fspath=f)",
+    "import os\nos.__dict__.pop('fspath')",
+    # setattr / delattr 及其混淆
+    "import json\nsetattr(json, 'dumps', f)",
+    "import json\nsetattr(json, 'du' + 'mps', f)",
+    "import json\nsetattr(json, name, f)",
+    "import os\ndelattr(os, 'fspath')",
+    "import os\nobject.__setattr__(os, 'fspath', f)",
+    "import socket\ntype.__setattr__(socket.socket, 'getsockname', f)",
+    "import os\ns = setattr\ns(os, 'fspath', f)",
+    "import builtins\ngetattr(builtins, 'setattr')(builtins, 'isinstance', f)",
+    # 别名跟踪 / 动态导入 / sys.modules
+    "import os\ngetattr(os, 'path').normpath = f",
+    "m = __import__('nt' + 'path')\nm.normpath = f",
+    "import importlib\nm = importlib.import_module('json')\nm.dumps = f",
+    "import sys\nsys.modules['json'].dumps = f",
+    "import sys\nm = sys.modules['os']\nm.fspath = f",
+    # 改函数内部属性
+    "def f():\n    pass\nf.__code__ = g.__code__",
+    "f.__defaults__ = (1,)",
+    "f.__kwdefaults__ = {}",
+    "f.__kwdefaults__['x'] = 1",
+    "f.__kwdefaults__.update(x=1)",
+    "del f.__defaults__",
+    "setattr(f, '__code__', c)",
+    "setattr(f, '__def' + 'aults__', ())",
+    "f.__globals__['x'] = 1",
+    "g = f.__globals__",
+    "c = f.__closure__[0].cell_contents",
+    "f.__closure__[0].cell_contents = 1",
+    "getattr(f, '__closure__')",
+    "getattr(cell, 'cell_' + 'contents')",
+    # sitecustomize / usercustomize
+    "import sitecustomize",
+    "import sitecustomize as s\ns.decide = f",
+    "from sitecustomize import decide",
+    "import usercustomize",
+    "import sys\nsys.modules['sitecustomize'].decide = f",
+    "import sys\nsys.modules['site' + 'customize'].decide = f",
+    "import sys\ndel sys.modules['sitecustomize']",
+    "import sys\nk = 'site' + 'customize'\ndel sys.modules[k]",
+    "import sys\nsys.modules.pop('sitecustomize')",
+    "__import__('site' + 'customize')",
+    "import importlib\nimportlib.import_module('sitecustomize')",
+    "src = open(r'C:\\env\\Lib\\site-packages\\sitecustomize.py').read()",
+    "import site\nsite.execsitecustomize()",
+    # 跟踪函数、别的线程的帧
+    "import sys\nsys.settrace(t)",
+    "import sys\nsys.setprofile(t)",
+    "import threading\nthreading.settrace(t)",
+    "import threading\nthreading.setprofile(t)",
+    "import threading\nthreading.settrace_all_threads(t)",
+    "from sys import settrace\nsettrace(t)",
+    "import sys\ngetattr(sys, 'set' + 'trace')(t)",
+    "import sys\nsys._current_frames()",
+    "import sys\nsys._current_exceptions()",
+    "import sys\nsys.monitoring.register_callback(1, 2, cb)",
+]
+
+
+@pytest.mark.parametrize("src", HOOK_TAMPER_REJECT)
+def test_hook_tamper_rejected(src):
+    fs = scan_py(src)
+    hits = [f for f in fs if f.rule == "hook-tamper" and f.level == REJECT]
+    assert hits, [(f.rule, f.level, f.message) for f in fs]
+    assert all("可篡改/绕过沙箱审计钩子" in f.message for f in hits)
+
+
+@pytest.mark.parametrize("src", [
+    "import sys\nsys.addaudithook(h)",
+    "import sys\nsys.audit('open', p, 'r', 0)",
+    "from sys import audit\naudit('x')",
+    "import sys\ngetattr(sys, 'au' + 'dit')('x')",
+])
+def test_audit_hook_api_rejected(src):
+    hits = [f for f in scan_py(src) if f.rule == "audit-hook" and f.level == REJECT]
+    assert hits and all("可篡改/绕过沙箱审计钩子" in f.message for f in hits)
+
+
+@pytest.mark.parametrize("src", [
+    "import gc\ngc.get_objects()",
+    "import gc\ngc.get_referrers(x)",
+    "import gc\ngc.get_referents(x)",
+    "from gc import get_objects",
+    "import gc\ngc.callbacks.append(cb)",
+    "import sys\nfr = sys._getframe(1)",
+    "import inspect\nfr = inspect.currentframe()",
+    "import inspect\ns = inspect.stack()",
+    "def f(fr):\n    return fr.f_back.f_globals",
+    "try:\n    x()\nexcept Exception as e:\n    fr = e.__traceback__.tb_frame",
+    "v = getattr(fr, 'f_locals')",
+    "import pdb\npdb.set_trace()",
+    "breakpoint()",
+])
+def test_hook_introspection_needs_explanation(src):
+    fs = scan_py(src)
+    assert "hook-tamper" in rules(fs, EXPLAIN), [(f.rule, f.level, f.message) for f in fs]
+    assert "hook-tamper" not in rules(fs, REJECT)
+    assert all("可篡改/绕过沙箱审计钩子" in f.message for f in fs if f.rule == "hook-tamper")
+
+
+@pytest.mark.parametrize("src", [
+    "import torch\ntorch.backends.cudnn.benchmark = True",
+    "import torch\ntorch.backends.cuda.matmul.allow_tf32 = True",
+    "import numpy as np\nnp.set_printoptions(precision=3)",
+    "import torch.nn as nn\nnn.Module.dump_patches = True",
+    "import functools\ndef deco(f):\n    @functools.wraps(f)\n    def w(*a, **k):\n        return f(*a, **k)\n    w.calls = 0\n    return w",
+    "def f():\n    pass\nf.cache = {}",
+    "class C:\n    pass\nC.x = 1\nsetattr(C, 'y', 2)",
+    "import config\nconfig.lr = 0.1",
+    "from . import config\nconfig.lr = 0.1",
+    "import sys\nsys.stdout = open(OUT / 'log.txt', 'w', encoding='utf-8')",
+    "import sys\nsys.argv = ['x']\nsys.excepthook = h",
+    "import time, logging\nlogging.Formatter.converter = time.gmtime",
+    "import os\nos.environ['CUDA_VISIBLE_DEVICES'] = '0'",
+    "class T:\n    def __init__(self):\n        self.socket = 1\n        object.__setattr__(self, 'x', 1)",
+    "import json\nd = json.loads(s)\nd['x'] = 1",
+    "import argparse\nargs = argparse.ArgumentParser().parse_args()\nvars(args)['lr'] = 0.1",
+    "x = f.__defaults__",
+    "n = f.__code__.co_argcount",
+    "import traceback\ntraceback.print_exc()",
+    "import logging\nlog = logging.getLogger(__name__)\nlog.setLevel(logging.INFO)",
+    "import random, warnings\nrandom.seed(0)\nwarnings.filterwarnings('ignore')",
+    "import json\nclass Enc(json.JSONEncoder):\n    def default(self, o):\n        return str(o)",
+    "import threading\nclass W(threading.Thread):\n    def run(self):\n        pass",
+    "import site\np = site.getsitepackages()",
+])
+def test_hook_tamper_false_positives(src):
+    fs = scan_py(src)
+    assert "hook-tamper" not in rules(fs), [(f.rule, f.level, f.message) for f in fs]
+    assert not rules(fs, REJECT), [(f.rule, f.message) for f in fs if f.level == REJECT]
+
+
+def test_clean_train_has_no_hook_tamper():
+    assert "hook-tamper" not in rules(er.scan_files({"train.py": CLEAN_TRAIN.encode("utf-8")}))
+
+
+def test_stdlib_list_covers_running_python():
+    import sys
+    have = getattr(sys, "stdlib_module_names", None)
+    if have is None:
+        pytest.skip("Python 3.9 没有 sys.stdlib_module_names")
+    assert set(have) <= er._STDLIB
+
+
+def test_hook_tamper_bumped_rules_version():
+    assert er.RULES_VERSION >= 3
