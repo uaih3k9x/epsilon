@@ -22,6 +22,15 @@ type Store struct {
 	items map[string]*item
 	total int64
 	clock int64 // 单调递增的"最近使用"时钟（纳秒），保证先后可比
+
+	remove func(string) error // 删块文件；nil 用 os.Remove。测试里换成删不掉的，模拟 Windows 上正被读
+}
+
+func (s *Store) rm(p string) error {
+	if s.remove != nil {
+		return s.remove(p)
+	}
+	return os.Remove(p)
 }
 
 type item struct {
@@ -165,8 +174,11 @@ func (s *Store) verify(h string) error {
 	if s.items[h] != it { // 算哈希期间被淘汰又重新放进来了：新的那块不归这次管
 		return nil
 	}
-	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-		return err
+	// 删不掉（Windows 上正被读，比如 P2P 服务正发给邻居）也从表里去掉：Has 为假就不再发给邻居、
+	// 调用方会去重取。文件留在原处，重取时改名覆盖它；那时还被占着就这次取失败，下一轮再来。
+	if err := s.rm(p); err != nil && !os.IsNotExist(err) {
+		s.forget(h, it)
+		return fmt.Errorf("块 %s（文件暂时删不掉: %v）: %w", h, err, ErrHashMismatch)
 	}
 	s.forget(h, it)
 	return fmt.Errorf("块 %s: %w", h, ErrHashMismatch)
@@ -283,7 +295,7 @@ func (s *Store) Evict(keep map[string]bool) []string {
 		if s.total <= s.quota {
 			break
 		}
-		if err := os.Remove(chunkPath(s.dir, h)); err != nil && !os.IsNotExist(err) {
+		if err := s.rm(chunkPath(s.dir, h)); err != nil && !os.IsNotExist(err) {
 			continue
 		}
 		s.total -= s.items[h].size
