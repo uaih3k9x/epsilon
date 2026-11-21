@@ -23,14 +23,14 @@ var (
 
 // p2pRig 直接调 Handler（不走网络），这样每个请求能指定来源 IP，时钟也能安全地拨。
 type p2pRig struct {
-	t   *testing.T
+	t   testing.TB
 	c   *Controller
 	h   http.Handler
 	now time.Time
 	dir string
 }
 
-func newP2PRig(t *testing.T, cfg Config) *p2pRig {
+func newP2PRig(t testing.TB, cfg Config) *p2pRig {
 	dir := t.TempDir()
 	m := proto.Manifest{ID: "m1", ChunkSize: 4, Files: []proto.ManifestFile{
 		{Path: "a.gguf", Size: 8, Chunks: []string{h1, h2}},
@@ -353,5 +353,66 @@ func TestHaveIgnoresBadHashes(t *testing.T) {
 	r.do("POST", "/v1/have", "10.0.0.1", "tok", proto.Have{Node: "pc-01", Add: []string{h1, "../x", strings.ToUpper(h2)}})
 	if n := chunkCounts(t, r)["pc-01"]; n != 1 {
 		t.Fatalf("只该记下合法块，得到 %d", n)
+	}
+}
+
+// have、peers、重新登记并发打进来（-race 下跑）：不能有数据竞争，peers 回的来源格式都对；
+// 停下来之后块表以最后一次 have 为准。
+func TestPeersConcurrentHaveAndPeers(t *testing.T) {
+	r := newP2PRig(t, Config{})
+	names := []string{"pc-01", "pc-02", "pc-03", "pc-04"}
+	for i, n := range names {
+		r.join(n, fmt.Sprintf("10.0.0.%d", i+1), 47100)
+	}
+	all := []string{h1, h2, h3}
+	done := make(chan struct{})
+	errs := make(chan string, 64)
+	for i, n := range names {
+		go func(i int, n string) {
+			defer func() { done <- struct{}{} }()
+			ip := fmt.Sprintf("10.0.0.%d", i+1)
+			for k := 0; k < 200; k++ {
+				h := all[(i+k)%3]
+				switch k % 4 {
+				case 0:
+					r.do("POST", "/v1/have", ip, "tok", proto.Have{Node: n, Add: []string{h}})
+				case 1:
+					r.do("POST", "/v1/have", ip, "tok", proto.Have{Node: n, Del: []string{h}})
+				case 2:
+					w := r.do("GET", "/v1/peers?manifest=m1&node="+n, ip, "tok", nil)
+					var p proto.Peers
+					if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &p) != nil || len(p.Sources) != 3 {
+						errs <- fmt.Sprintf("peers %d %s", w.Code, w.Body)
+						continue
+					}
+					for _, srcs := range p.Sources {
+						for _, s := range srcs {
+							if s != "" && !strings.HasPrefix(s, "http://10.0.0.") {
+								errs <- "来源格式不对: " + s
+							}
+						}
+					}
+				case 3:
+					if k%40 == 3 {
+						r.do("POST", "/v1/register", ip, "tok", proto.Register{Node: n, P2PPort: 47100})
+					}
+				}
+			}
+		}(i, n)
+	}
+	for range names {
+		<-done
+	}
+	close(errs)
+	for e := range errs {
+		t.Fatal(e)
+	}
+	// 安静下来以后：pc-01 只报有 h2，pc-02 看到的 h2 来源就只有它
+	for _, n := range names {
+		r.do("POST", "/v1/have", "10.0.0.1", "tok", proto.Have{Node: n, Del: all})
+	}
+	r.do("POST", "/v1/have", "10.0.0.1", "tok", proto.Have{Node: "pc-01", Add: []string{h2}})
+	if _, p := r.peers("m1", "pc-02"); neighbors(p.Sources[h2]) != 1 || neighbors(p.Sources[h1]) != 0 {
+		t.Fatalf("并发之后块表不对: %q", p.Sources)
 	}
 }

@@ -22,6 +22,15 @@ type Store struct {
 	items map[string]*item
 	total int64
 	clock int64 // 单调递增的"最近使用"时钟（纳秒），保证先后可比
+
+	remove func(string) error // 删块文件；nil 用 os.Remove。测试里换成删不掉的，模拟 Windows 上正被读
+}
+
+func (s *Store) rm(p string) error {
+	if s.remove != nil {
+		return s.remove(p)
+	}
+	return os.Remove(p)
 }
 
 type item struct {
@@ -29,8 +38,17 @@ type item struct {
 	used int64
 }
 
+// staleTmp: 临时文件放了这么久没动才算崩溃残留。同一块目录上可能同时开着别的 Store
+// （探针和 epsilon-env、主控每个请求一个），不能把人家正在写的临时文件删掉。
+const staleTmp = time.Hour
+
+// emptyHash 是空内容的 sha256：只有它可以是 0 字节的块。
+var emptyHash = func() string { h := sha256.Sum256(nil); return hex.EncodeToString(h[:]) }()
+
 // NewStore 打开（必要时新建）块目录，扫描已有块；最近使用时间用文件修改时间初始化。
-// 上次崩溃留下的临时文件顺手删掉。
+// 上次崩溃留下的临时文件（放了 staleTmp 以上的）顺手删掉；0 字节又不是空内容哈希的块
+// （断电留下的典型样子）也删掉。别的大小不对、内容不对的块这里看不出来（不知道应有多大、
+// 开机重算哈希太慢），拼装时发现再删（见 Assemble）。
 func NewStore(dir string, quota int64) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
@@ -50,8 +68,11 @@ func NewStore(dir string, quota int64) (*Store, error) {
 		}
 		for _, e := range ents {
 			name := e.Name()
+			p := filepath.Join(dir, sub.Name(), name)
 			if strings.HasPrefix(name, ".tmp-") {
-				os.Remove(filepath.Join(dir, sub.Name(), name))
+				if fi, err := e.Info(); err == nil && time.Since(fi.ModTime()) > staleTmp {
+					os.Remove(p)
+				}
 				continue
 			}
 			if !ValidHash(name) || name[:2] != sub.Name() || !e.Type().IsRegular() {
@@ -59,6 +80,10 @@ func NewStore(dir string, quota int64) (*Store, error) {
 			}
 			fi, err := e.Info()
 			if err != nil {
+				continue
+			}
+			if fi.Size() == 0 && name != emptyHash {
+				os.Remove(p)
 				continue
 			}
 			s.items[name] = &item{size: fi.Size(), used: fi.ModTime().UnixNano()}
@@ -89,20 +114,20 @@ func (s *Store) Open(h string) (io.ReadSeekCloser, int64, error) {
 	if !ValidHash(h) {
 		return nil, 0, fmt.Errorf("块哈希不合法: %q", h)
 	}
+	// 持锁打开：不然 Evict 删了、Put 又放回来之后，这里按"文件没了"去掉的会是新放进来的那块
 	s.mu.Lock()
 	it := s.items[h]
-	if it != nil {
-		it.used = s.tick()
-	}
-	s.mu.Unlock()
 	if it == nil {
+		s.mu.Unlock()
 		return nil, 0, fmt.Errorf("没有块 %s: %w", h, os.ErrNotExist)
 	}
+	it.used = s.tick()
 	f, err := os.Open(chunkPath(s.dir, h))
+	if os.IsNotExist(err) { // 被外面删了
+		s.forget(h, it)
+	}
+	s.mu.Unlock()
 	if err != nil {
-		if os.IsNotExist(err) { // 被外面删了
-			s.drop(h)
-		}
 		return nil, 0, err
 	}
 	fi, err := f.Stat()
@@ -113,13 +138,50 @@ func (s *Store) Open(h string) (io.ReadSeekCloser, int64, error) {
 	return f, fi.Size(), nil
 }
 
-func (s *Store) drop(h string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if it := s.items[h]; it != nil {
+// forget 把块从表里去掉（只在表里还是 it 这一项时）。调用方持锁。
+func (s *Store) forget(h string, it *item) {
+	if s.items[h] == it {
 		s.total -= it.size
 		delete(s.items, h)
 	}
+}
+
+// verify 重算一个块的 sha256；对不上就删掉文件、从表里去掉，返回 ErrHashMismatch。
+// 拼装整文件哈希对不上时用来找出坏块（断电截断、磁盘坏），坏块删了下次就会重新取。
+func (s *Store) verify(h string) error {
+	s.mu.Lock()
+	it := s.items[h]
+	s.mu.Unlock()
+	if it == nil {
+		return fmt.Errorf("没有块 %s: %w", h, os.ErrNotExist)
+	}
+	p := chunkPath(s.dir, h)
+	f, err := os.Open(p)
+	if err != nil {
+		return err
+	}
+	hs := sha256.New()
+	_, err = io.Copy(hs, f)
+	f.Close()
+	if err != nil {
+		return err
+	}
+	if hex.EncodeToString(hs.Sum(nil)) == h {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.items[h] != it { // 算哈希期间被淘汰又重新放进来了：新的那块不归这次管
+		return nil
+	}
+	// 删不掉（Windows 上正被读，比如 P2P 服务正发给邻居）也从表里去掉：Has 为假就不再发给邻居、
+	// 调用方会去重取。文件留在原处，重取时改名覆盖它；那时还被占着就这次取失败，下一轮再来。
+	if err := s.rm(p); err != nil && !os.IsNotExist(err) {
+		s.forget(h, it)
+		return fmt.Errorf("块 %s（文件暂时删不掉: %v）: %w", h, err, ErrHashMismatch)
+	}
+	s.forget(h, it)
+	return fmt.Errorf("块 %s: %w", h, ErrHashMismatch)
 }
 
 // Put 存一个块：边写临时文件边算 sha256，对不上返回 ErrHashMismatch；对上了改名就位。
@@ -159,6 +221,9 @@ func (s *Store) ingest(r io.Reader, want string) (string, int64, error) {
 	tmp := f.Name()
 	hs := sha256.New()
 	n, err := io.Copy(io.MultiWriter(f, hs), r)
+	if err == nil {
+		err = f.Sync() // 先落盘再改名：不然断电后正式文件名下可能是半截或全零
+	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
@@ -230,7 +295,7 @@ func (s *Store) Evict(keep map[string]bool) []string {
 		if s.total <= s.quota {
 			break
 		}
-		if err := os.Remove(chunkPath(s.dir, h)); err != nil && !os.IsNotExist(err) {
+		if err := s.rm(chunkPath(s.dir, h)); err != nil && !os.IsNotExist(err) {
 			continue
 		}
 		s.total -= s.items[h].size
