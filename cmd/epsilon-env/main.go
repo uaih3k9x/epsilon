@@ -1,6 +1,6 @@
 // epsilon-env: 在机器上手工安装环境层（探针接上之前用来实测，契约见 docs/jobs.md）。
 // 用法: epsilon-env install -name py311-torch2.5-cu124@1 -digest <钥匙环里的摘要> -manifest <清单.json> -chunks <块目录> -root D:\epsilon [脚本 参数...]
-// 给了脚本就在装好后用层里的解释器跑它（-E -B），退出码原样返回。
+// 给了脚本就在装好后用层里的解释器跑它（-E -s -B），退出码原样返回。
 //
 // epsilon-env upload -id exp029-t0 -dir D:\epsilon\jobs\exp029-t0\output -config D:\epsilon\probe.json
 // 把任务输出传回主控，断了重跑就是续传。

@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"epsilon/controller"
 )
@@ -29,5 +30,11 @@ func main() {
 		log.Print("警告: 没设 probe_token，谁都能冒充探针登记")
 	}
 	log.Printf("epsilon-controller 监听 %s", cfg.Listen)
-	log.Fatal(http.ListenAndServe(cfg.Listen, controller.New(cfg).Handler()))
+	c := controller.New(cfg)
+	go func() { // 没有心跳进来时也要发现失联节点、把任务放回队列
+		for range time.Tick(5 * time.Second) {
+			c.TickJobs()
+		}
+	}()
+	log.Fatal(http.ListenAndServe(cfg.Listen, c.Handler()))
 }
