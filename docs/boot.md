@@ -14,13 +14,18 @@
 
 ```
 <root>\                     例如 D:\epsilon
-  A\  B\                    槽：本体文件 + release.json（签名清单原文）
+  A\  B\                    槽：本体文件 + release.json（签名清单原文）；清单 files 里必须有 epsilon-probe.exe
   boot-state.json           只有 boot 写
   staged.json               只有 loader 创建；只有 boot 删除
   boot-events.jsonl         只有 boot 追加写；loader 只读
   boot-events.sent          只有 loader 写：已转发到的字节偏移
   confirm-A / confirm-B     本体第一次心跳成功后创建；boot 读到就转正
 ```
+
+**清单必需项（冻结，2026-11-18 定，F1）**：`release.json` 的 `files` 里必须有一项 `path` 正好是 `epsilon-probe.exe`
+（`boot.ProbeExe`；按字节比较，不折叠大小写，和文件名规则 `safeName` 一样；带目录的写法本来就不合法）。没有就是坏槽：
+`VerifySlot` / `VerifySlotFor` 返回错误，A/B、R 一视同仁。boot 启动的就是 `<slot>\epsilon-probe.exe`，缺它的槽即使
+能起来，起来的也是没验过签的东西，没人和主控通信，机器失联只能人跑过去。
 
 **每个文件只有一个写入方**（staged.json 是"loader 创建、boot 消费删除"的交接）。写文件一律"临时文件 → 刷盘 → 改名"。
 
@@ -41,8 +46,9 @@
 
 loader 的步骤：
 1. 只在 `pending == ""` 时动手；目标槽 = `current` 以外的那个（`current` 为空时是 A）。**绝不写 current 槽**。
-2. 清空目标槽 → 逐个下载文件（`.part` → 校验大小和 sha256 → 改名）→ 最后写 `release.json`。
-3. 对整个槽按 boot 同样的规则验一遍（签名 + 每个文件哈希 + `min_boot` ≤ boot 版本）。
+2. 先验主控给的发布（签名 + `min_boot` ≤ boot 版本 + 清单里有 `epsilon-probe.exe`，和 boot 共用 `boot.CheckManifest`），不过就什么都不动——目标槽可能正是 good 退路。
+   过了再清空目标槽 → 逐个下载文件（`.part` → 校验大小和 sha256 → 改名）→ 最后写 `release.json`。
+3. 对整个槽按 boot 同样的规则验一遍（签名 + 清单里有 `epsilon-probe.exe` + 每个文件哈希 + `min_boot` ≤ boot 版本）。
 4. 原子写 `staged.json`。它出现就表示"槽已备好、可以切"。
 
 boot 的处理（启动选槽前，以及看护非试启动的本体时每个 Poll 周期检查一次）：
@@ -96,7 +102,7 @@ boot 不下载，所以安装脚本负责放进第一个版本：
 
 loader 住在本体里，本体跑不起来就没人下载修复版。所以加一个**只读的救援槽** `<root>\R`：
 
-- 内容：`epsilon-probe.exe` + 签了名的 `release.json`（+ `workloads.json`），和 A/B 一样能用 `VerifySlot` 验。
+- 内容：`epsilon-probe.exe` + 签了名的 `release.json`（+ `workloads.json`），和 A/B 一样能用 `VerifySlot` 验；清单里同样必须有 `epsilon-probe.exe`。
 - **只有安装脚本写 R**；boot 和 loader 都不写、不删。R 不进 `boot-state.json` 的 `versions`，不当 current / good / pending。
 - **什么时候用**：boot 选槽时"没有能跑的"——
   1. current 和 good 都验不过（或版本对不上），且没有能试的 pending；或者
@@ -140,3 +146,79 @@ loader 住在本体里，本体跑不起来就没人下载修复版。所以加�
 
 R 只在重装时更新，所以"救援时选哪个槽"的规则以**装进 R 的那个本体**为准，这台机器重装前都改不了。改这些规则时要想到：已经装出去的 R 还是旧规则。
 
+
+## 冻结前折磨测试（设计书 11.12，2026-11-18）
+
+生产代码改了两处：F1 定下后 `VerifySlot` 要求清单里有本体（见下面 F1）；另一处是 `boot/fault.go` 加了一道断电注入的缝（`faultHook`，生产里是 nil），`boot.go` 里的写盘点
+（`writeAtomic` 的 Create/Write/Sync/Rename、`appendLine` 的轮转 Rename/OpenFile/Write/Sync、删 staged.json 的两处、
+删确认文件的一处）换成了同名小包装，逻辑没动。测试都在 `boot/` 下：
+
+- 开发时的快速回归：`go test -race -short ./boot`（约 13 秒）。状态机只从一小部分初始状态出发，断电只断每第 5 个写盘点；
+- 冻结、合并前跑全量：`go test -race ./boot`（约 45 秒，大头是状态机穷举）。
+
+| 11.12 的手段 | 做了没有 | 在哪 |
+|---|---|---|
+| 断电模拟 | ✅ 8 个场景，共 155 个写盘点，每个点都断一次（不抽样）；write 断在一半（撕裂写） | `powercut_test.go`（`-v` 打印每个场景"N 个写盘点全试过"） |
+| 模糊测试 | ✅ 4 个目标，本地各跑 5 分钟无失败；种子语料在 `testdata/fuzz/` | `fuzz_test.go` |
+| 状态机穷举 | ✅ 2.8 万个初始状态 BFS，可达约 4.8 万个，12 层收敛 | `statemachine_test.go`（`-short` 只跑一小部分初始状态） |
+| 对抗用例 | ✅ 签名攻击、版本回滚、槽文件不完整 | `adversarial_test.go` |
+| Windows 专项 | ⬜ 没做：exe 被替换、杀毒隔离、磁盘满、只读、中文路径、两个 boot 同时启动，要在真机上测 | |
+| 对抗评审 | ⬜ 没做：要另派一个不知道设计思路的人 | |
+| 真机长跑 | ⬜ 没做：牺牲机 + 试点机 | |
+
+**断电模拟**的场景：消费 staged.json（接受 / 拒绝）、试启动后确认转正、试满 MaxTries 回退、current 坏了改跑 good、
+首次安装、救援之后消费 staged.json、事件文件轮转。每个点断电后，在同一目录上新起一个 Boot 跑到稳定，检查：
+
+- I1 boot-state.json 总能解析；
+- I2 启动的槽一定验得过，非试启动时清单版本等于 `versions[槽]`；
+- I3 有退路时，同一个待试版本跨重启的试启动总次数不超过 MaxTries；
+- I4 最后在跑的是新版本或者旧的好版本；
+- I5 staged.json 最终被消费；
+- I6 事件文件每个完整的行都能解析，一次断电最多留下一行半截的；
+- I7 current、pending、good 非空时互不相同。
+
+断电模型的前提：改名、删除一旦返回就算落盘（见下面 F4）。断电那一下之后，Run 再走到写盘点就直接结束（`runtime.Goexit`），
+和真断电一样后面的代码不再跑。每次只断一次电，恢复途中再断一次没有测。
+
+**状态机穷举**的状态：current/pending/good × tries（0..MaxTries+1）× bad × A/B/R 槽内容（好 / 签名合法但版本不同 /
+被篡改 / 缺失）× staged.json（无 / A / B / 垃圾），事件是崩溃或卡死不确认、确认、跑着的槽被篡改，以及 loader 往非 current
+的槽写进另一个签名版本、放 staged.json（所以 2.x 版本、bad=2.x 的状态也会遇到交接）。每一步对照一个不调被测代码的
+模型检查：消费 staged.json 后整个 state 和模型逐字段一致（含 tries：新槽或新版本清零，同槽同版本的重放不清零）、
+不 panic、不启动验不过的槽、I3、I7、没有事件时 Pick 是不动点、有能跑的槽就一定启动、没东西跑就一定救援、救援不写
+state 也不跑验不过的 R。用几个故意改坏的 boot.go（不核对版本、不记次数、不拒 bad、转正不留 good、多试一次、
+被覆盖的 good 不清、交接新版本时不清零 tries、同槽同版本重放也清零 tries）验证过，每一个都会被抓出来。
+
+模糊测试的签名私钥由固定种子生成（种子语料要跨次运行有效），等于是公开的；`TestFuzzKeyNotInReleaseKeys` 保证它的
+公钥不会进 `loader.PublicKeys`（`cmd/epsilon-boot` 的那份由 `loader/keys_test.go` 保证一致）。
+
+## 冻结前暴露的问题
+
+折磨测试**没有找到 boot 逻辑的 bug**，所以 boot.go 除了换包装没有别的改动。下面几条要动冻结契约，或者要在真机上
+确认。F1 已决定并改了；其余只记下来待定，没有改。F2、F3 各有一条 `TestKnownIssue*` 用例记录现状，定了怎么改再把断言反过来。
+
+- **F1 清单不要求有本体**（**已决定，2026-11-18，9x 拍板**）。原来 `VerifySlot` 只校验清单里列出的文件，不要求列出
+  `epsilon-probe.exe`；而 boot 启动的就是 `<slot>\epsilon-probe.exe`。签名清单漏了它，槽里随便放一个 exe 都会被当成验过的
+  本体启动，R 也一样。缺探针的槽能通过校验并启动，但启动后没东西和主控通信，机器失联只能人跑过去——是坏槽却看起来是好的。
+  **契约变更**：`VerifySlot` / `VerifySlotFor` 要求 `Files` 里有 `boot.ProbeExe`（`epsilon-probe.exe`，按字节比较），
+  缺了返回错误。boot 按现有逻辑处理：staged 交接被拒；current 验不过就回退到 good；R 验不过记 `boot_rescue_bad`、不跑。
+  loader 用同一个函数验槽，一起生效。引导器版本号不变（还是 2）：现有发布都带本体，新旧 boot 对它们结论一样。
+  测试：`TestF1ManifestMustListProbe`（缺、大小写不同、多后缀、空清单）、`TestF1ManifestWithProbePasses`、
+  `TestF1CurrentWithoutProbeFallsBackToGood`、`TestF1RescueSlotMustListProbe`；`FuzzVerifySlot` 加了"放行的清单一定有本体"。
+  状态机穷举里"被篡改"已经代表"槽验不过"，缺本体对 boot 的选槽逻辑是同一种情况，没有另加一种槽内容。
+  发版侧：`epsilon-release` 签名前检查要签入的文件里有没有 `boot.ProbeExe`（取文件名按字节比），没有就报错退出，
+  不碰 `-out`（不清旧产出、不写 release.json），免得签出一份所有引导器都拒收的发布。`deploy/release.sh` 本来就传
+  `dist/build/epsilon-probe.exe`，不受影响。测试：`TestReleaseRefusesWithoutProbe`、`TestReleaseRefusesWithoutProbeKeepsOldOutput`、
+  `TestReleaseWithProbeSigns`（签出来的直接过 `VerifySlot`）。
+  同一循环里也拒掉重复的文件名（会在 `-out` 里互相覆盖、清单留两条同名 path）：`TestReleaseRefusesDuplicateNames`。
+  loader 侧：`release()` 用 `boot.CheckManifest` 在清空目标槽、下载之前就拒缺本体的发布（`TestStageRejectsRelease/清单缺本体`）。
+- **F2 bad 只记一个版本**。两个坏版本交替下发（比如管理员在两个版本之间来回调），每个都会重新试满 MaxTries 次，
+  来回空转。可能的改法：bad 改成最近几个版本的列表（State 加字段，动契约），或者在主控 / loader 侧挡住。
+- **F3 槽里多余的文件不拦**。只有清单里的文件受保护。本体或它拉起的程序如果按名字加载同目录的 DLL，多出来的
+  文件就是没验过签的代码。要不要改取决于对 Windows DLL 搜索顺序的评估（Windows 专项里一起看）。
+- **F4 改名不一定马上落盘**。`writeAtomic` 刷了临时文件，但 Windows 上 `os.Rename` 不带 `MOVEFILE_WRITE_THROUGH`，
+  改名本身可能在断电后被日志回滚成旧文件（I1 仍然成立，旧文件是完整的）。后果是"先记 tries 再启动"在断电时
+  不一定生效：如果新版本一起来就让整机断电或蓝屏，tries 可能一直记不上，就不会回退。断电模拟假设改名一返回就
+  落盘，覆盖不到这一条，要在真机上拔电验证；要改的话是 Windows 专用代码。
+- **F5 state 被别人改坏时的容忍度**（只记录）。boot 只自己写 state，正常写不出这些值；但如果 state 被别的程序改了：
+  负的 tries 会让试启动次数超过 MaxTries；pending/current 可以指向 A/B 以外的目录（仍然要验签和版本，所以只能跑
+  签过名的本体）。模糊测试确认这些情况下都不会 panic，也不会启动验不过的槽。

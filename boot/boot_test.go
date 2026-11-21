@@ -105,18 +105,18 @@ func putSlotMin(t *testing.T, b *Boot, priv ed25519.PrivateKey, slot, version st
 	body := "probe " + version
 	sum := sha256.Sum256([]byte(body))
 	m := Manifest{Version: version, MinBoot: minBoot,
-		Files: []File{{Path: "epsilon-probe.exe", Size: int64(len(body)), SHA256: hex.EncodeToString(sum[:])}}}
+		Files: []File{{Path: ProbeExe, Size: int64(len(body)), SHA256: hex.EncodeToString(sum[:])}}}
 	s, err := Sign(m, priv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	raw, _ := json.Marshal(s)
-	write(t, filepath.Join(dir, "epsilon-probe.exe"), body)
+	write(t, filepath.Join(dir, ProbeExe), body)
 	write(t, filepath.Join(dir, ReleaseFile), string(raw))
 }
 
 func tamper(t *testing.T, b *Boot, slot string) {
-	write(t, filepath.Join(b.Root, slot, "epsilon-probe.exe"), "evil")
+	write(t, filepath.Join(b.Root, slot, ProbeExe), "evil")
 }
 
 func write(t *testing.T, path, body string) {

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"pending\":\"R\",\"versions\":{\"R\":\"1.R\"}}")

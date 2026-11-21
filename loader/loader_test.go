@@ -310,6 +310,8 @@ func TestStageRejectsRelease(t *testing.T) {
 			e.ctl.mu.Unlock()
 		},
 		"min_boot 太大": func(e *env) { e.publish("0.4.0", e.l.BootVersion+1, map[string]string{"epsilon-probe.exe": "x"}) },
+		// F1：清单里没有本体，boot 一定拒收；在清空目标槽之前就拒，不下载
+		"清单缺本体": func(e *env) { e.publish("0.4.0", 1, map[string]string{"workloads.json": "{}"}) },
 	}
 	for name, bad := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -324,6 +326,9 @@ func TestStageRejectsRelease(t *testing.T) {
 			e.noStaged()
 			if e.marker("A") != "old-a" || e.marker("B") != "old-b" {
 				t.Fatal("槽被动了")
+			}
+			if e.ctl.fetches != 0 {
+				t.Fatalf("拒收的发布还下载了 %d 个文件", e.ctl.fetches)
 			}
 		})
 	}

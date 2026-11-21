@@ -81,13 +81,13 @@ func (b *Boot) save(st State) error {
 // Windows 上 loader 正开着目标文件读时改名会失败，所以改名重试一会儿。
 func writeAtomic(path string, data []byte) error {
 	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	f, err := fsCreate(tmp)
 	if err != nil {
 		return err
 	}
-	_, err = f.Write(data)
+	_, err = fsWrite(f, data)
 	if err == nil {
-		err = f.Sync()
+		err = fsSync(f)
 	}
 	if cerr := f.Close(); err == nil {
 		err = cerr
@@ -96,7 +96,7 @@ func writeAtomic(path string, data []byte) error {
 		return err
 	}
 	for i := 0; ; i++ {
-		if err = os.Rename(tmp, path); err == nil || i == 9 {
+		if err = fsRename(tmp, path); err == nil || i == 9 {
 			return err
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -117,11 +117,11 @@ func (b *Boot) event(kind, format string, a ...any) {
 // 断电可能留下半行：追加前发现末尾不是换行就先补一个，坏的只有那半行。
 func appendLine(path string, line []byte) error {
 	if fi, err := os.Stat(path); err == nil && fi.Size() > eventsMax {
-		if err := os.Rename(path, path+".1"); err != nil {
+		if err := fsRename(path, path+".1"); err != nil {
 			log.Printf("轮转 %s: %v", path, err) // loader 正开着就下次再轮转，这次照常追加
 		}
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	f, err := fsOpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
@@ -132,10 +132,10 @@ func appendLine(path string, line []byte) error {
 			line = append([]byte{'\n'}, line...)
 		}
 	}
-	if _, err := f.Write(append(line, '\n')); err != nil {
+	if _, err := fsWrite(f, append(line, '\n')); err != nil {
 		return err
 	}
-	return f.Sync()
+	return fsSync(f)
 }
 
 func sumFile(path string) (int64, string, error) {
@@ -149,7 +149,7 @@ func sumFile(path string) (int64, string, error) {
 	return n, hex.EncodeToString(h.Sum(nil)), err
 }
 
-// check 验槽（签名、min_boot、文件哈希），并核对清单版本 == state 记的版本。
+// check 验槽（VerifySlot：签名、min_boot、清单里有 ProbeExe、文件哈希），并核对清单版本 == state 记的版本。
 // 版本对不上说明 loader 往里写过新东西，不能当已确认的版本跑（docs/boot.md "回退时核对版本"）。
 func (b *Boot) check(st State, slot string) error {
 	m, err := VerifySlot(b.path(slot), b.Keys)
@@ -198,7 +198,7 @@ func (b *Boot) consumeStaged() bool {
 	}
 	if err != nil {
 		b.event("boot_staged_rejected", "%.200s: %v", raw, err)
-		os.Remove(path)
+		fsRemove(path)
 		return false
 	}
 	if st.Pending != sg.Slot || st.Versions[sg.Slot] != m.Version {
@@ -212,7 +212,7 @@ func (b *Boot) consumeStaged() bool {
 		}
 		b.event("boot_staged", "版本 %s（槽 %s）待试", m.Version, sg.Slot)
 	}
-	if err := os.Remove(path); err != nil {
+	if err := fsRemove(path); err != nil {
 		log.Printf("删 %s: %v", StagedFile, err) // 下次走上面的幂等分支再删
 	}
 	return true
@@ -395,7 +395,7 @@ func (b *Boot) runOnce(stop <-chan struct{}) bool {
 	}
 	// 先删旧确认文件再启动：上次留下的文件不能让这次没确认的版本转正。删不掉就不启动。
 	confirm := b.path("confirm-" + slot)
-	if err := os.Remove(confirm); err != nil && !os.IsNotExist(err) {
+	if err := fsRemove(confirm); err != nil && !os.IsNotExist(err) {
 		log.Printf("删 %s: %v", confirm, err)
 		return b.sleep(stop, b.Backoff)
 	}
